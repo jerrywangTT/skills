@@ -257,6 +257,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # such review's spec. With area_fail_cap (0 off) reviews of one area failed within 48 h, across
     # stacks, the daemon queues no automatic fix for it and the coordinator re-plans (reviewcap).
     # The daily review's self-efficiency audit lists tasks blocked longer than blocked_long_h hours.
+    # It also lists each Restrictions item that only blocked work over 7 days: at least rule_blocks_min
+    # blocked runs and asks citing it, and no refused action citing it (restriction_audit).
     # A code task left in review with no review sweep_after_s (0 off) after its last run gets one
     # from the daemon (sweep_reviews), which only queues reviews and never closes a task. A harness
     # task gets one too, unless its commit is merged into the harness: then it is closed as done. A done code
@@ -265,7 +267,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # A review whose head carries a change with a failed review and an open fix waits for that fix
     # to land or its chain to end, at most carried_hold_max_h hours (0: no cap; reviewhold).
     "review": {"light_max_lines": 80, "risky_paths": [], "light_paths": [], "auto": True, "auto_notes": "",
-               "area_fail_cap": 3, "blocked_long_h": 12, "sweep_after_s": 1800,
+               "area_fail_cap": 3, "blocked_long_h": 12, "rule_blocks_min": 3, "sweep_after_s": 1800,
                "unreviewed_per_pass": 2, "unreviewed_max_age_h": 72, "carried_hold_max_h": 24},
     # Continue chains (chaincap): a task_add that continues a lineage past max_hops hops, max_stalls
     # failed or no-progress hops in a row or max_usd spent (0 turns one off), or one in an area under

@@ -7,6 +7,10 @@ whole Restrictions section with looser wording), or `over` retires one, the proj
 (bin/, hooks/, schedules) may still carry the old rule. restriction_tools names them in a queued
 `restriction_tools` event for the next digest; it never edits anything. coordinator.apply() calls it
 once per turn, with the turn's tasks, so a tool a task of that batch already names is left out.
+
+only_blocks_lines gives the daily review, per Restrictions item, the 7-day count of blocked runs and
+asks citing it against refused actions citing it, and lists an item that only blocked work: evidence
+for the coordinator's one-time ask to loosen it. Only the user's own words loosen a rule.
 """
 from __future__ import annotations
 
@@ -126,4 +130,62 @@ def restriction_tools(p: Project, loosened: list[tuple[str, str, str]], batch: l
         out.append(x)
         p.db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
                (time.time(), "harness", "restriction_tools", "normal", x, "queued"))
+    return out
+
+
+# The daily review's 7-day count per Restrictions item: evidence for the coordinator's one-time ask
+# to drop or loosen a rule that only blocks work. Model-free; it never edits the charter or asks.
+CITE_WINDOW_S = 7 * 86400
+BLOCKS_MIN = 3   # review.rule_blocks_min: blocked-work citations that list an item
+
+
+def citations(p: Project, now: float | None = None, window_s: float = CITE_WINDOW_S) -> list[dict]:
+    """Per item of the charter's Restrictions sections, in charter order: {item, blocked, asks,
+    stopped} over the last `window_s`. `blocked`: task_blocked events (a run that ended blocked, or a
+    task the daemon blocked) citing the item; `asks`: asks sent to the user citing it; `stopped`:
+    coordinator actions the guard or relay refused (rejected_actions; the ask gate's ask_user refusals
+    are left out) citing it. A text cites an item when it is about one of the item's sentences
+    (coordinator._widens on its _rule_words); one text may cite several items."""
+    from .coordinator import _items, _rule_words, _sentences, _widens
+    from .prompts import charter_restrictions
+    try:
+        body = charter_restrictions(p.charter_path.read_text())
+    except OSError:
+        return []
+    items = [" ".join(body[s:e].split()) for s, e, _ in _items(body)]
+    rows = [{"item": x, "sentences": _sentences([x]), "blocked": 0, "asks": 0, "stopped": 0} for x in items if x]
+    if not rows:
+        return []
+    since = (time.time() if now is None else now) - window_s
+    texts: list[tuple[str, str]] = []
+    texts += [("blocked", e["text"]) for e in p.db.q(
+        "SELECT text FROM events WHERE kind='task_blocked' AND ts>=?", (since,))]
+    texts += [("asks", m["text"]) for m in p.db.q(
+        "SELECT text FROM messages WHERE direction='out' AND kind='ask' AND ts>=?", (since,))]
+    for e in p.db.q("SELECT text, data FROM events WHERE kind='rejected_actions' AND ts>=?", (since,)):
+        try:
+            got = json.loads(e["data"]) if e["data"] else None
+        except ValueError:
+            got = None
+        texts += [("stopped", str(x)) for x in (got if isinstance(got, list) else [e["text"]])
+                  if not str(x).startswith("ask_user:")]
+    for key, text in texts:
+        words = _rule_words(text or "")
+        for r in rows:
+            if any(_widens(s, words) for s in r["sentences"]):
+                r[key] += 1
+    return [{k: v for k, v in r.items() if k != "sentences"} for r in rows]
+
+
+def only_blocks_lines(p: Project, now: float | None = None, least: int = BLOCKS_MIN) -> list[str]:
+    """The self-efficiency audit's lines: one per Restrictions item whose blocked runs and asks
+    reached `least` in 7 days while it stopped no banned action; [] when none qualify."""
+    from .coordinator import clip
+    out = []
+    for r in citations(p, now):
+        held = r["blocked"] + r["asks"]
+        if held >= least and not r["stopped"]:
+            out.append(f"Restrictions item only blocked work in {CITE_WINDOW_S // 86400} d (held {r['blocked']} "
+                       f"blocked run{'s' * (r['blocked'] != 1)} and {r['asks']} ask{'s' * (r['asks'] != 1)}, "
+                       f"stopped no banned action): \"{clip(r['item'], 160)}\"")
     return out

@@ -26,7 +26,9 @@ the project could have saved. Model-free; the review grades it.
   whose end only a model can judge that were listed as possibly over a day or more ago; and at any
   age, a resource pause with no end or whose `until` has passed;
 - upstream fixes shipped but not confirmed yet (how many, the oldest's age), and resolutions closed
-  as 'confirmed by quiet' in the window.
+  as 'confirmed by quiet' in the window;
+- over 7 days, each Restrictions item that only blocked work: blocked runs and asks citing it reached
+  `review.rule_blocks_min` while no refused action cited it (restriction_audit.only_blocks_lines).
 
 An empty day is one line, NOTHING. `ttp audit` prints the same lines, or `report` as JSON. It reads
 only the project's own database and harness files."""
@@ -396,6 +398,9 @@ def lines(db: DB, now: float | None = None, window_s: float = WINDOW_S, blocked_
             q = 0
         if q:
             out.append(f"upstream fixes confirmed by quiet: {q}")
+        from . import restriction_audit
+        least = int((p.config().get("review") or {}).get("rule_blocks_min", restriction_audit.BLOCKS_MIN))
+        out += restriction_audit.only_blocks_lines(p, now, least)
         from .coordinator import worker_pinned_line
         if pinned := worker_pinned_line(p):
             out.append(pinned)
