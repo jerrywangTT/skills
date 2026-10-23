@@ -197,3 +197,229 @@ def test_a_task_waiting_on_an_ended_detached_driver_holds_no_worker_slot(env, mo
     finally:
         drain(d)
         assert reap_tmp_processes(tmp_path) == [], "a stand-in run outlived the test"
+
+
+def _board_setup(env, monkeypatch, tmp_path, board):
+    """_slot_setup with three worker slots and `board` slots of resource board. Each stand-in run hands
+    off $G/result-<task>.json when the test wrote one, else runs until $G/go-<task> or drain(). Returns
+    (p, d, drain, go): go(tid) ends that task's run and reaps it."""
+    p, d, drain, settle = _slot_setup(env, monkeypatch, tmp_path, slots=3)
+    g = shlex.quote(str(tmp_path))
+    monkeypatch.setenv("TTP_FAKE_SHELL", f'G={g}; if [ -e "$G/result-$TTP_TASK.json" ]; then '
+                                         f'cp "$G/result-$TTP_TASK.json" "$TTP_RUN_DIR/result.json"; exit 0; fi; '
+                                         f'while [ ! -e "$G/go-$TTP_TASK" ] && [ ! -e "$G/release-runs" ]; '
+                                         f'do sleep 0.05; done')
+    _board_slots(p, d, board)
+
+    def go(tid):
+        (tmp_path / f"go-{tid}").touch()
+        assert _until_true(lambda: d.reap_runs() or tid not in _slot_tasks(p)), f"the run of #{tid} did not end"
+    return p, d, drain, go
+
+
+def _board_slots(p, d, n, **more):
+    p.set_config("resources", {"board": n, **more})
+    d.cfg = p.config()
+
+
+def _board_add(p, title, priority, resources=("board",)):
+    from ttp import coordinator as coord
+    assert coord.apply(p, [{"type": "task_add", "title": title, "spec": "s", "kind": "work", "tier": "light",
+                            "resources": list(resources), "exclusive": True, "priority": priority}]) == []
+    return p.db.one("SELECT id FROM tasks WHERE title=?", (title,))["id"]
+
+
+def _board_waiting(p, d, tmp_path, tid, probe="ttp lock --probe board"):
+    """Start task tid (the test leaves a slot of each of its resources free), let its run hand off
+    waiting on `probe` and reap it; the next run of the task stays running until go(tid)."""
+    res = tmp_path / f"result-{tid}.json"
+    res.write_text(json.dumps({"status": "waiting", "summary": "board busy", "retry_when": probe,
+                               "retry_after_s": 3600}))
+    d.dispatch()
+    assert _until_true(lambda: d.reap_runs() or p.db.task(tid)["status"] == "queued" and tid not in _slot_tasks(p))
+    res.unlink()
+    t = p.db.task(tid)
+    assert json.loads(t["result"])["status"] == "waiting" and t["not_before"] > time.time() + 3000, t
+
+
+def test_a_freed_exclusive_slot_goes_to_the_higher_priority_task_waiting_for_it(env, monkeypatch, tmp_path,
+                                                                                reap_tmp_processes):
+    """The reported case: a priority-3 run holds board, a priority-1 task waits on `ttp lock --probe board`
+    (retry timer an hour off) and a newer priority-3 task is ready. Once board frees, dispatch starts the
+    waiting priority-1 task, not the ready one."""
+    p, d, drain, go = _board_setup(env, monkeypatch, tmp_path, board=2)
+    try:
+        a = _board_add(p, "A holds board", 3)
+        p1 = _board_add(p, "P1 urgent", 1)
+        _board_waiting(p, d, tmp_path, p1)
+        assert _slot_tasks(p) == [a]
+        _board_slots(p, d, 1)
+        c = _board_add(p, "C routine", 3)
+        d.dispatch()
+        assert _slot_tasks(p) == [a], "a task started on a full board"
+        go(a)
+        d.dispatch()
+        assert _slot_tasks(p) == [p1], "the freed slot went to the lower-priority ready task"
+        assert p.db.task(c)["status"] == "queued"
+    finally:
+        drain(d)
+        assert reap_tmp_processes(tmp_path) == [], "a stand-in run outlived the test"
+
+
+def test_a_freed_exclusive_slot_goes_to_the_higher_priority_of_two_ready_tasks(env, monkeypatch, tmp_path,
+                                                                               reap_tmp_processes):
+    p, d, drain, go = _board_setup(env, monkeypatch, tmp_path, board=1)
+    try:
+        a = _board_add(p, "A holds board", 3)
+        d.dispatch()
+        assert _slot_tasks(p) == [a]
+        c = _board_add(p, "C routine, older", 3)
+        p1 = _board_add(p, "P1 urgent", 1)
+        d.dispatch()
+        assert _slot_tasks(p) == [a]
+        go(a)
+        d.dispatch()
+        assert _slot_tasks(p) == [p1] and p.db.task(c)["status"] == "queued"
+    finally:
+        drain(d)
+        assert reap_tmp_processes(tmp_path) == [], "a stand-in run outlived the test"
+
+
+def test_a_waiting_higher_priority_task_reserves_the_slot_against_ttp_lock_and_lower_tasks(
+        env, monkeypatch, tmp_path, reap_tmp_processes):
+    """board has two slots: run A holds one, a test `ttp lock` the other, P1 waits. Once the lock ends,
+    the free slot is reserved for P1: another `ttp lock` waits (75, naming P1) and dispatch starts P1,
+    not the lower-priority ready C."""
+    from ttp import locks
+    p, d, drain, go = _board_setup(env, monkeypatch, tmp_path, board=2)
+    flag, marks = tmp_path / "unlock", tmp_path / "marks"
+    holder = None
+    try:
+        a = _board_add(p, "A holds board", 3)
+        p1 = _board_add(p, "P1 urgent", 1)
+        _board_waiting(p, d, tmp_path, p1)
+        holder = _lock(_lock_env(env, p, TTP_TASK="900"), "board", cmd=_mark(marks, "H", flag))
+        assert _until_true(lambda: marks.exists() and "start H" in marks.read_text())
+        c = _board_add(p, "C routine", 3)
+        d.dispatch()
+        assert _slot_tasks(p) == [a]
+        assert locks.reserved_by(d._reserve_path("board")) == f"task #{p1}"
+        flag.touch()
+        assert _ended([holder]) == [0]
+        r = subprocess.run([sys.executable, str(TTP), "lock", "--timeout", "2", "board", "--", "true"],
+                           env=_lock_env(env, p, TTP_TASK="901"), capture_output=True, text=True, timeout=60)
+        assert r.returncode == 75 and f"reserved for task #{p1}" in r.stderr, (r.returncode, r.stderr)
+        d.dispatch()
+        assert _slot_tasks(p) == [a, p1] and p.db.task(c)["status"] == "queued"
+    finally:
+        flag.touch()
+        if holder:
+            _ended([holder])
+        drain(d)
+        assert reap_tmp_processes(tmp_path) == [], "a stand-in run outlived the test"
+
+
+def test_a_reservation_that_keeps_a_free_slot_unused_lapses_after_exclusive_reserve_s(
+        env, monkeypatch, tmp_path, reap_tmp_processes):
+    """P1 needs board and cable; a test `ttp lock` holds cable. P1 reserves the free board, so the lower C
+    does not start on it, until the reservation lapses after budget.exclusive_reserve_s (1 s here)."""
+    from ttp import locks
+    p, d, drain, go = _board_setup(env, monkeypatch, tmp_path, board=1)
+    flag, marks = tmp_path / "unlock", tmp_path / "marks"
+    holder = None
+    try:
+        p.set_config("budget.exclusive_reserve_s", 1)
+        _board_slots(p, d, 1, cable=1)
+        p1 = _board_add(p, "P1 urgent", 1, resources=("board", "cable"))
+        _board_waiting(p, d, tmp_path, p1, probe="ttp lock --probe board,cable")
+        holder = _lock(_lock_env(env, p, TTP_TASK="900"), "cable", cmd=_mark(marks, "H", flag))
+        assert _until_true(lambda: marks.exists() and "start H" in marks.read_text())
+        c = _board_add(p, "C routine", 3)
+        d.dispatch()
+        d.dispatch()
+        assert _slot_tasks(p) == [], "C started on a board reserved for P1"
+        assert locks.reserved_by(d._reserve_path("board")) == f"task #{p1}"
+        time.sleep(1.2)
+        d.dispatch()
+        assert _slot_tasks(p) == [c], "the reservation never lapsed"
+        assert locks.reserved_by(d._reserve_path("board")) != f"task #{p1}"
+        assert p.db.task(p1)["status"] == "queued"
+    finally:
+        flag.touch()
+        if holder:
+            _ended([holder])
+        drain(d)
+        assert reap_tmp_processes(tmp_path) == [], "a stand-in run outlived the test"
+
+
+def test_equal_priority_reserves_nothing_and_the_older_waiting_task_takes_the_freed_slot(
+        env, monkeypatch, tmp_path, reap_tmp_processes):
+    from ttp import locks
+    p, d, drain, go = _board_setup(env, monkeypatch, tmp_path, board=2)
+    try:
+        a = _board_add(p, "A holds board", 3)
+        w = _board_add(p, "W waits, older", 3)
+        _board_waiting(p, d, tmp_path, w)
+        _board_slots(p, d, 1)
+        c = _board_add(p, "C ready, newer", 3)
+        d.dispatch()
+        assert _slot_tasks(p) == [a]
+        assert locks.reserved_by(d._reserve_path("board")) is None, "an equal rank took a reservation"
+        go(a)
+        d.dispatch()
+        assert _slot_tasks(p) == [w] and p.db.task(c)["status"] == "queued"
+        assert locks.reserved_by(d._reserve_path("board")) is None
+    finally:
+        drain(d)
+        assert reap_tmp_processes(tmp_path) == [], "a stand-in run outlived the test"
+
+
+def test_a_paused_exclusive_resource_is_reserved_for_no_one_and_nothing_starts_on_it(
+        env, monkeypatch, tmp_path, reap_tmp_processes):
+    from ttp import coordinator as coord, locks
+    p, d, drain, go = _board_setup(env, monkeypatch, tmp_path, board=1)
+    try:
+        p1 = _board_add(p, "P1 urgent", 1)
+        _board_waiting(p, d, tmp_path, p1)
+        before = p.db.task(p1)["not_before"]
+        coord.pause_resource(p, "board", True, reason="maintenance", by="user")
+        _board_add(p, "C routine", 3)
+        d.dispatch()
+        assert _slot_tasks(p) == []
+        assert locks.reserved_by(d._reserve_path("board")) is None, "a paused resource was reserved"
+        assert p.db.task(p1)["not_before"] == before, "a task on a paused resource was woken"
+    finally:
+        drain(d)
+        assert reap_tmp_processes(tmp_path) == [], "a stand-in run outlived the test"
+
+
+def test_a_reservation_keeps_one_slot_so_lower_tasks_take_the_spare_slots_and_its_start_serves_it(
+        env, monkeypatch, tmp_path, reap_tmp_processes):
+    """board has two slots and P1 (board and cable) reserves it while cable is held: the lower C takes the
+    spare slot, the lower D not the one kept for P1. Once P1 starts, its reservation is served."""
+    from ttp import locks
+    p, d, drain, go = _board_setup(env, monkeypatch, tmp_path, board=2)
+    flag, marks = tmp_path / "unlock", tmp_path / "marks"
+    holder = None
+    try:
+        _board_slots(p, d, 2, cable=1)
+        p1 = _board_add(p, "P1 urgent", 1, resources=("board", "cable"))
+        _board_waiting(p, d, tmp_path, p1, probe="ttp lock --probe board,cable")
+        holder = _lock(_lock_env(env, p, TTP_TASK="900"), "cable", cmd=_mark(marks, "H", flag))
+        assert _until_true(lambda: marks.exists() and "start H" in marks.read_text())
+        c = _board_add(p, "C routine", 3)
+        dd = _board_add(p, "D routine", 3)
+        d.dispatch()
+        assert _slot_tasks(p) == [c], "the spare slot stayed idle, or the kept one was taken"
+        assert locks.reserved_by(d._reserve_path("board")) == f"task #{p1}"
+        go(c)
+        flag.touch()
+        assert _ended([holder]) == [0]
+        d.dispatch()
+        assert _slot_tasks(p) == [p1, dd], "P1's start did not serve its reservation"
+    finally:
+        flag.touch()
+        if holder:
+            _ended([holder])
+        drain(d)
+        assert reap_tmp_processes(tmp_path) == [], "a stand-in run outlived the test"

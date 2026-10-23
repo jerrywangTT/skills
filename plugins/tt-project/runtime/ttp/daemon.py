@@ -8907,7 +8907,10 @@ class Daemon:
                 if reserve and first == task["id"]:
                     locks.reserve(self._reserve_path(res), shared.holder(self.p, res, hold.who(task['id']), self.cfg))
                 return {"kind": "busy", "resource": res, "tasks": busy}
-            if first is not None and first != task["id"]:
+            # A reservation keeps one slot for its task: it is served once that task runs, and a slot
+            # beyond the one it needs stays open to others.
+            if first is not None and first != task["id"] and first not in busy and \
+                    min(limit - len(busy), sum(locks.any_free([x]) for x in self._slot_paths(res))) < 2:
                 return {"kind": "reserved", "resource": res, "task": first}
             paths = self._slot_paths(res)
             if not locks.any_free(paths):
@@ -9013,7 +9016,7 @@ class Daemon:
 
     def _slot_reservers(self, now: float) -> dict[str, int]:
         """Canonical exclusive lock -> the task that reserves it (_slot_plan): no other task starts on it
-        as an exclusive holder meanwhile (_resource_hold's "reserved")."""
+        as an exclusive holder meanwhile in the one slot kept for it (_resource_hold's "reserved")."""
         return self._slot_plan(now)[0]
 
     def _slot_open(self, res: str, tid: int) -> bool:
