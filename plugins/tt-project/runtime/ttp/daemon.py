@@ -128,6 +128,7 @@ from . import worktree
 from .db import (CHANGES_NEEDED, HARNESS_MERGED_KEY, PAUSE_BOOT_KEY, SEVERITY_RANK, TERMINAL_TASK_STATES, WORKSPACE_TRIES_KEY, BranchIndex, continues_id, deferral,
                  dependency_ids, pin_of, dump_result, load_result, review_subject, reviewed_ids, task_outcome, unplanned_abrupt,
                  without_deferral)
+from .project import rebase_replace
 from .project import (Project, command_env, deep_merge, layered, disk_resume_gb, durable_append, durable_write, git_fsync_env,
                       hostname, nice_level, output_tail, own_free, own_push, push_allowed, zombie)
 from .providers import get_provider
@@ -9561,6 +9562,12 @@ class Daemon:
             lines.append(f"It delivers onto branch {elsewhere}, not {d['push_branch']}, but {uncreatable}. Review "
                          f"only: if it passes, hand off `done`; do not run `ttp push` or approve it for the push "
                          f"queue. Leave the branch" + (" and the PR" if pr else "") + " as they are.")
+        elif elsewhere and (old := worktree.rebased_branch(task)) and d.get("push_allowed", True) \
+                and rebase_replace(cfg) != "lease":
+            lines.append(f"It rebases {old} and delivers onto its own branch {elsewhere}, not {old} (a rebase "
+                         f"cannot fast-forward it) and not {d['push_branch']}. If it passes, publish it with "
+                         f"`ttp push --own --detach` from the change's worktree; never run plain `ttp push` and do "
+                         f"not approve it for the push queue.")
         elif elsewhere and (old := worktree.rebased_branch(task)) and d.get("push_allowed", True):
             lines.append(f"It rebases {old} and delivers back onto {elsewhere}, not {d['push_branch']}. If it "
                          f"passes, publish it with `ttp push --own --detach` from the change's worktree: a rebase "

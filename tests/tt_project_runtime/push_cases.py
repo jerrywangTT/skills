@@ -6287,24 +6287,35 @@ def test_push_own_with_a_git_remote_still_pushes_to_it_and_never_falls_back_to_t
     assert _git_out(repo, "rev-parse", "feature/x") == before
 
 
-def test_a_rebase_task_builds_on_its_own_branch_and_its_review_publishes_back_onto_the_old_one(env, monkeypatch):
+@pytest.mark.parametrize("mode", [None, "lease"])
+def test_a_rebase_task_builds_on_its_own_branch_and_its_review_publishes_back_onto_the_old_one(env, monkeypatch, mode):
     """A task whose title says it rebases the branch its spec names is labelled rebases:<branch>, not
-    pr_branch: it starts from that branch's head on its own branch, its prompt says --own publishes
-    back onto the old branch under a lease, and its review publishes it there with --own (never a
-    plain force push, never the queue)."""
+    pr_branch: it starts from that branch's head on its own branch. (e) Under delivery.rebase_replace
+    lease its worker prompt, task_add note, review spec and coordinator rules say --own publishes back
+    onto the old branch under a lease (never a plain force push, never the queue); unset (new_branch)
+    none of them has any lease-replace wording, and it delivers on its own new branch."""
     from ttp import coordinator as coord, push, pushq, worktree
-    from ttp.prompts import worker_task
+    from ttp.prompts import coordinator_role, worker_task
     p = make(env)
     _with_origin(env, clone=False)
     p.set_config("delivery.push_branch", "origin/work")
     p.set_config("delivery.own_push", "on")   # creating its branch takes own pushes set on
+    if mode:
+        p.set_config("delivery.rebase_replace", mode)
+    lease = mode == "lease"
+    role = coordinator_role(p)
+    assert ("--own then replaces it under a lease" in role) == lease
+    assert ("it then delivers on its own new branch" in role) != lease
+    assert "`delivery.rebase_replace` `lease`" in role and "forbids force-pushing" in role
     monkeypatch.setattr(pushq, "enabled", lambda *a, **k: False)
     _git_out(p.root, "branch", "feature/x")
     assert coord.apply(p, [{"type": "task_add", "title": "Rebase feature/x onto work", "kind": "code",
                             "spec": "pr_branch: `feature/x`\nRebase it onto the latest work."}]) == []
     t = p.db.one("SELECT * FROM tasks WHERE title='Rebase feature/x onto work'")
     assert json.loads(t["labels"]) == ["rebases:feature/x"]
-    assert any("rebases feature/x" in n for n in p.db.kv(coord.NOTES_KEY) or [])
+    notes = " ".join(p.db.kv(coord.NOTES_KEY) or [])
+    assert "rebases feature/x" in notes and ("under a lease" in notes) == lease
+    assert ("its review publishes that new branch" in notes) != lease
     assert worktree.rebased_branch(t) == "feature/x" and worktree.carried_branch(t) == ""
     path, branch = worktree.ensure(p, t)
     assert branch.startswith(f"ttp/t{t['id']}-")
@@ -6312,7 +6323,9 @@ def test_a_rebase_task_builds_on_its_own_branch_and_its_review_publishes_back_on
     # Where the rebase started is recorded, so --own keeps what feature/x gains after it.
     assert worktree.rebase_start(p.root, t["id"]) == _git_out(p.root, "rev-parse", "feature/x")
     prompt = worker_task(p, t, str(path), branch)
-    assert "rebases branch feature/x" in prompt and "under a lease" in prompt
+    assert "rebases branch feature/x" in prompt and ("under a lease" in prompt) == lease
+    assert (f"delivers there (`ttp push --own --detach`), never onto feature/x" in prompt) != lease
+    assert not re.search(r"\blease\b", prompt) or lease
     # A title without "rebase" keeps pr_branch.
     assert coord.apply(p, [{"type": "task_add", "title": "Fix feature/x CI", "kind": "code",
                             "spec": "pr_branch: `feature/x`\nFix it."}]) == []
@@ -6320,9 +6333,13 @@ def test_a_rebase_task_builds_on_its_own_branch_and_its_review_publishes_back_on
         == ["pr_branch:feature/x"]
     # Its review: published back onto feature/x with --own under a lease, review only for the queue.
     code, _, _, (rev,) = _finish_code(env, p, "rebase it", {"r.py": 3}, labels=["rebases:feature/x"])
-    assert push.pr_elsewhere(p, p.db.task(code), {"push_branch": "origin/work"}) == "feature/x"
-    assert "It rebases feature/x and delivers back onto feature/x" in rev["spec"], rev["spec"]
-    assert "under a lease" in rev["spec"], rev["spec"]
+    own = p.db.task(code)["branch"]
+    assert push.pr_elsewhere(p, p.db.task(code), {"push_branch": "origin/work"}) == ("feature/x" if lease else own)
+    if lease:
+        assert "It rebases feature/x and delivers back onto feature/x" in rev["spec"], rev["spec"]
+    else:
+        assert f"It rebases feature/x and delivers onto its own branch {own}, not feature/x" in rev["spec"], rev["spec"]
+    assert ("under a lease" in rev["spec"]) == lease and bool(re.search(r"\blease\b", rev["spec"])) == lease, rev["spec"]
     assert "`ttp push --own --detach`" in rev["spec"] and "do not approve it for the push queue" in rev["spec"]
 
 
@@ -10819,12 +10836,15 @@ def test_own_push_publishes_another_tasks_branch_checked_out_when_only_an_update
         assert push.own_target(p, repo) == ("origin", theirs), how
 
 
-def _rebase_setup(env, monkeypatch, checks=("true",), spec_line="pr_branch: {old}", record=True):
+def _rebase_setup(env, monkeypatch, checks=("true",), spec_line="pr_branch: {old}", record=True, lease=True):
     """An earlier task's branch `old` on origin (the tip `theirs`, not on the push branch) and a
     running task labelled rebases:<old> whose spec names it, on its own branch with a rebased head
     that does not fast-forward `old`; `theirs` recorded as where its rebase started, as
-    worktree.ensure records it (`record` False: nothing recorded, as for a task dispatched before)."""
+    worktree.ensure records it (`record` False: nothing recorded, as for a task dispatched before).
+    `lease`: delivery.rebase_replace lease (False: unset, which reads as new_branch)."""
     p, repo, origin, other = _push_setup(env, monkeypatch, list(checks))
+    if lease:
+        p.set_config("delivery.rebase_replace", "lease")
     owner = p.db.add_task("First example", "s", kind="code")
     old = f"ttp/t{owner}-example"
     _commit(other, "old.txt", "old\n")
@@ -10842,6 +10862,144 @@ def _rebase_setup(env, monkeypatch, checks=("true",), spec_line="pr_branch: {old
         from ttp import worktree
         worktree.record_rebase_start(repo, tid, theirs)
     return p, repo, origin, other, tid, old, theirs
+
+
+def test_a_rebase_delivers_on_its_own_new_branch_by_default_and_never_leases(env, monkeypatch, capsys):
+    """(a) delivery.rebase_replace unset (new_branch): a rebases:<old> task publishes its own branch,
+    never with a lease, and a non-fast-forward --own onto an existing remote branch (the rebased one
+    checked out, or its own branch rewritten) is refused, naming the setting."""
+    from ttp import push, worktree
+    leases = []
+    real = push.publish
+    monkeypatch.setattr(push, "publish", lambda *a, **k: leases.append(k.get("lease")) or real(*a, **k))
+    p, repo, origin, other, tid, old, theirs = _rebase_setup(env, monkeypatch, lease=False)
+    t = p.db.task(tid)
+    own = t["branch"]
+    assert worktree.delivery_branch(t) == (old, True) and push.delivery_source(p, t)[1:] == (own, False)
+    assert push.own_target(p, repo) == ("origin", own) and not push.own_lease(p, own)
+    head = _git_out(repo, "rev-parse", "HEAD")
+    assert _ttp("push", "--own") == 0, capsys.readouterr().err
+    assert _git_out(origin, "rev-parse", own) == head and _git_out(origin, "rev-parse", old) == theirs
+    assert "under a lease" not in capsys.readouterr().err and leases and not any(leases)
+    # Its own branch rewritten: git refuses the non-fast-forward, and the message names the setting.
+    _git_out(repo, "commit", "-q", "--amend", "-m", "rewritten")
+    assert _ttp("push", "--own") == push_rejected()
+    assert "delivery.rebase_replace" in capsys.readouterr().err
+    assert _git_out(origin, "rev-parse", own) == head
+    # The rebased branch itself checked out: refused before any push, naming the setting.
+    _git_out(repo, "checkout", "-q", "-B", old)
+    with pytest.raises(ValueError, match="delivery.rebase_replace"):
+        push.own_target(p, repo)
+    assert _ttp("push", "--own") != 0
+    assert "delivery.rebase_replace" in capsys.readouterr().err
+    assert _git_out(origin, "rev-parse", old) == theirs and not any(leases)
+
+
+def test_rebase_replace_lease_replaces_the_rebased_branch_as_before(env, monkeypatch, capsys):
+    """(b) delivery.rebase_replace lease keeps the lease replace: --own publishes the rebase back onto
+    the old branch with --force-with-lease. It passes config validation, and the coordinator sets it
+    only on the user's word."""
+    from ttp import coordinator as coord, project, push
+    p, repo, origin, other, tid, old, theirs = _rebase_setup(env, monkeypatch, lease=True)
+    assert project.config_problems(p.raw_config(), p.root) == [] or not any(
+        "rebase_replace" in x for x in project.config_problems(p.raw_config(), p.root))
+    t = p.db.task(tid)
+    assert push.delivery_source(p, t)[1:] == (old, True) and push.own_lease(p, old)
+    head = _git_out(repo, "rev-parse", "HEAD")
+    assert _ttp("push", "--own") == 0, capsys.readouterr().err
+    assert _git_out(origin, "rev-parse", old) == head and "under a lease" in capsys.readouterr().err
+    p.set_config("delivery.rebase_replace", "new_branch")
+    out = coord.apply(p, [{"type": "config_set", "key": "delivery.rebase_replace", "value": "lease"}])
+    assert any("needs the user's approval" in x for x in out), out
+    assert p.config()["delivery"]["rebase_replace"] == "new_branch"
+    assert coord.apply(p, [{"type": "config_set", "key": "delivery.rebase_replace", "value": "lease"}],
+                       user_turn=True) == []
+    assert p.config()["delivery"]["rebase_replace"] == "lease"
+
+
+def test_never_force_refuses_every_forced_git_push_and_a_lease(env, monkeypatch, capsys):
+    """(c) delivery.never_force true: the run's git wrapper refuses a raw `git push` that forces in any
+    form, the PreToolUse hook denies one by git's path, and --own refuses a lease push even under
+    delivery.rebase_replace lease. A fast-forward push still goes."""
+    from ttp import gitguard, hook, push
+    p, repo, origin, other, tid, old, theirs = _rebase_setup(env, monkeypatch, lease=True)
+    own = p.db.task(tid)["branch"]
+    _git_out(repo, "push", "-q", "origin", f"{own}:refs/heads/{own}")
+    _git_out(repo, "commit", "-q", "--amend", "-m", "rewritten")
+    wrapper = RUNTIME.parent / "template" / "bin" / "git"
+    run_env = {**os.environ, "TTP_PYTHON": sys.executable}
+
+    def git_push(*args):
+        return subprocess.run([str(wrapper), "push", *args], cwd=repo, env=run_env, capture_output=True,
+                              text=True, timeout=60)
+
+    forced = [["-f", "origin", own], ["--force", "origin", own], ["--force-with-lease", "origin", own],
+              ["--force-with-lease=" + own, "origin", own], ["--force-if-includes", "origin", own],
+              ["-uf", "origin", own], ["origin", f"+{own}:{own}"], ["-o", "x", "origin", "--", f"+HEAD:{own}"]]
+    # Off (the default): a forced push to its own branch is git's business.
+    assert gitguard.never_force_refusal(["push", "-f", "origin", own], dict(os.environ)) == ""
+    p.set_config("delivery.never_force", True)
+    for args in forced:
+        out = git_push(*args)
+        assert out.returncode != 0 and "delivery.never_force" in out.stderr, (args, out.stderr)
+        assert gitguard.forced(args), args
+    for args in (["origin", own], ["-o", "+x", "origin", own], ["--no-force-with-lease", "origin", own],
+                 ["--push-option", "-f", "origin", own]):
+        assert gitguard.forced(args) == "", args
+    assert _git_out(origin, "rev-parse", own) != _git_out(repo, "rev-parse", "HEAD")
+    run_dir = env["tmp"] / "run"
+    run_dir.mkdir()
+    monkeypatch.setenv("TTP_RUN_DIR", str(run_dir))
+    deny = lambda c: (hook.pre_tool_use({"tool_name": "Bash", "tool_input": {"command": c}})[0] or {}).get(
+        "hookSpecificOutput", {}).get("permissionDecision")
+    assert deny(f"/usr/bin/git push -f origin {own}") == "deny"
+    assert "delivery.never_force" in hook.git_push_bypass([["/usr/bin/git", "push", "-f", "origin", own]])
+    # A lease push is refused too, even with rebase_replace lease (validation flags that pair).
+    _git_out(repo, "reset", "-q", "--hard", f"origin/{own}")
+    assert _ttp("push", "--own") == push.REFUSED
+    assert "delivery.never_force" in capsys.readouterr().err
+    assert _git_out(origin, "rev-parse", old) == theirs
+    # A fast-forward still goes.
+    _commit(repo, "ff.txt", "ff\n")
+    assert git_push("origin", f"HEAD:{own}").returncode == 0
+
+
+def test_rebase_replace_lease_with_never_force_is_rejected_at_config_validation(env):
+    """(d) delivery.rebase_replace lease together with delivery.never_force true is a config problem
+    that says why, and config_set refuses to make that pair (either key last)."""
+    from ttp import coordinator as coord, project
+    p = make(env)
+    raw = {**p.raw_config(), "delivery": {"rebase_replace": "lease", "never_force": True}}
+    problems = project.config_problems(raw, p.root)
+    assert any("delivery.rebase_replace: lease" in x and "never_force" in x and "force push" in x
+               for x in problems), problems
+    assert not any("rebase_replace" in x for x in project.config_problems(
+        {**raw, "delivery": {"rebase_replace": "new_branch", "never_force": True}}, p.root))
+    assert any("not one of" in x for x in project.config_problems(
+        {**raw, "delivery": {"rebase_replace": "force"}}, p.root))
+    assert coord.apply(p, [{"type": "config_set", "key": "delivery.never_force", "value": True}]) == []
+    out = coord.apply(p, [{"type": "config_set", "key": "delivery.rebase_replace", "value": "lease"}], user_turn=True)
+    assert any("never_force" in x for x in out), out
+    p.set_config("delivery.never_force", False)
+    assert coord.apply(p, [{"type": "config_set", "key": "delivery.rebase_replace", "value": "lease"}], user_turn=True) == []
+    out = coord.apply(p, [{"type": "config_set", "key": "delivery.never_force", "value": True}])
+    assert any("never_force" in x for x in out) and p.config()["delivery"]["never_force"] is False, out
+    # The coordinator turns the safe sides on itself; never_force off needs the user.
+    assert coord.apply(p, [{"type": "config_set", "key": "delivery.rebase_replace", "value": "new_branch"}]) == []
+    out = coord.apply(p, [{"type": "config_set", "key": "delivery.never_force", "value": False}])
+    assert out == [] or any("needs the user's approval" in x for x in out)
+
+
+def test_an_upgraded_project_without_the_setting_rebases_onto_a_new_branch(env, monkeypatch):
+    """(f) A project.json from before delivery.rebase_replace (no key at all) reads as new_branch: no
+    migration, no config problem, and a rebase task delivers on its own branch, never under a lease."""
+    from ttp import project, push
+    p, repo, origin, other, tid, old, theirs = _rebase_setup(env, monkeypatch, lease=False)
+    assert "rebase_replace" not in (p.raw_config().get("delivery") or {})
+    assert project.rebase_replace(p.config()) == "new_branch" and not project.never_force(p.config())
+    assert not any("rebase_replace" in x or "never_force" in x for x in project.config_problems(p.raw_config(), p.root))
+    t = p.db.task(tid)
+    assert push.delivery_source(p, t) == (t, t["branch"], False) and not push.own_lease(p, old)
 
 
 @pytest.mark.parametrize("spec_line", ["pr_branch: {old}", "`pr_branch: {old}`", "pr_branch: `{old}`"])

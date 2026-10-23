@@ -433,7 +433,8 @@ EXTRA_KEYS = {
                  "after_push_timeout_s", "backup_remote", "fast_forward_also", "mirror_remotes",
                  "allow_protected_push_branch", "own_push", "own_push_remote", "deploy_restart_wait_s", "plugin_version_guard",
                  "checks_fast_globs", "checks_fast_exclude",   # these two: `ttp checks` fast path (push.FAST_GLOBS),
-                 "checks_host"},   # where checks run (remotecheck)
+                 "checks_host",   # where checks run (remotecheck)
+                 "rebase_replace", "never_force"},   # whether a rebase replaces its branch (rebase_replace)
     "jev": {"via", "url", "model"},
     "power": {"keep_awake"},
     # device_timeout_max_s: a ceiling on device-job timeouts (off: unset); see device_timeout_max.
@@ -583,6 +584,44 @@ def own_creates_pr_branch(cfg: dict) -> bool:
     delivery.draft_prs is on; an explicit own_push value, or draft PRs off, keeps the mode strict."""
     d = cfg.get("delivery") or {}
     return d.get("own_push") is None and d.get("draft_prs", True) is not False
+
+
+# delivery.rebase_replace: how a `rebases:<branch>` task delivers. "new_branch" (the default, also for
+# an unknown value): onto its own new branch, never replacing the old one. "lease": `ttp push --own`
+# replaces the old branch under --force-with-lease (push.publish), a force push a project opts into.
+# delivery.never_force (default false): no run force-pushes at all (gitguard; publish refuses a lease).
+REBASE_REPLACE_MODES = ("new_branch", "lease")
+
+
+def rebase_replace_mode(v: Any) -> str:
+    """A delivery.rebase_replace value as one of REBASE_REPLACE_MODES: unset or unknown is "new_branch"."""
+    return "lease" if str(v or "").strip().lower() == "lease" else "new_branch"
+
+
+def rebase_replace(cfg: dict) -> str:
+    """The project's delivery.rebase_replace mode (rebase_replace_mode)."""
+    return rebase_replace_mode((cfg.get("delivery") or {}).get("rebase_replace"))
+
+
+def never_force(cfg: dict) -> bool:
+    """Whether delivery.never_force is on: no run force-pushes, not even under a lease."""
+    v = (cfg.get("delivery") or {}).get("never_force")
+    return v is True or str(v).strip().lower() in ("1", "true", "yes", "on")
+
+
+def rebase_problems(delivery: dict) -> list[str]:
+    """delivery.rebase_replace and delivery.never_force problems, one line each."""
+    out = []
+    mode = delivery.get("rebase_replace")
+    if mode is not None and str(mode).strip().lower() not in REBASE_REPLACE_MODES:
+        out.append(f"delivery.rebase_replace: {mode!r} is not one of {', '.join(REBASE_REPLACE_MODES)}; "
+                   f"a rebase delivers on its own new branch")
+    if not isinstance(delivery.get("never_force", False), bool):
+        out.append(f"delivery.never_force: {delivery['never_force']!r} is not true or false")
+    if rebase_replace_mode(mode) == "lease" and never_force({"delivery": delivery}):
+        out.append("delivery.rebase_replace: lease replaces a branch with --force-with-lease, a force push, "
+                   "and delivery.never_force is true; set rebase_replace to new_branch (no lease push is made)")
+    return out
 
 
 OWN_FLAG = re.compile(r"(?<![\w-])--own\b")
@@ -738,6 +777,7 @@ def config_problems(raw: dict, root: Path | None = None) -> list[str]:
     if own is not None and not isinstance(own, bool) and \
             str(own).strip().lower().replace("-", "_") not in OWN_PUSH_MODES + ("existing", "true", "false", "yes", "no"):
         out.append(f"delivery.own_push: {own!r} is not one of {', '.join(OWN_PUSH_MODES)}; `ttp push --own` is off")
+    out += rebase_problems(delivery)
     if not isinstance(delivery.get("plugin_version_guard", False), bool):
         out.append(f"delivery.plugin_version_guard: {delivery['plugin_version_guard']!r} is not true or false; "
                    "the plugin version guard is off")

@@ -558,7 +558,8 @@ def carried_branch(task: dict) -> str:
 
 def rebased_branch(task: dict) -> str:
     """The branch a task's `rebases:<branch>` label names: it starts from that branch's head on its own
-    branch and delivers back onto it with a lease (a rebase cannot fast-forward it), or ""."""
+    branch and delivers there (delivery.rebase_replace new_branch, the default) or back onto it under a
+    lease (lease), or "": a rebase cannot fast-forward it."""
     try:
         labels = json.loads(task.get("labels") or "[]")
     except (ValueError, TypeError):

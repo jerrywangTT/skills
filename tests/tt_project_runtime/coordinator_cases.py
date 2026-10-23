@@ -8946,8 +8946,9 @@ def test_the_coordinator_role_prompt_carries_only_the_rules_of_features_that_are
     # A default project's role prompt stays under its size budget (it had grown to 52.7k chars).
     # 31_210: room for the relay-label and stale_duplicate rules, the machine-wide hold, schedule precheck
     # and facts-at-send-time rules, the Course check and Progress rule, the overlaps rule, the likely-correction rule,
-    # and the loosening-as-written and restriction-evidence rules
-    assert len(role) <= 32_650, len(role)
+    # and the loosening-as-written and restriction-evidence rules;
+    # +300: the delivery.rebase_replace / never_force config_set rule and the rebase rule per mode
+    assert len(role) <= 32_950, len(role)
     assert "<!-- ttp:" not in role and "<!-- /ttp:" not in role
     assert role in coord.prompt_parts(p)[0]
     # Rules for features that are off are left out; turning one on brings its rules in.

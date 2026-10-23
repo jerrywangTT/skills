@@ -33,6 +33,7 @@ from .db import (PAUSED_RESOURCES_KEY, SEVERITY_RANK, SHARED_SEEN_KEY, TERMINAL_
                  dependency_ids, dump_result, host_line, load_result, names_branch, pin_of, review_subject,
                  reviewed_ids,
                  task_outcome, without_deferral)
+from .project import rebase_problems, rebase_replace, rebase_replace_mode
 from .project import (CORRECTIONS_HEADER, COORDINATOR_MEMORY_CHARS, PINNED_MEMORY_KINDS, Project, code_tasks_may_push,
                       durable_append, own_push, own_push_mode,
                       durable_write, pin_verify_mode, push_queue_number, push_queue_on)
@@ -120,6 +121,13 @@ ACTIONS_SCHEMA: dict[str, Any] = {
 
 # Settings the coordinator may change on the user's explicit request. Anything else needs the
 # user to edit project.json (or the web app) themselves.
+def _rebase_replace(v) -> str:
+    """delivery.rebase_replace as config_set takes it: new_branch or lease, nothing else."""
+    if str(v or "").strip().lower() not in ("new_branch", "lease"):
+        raise ValueError(f"delivery.rebase_replace must be new_branch or lease, not {v!r}")
+    return rebase_replace_mode(v)
+
+
 def _backup_remote(v: Any) -> str:
     """delivery.backup_remote as config_set takes it: a git remote's name, or "" (off)."""
     v = "" if v is None or v is False else str(v).strip()
@@ -176,6 +184,9 @@ USER_SETTABLE = {
     "delivery.push_queue": lambda v: str(v).lower() in ("1", "true", "yes", "on"),
     # Which remote branches besides the push branch `ttp push --own` may push to: on, existing_only, off.
     "delivery.own_push": own_push_mode,
+    # new_branch (default) or lease; never_force true refuses every forced push (project.rebase_problems)
+    "delivery.rebase_replace": lambda v: _rebase_replace(v),
+    "delivery.never_force": lambda v: v is True or str(v).strip().lower() in ("1", "true", "yes", "on"),
     "delivery.push_batch_s": lambda v: push_queue_number("push_batch_s", v),
     "delivery.push_batch_max": lambda v: push_queue_number("push_batch_max", v),
     "delivery.push_min_gap_s": lambda v: push_queue_number("push_min_gap_s", v),
@@ -1063,12 +1074,14 @@ NEEDS_USER = {"budget.daily_usd": "spend", "budget.weekly_usd": "spend", "budget
               "delivery.code_tasks_may_push": "review", "delivery.backup_remote": "access",
               "delivery.fast_forward_also": "restriction", "delivery.mirror_remotes": "restriction",
               "delivery.allow_protected_push_branch": "restriction", "delivery.own_push": "restriction",
+              "delivery.rebase_replace": "restriction", "delivery.never_force": "restriction",
               MERGE_KEY: "merge"}
 SAFE_WHEN_OFF = {"delivery.code_tasks_may_push", "budget.reset_credits_auto", "delivery.backup_remote", "delivery.fast_forward_also",
                  "delivery.mirror_remotes",
-                 "delivery.allow_protected_push_branch", "delivery.own_push"}
-# The value that turns a SAFE_WHEN_OFF key off, where it is not False, "" or [].
-OFF_VALUE = {"delivery.own_push": "off"}
+                 "delivery.allow_protected_push_branch", "delivery.own_push", "delivery.rebase_replace",
+                 "delivery.never_force"}
+# The value that turns a SAFE_WHEN_OFF key off (the safe side), where it is not False, "" or [].
+OFF_VALUE = {"delivery.own_push": "off", "delivery.rebase_replace": "new_branch", "delivery.never_force": True}
 
 
 def tasks_made(db, since: float, review: bool = False) -> list[float]:
@@ -1624,8 +1637,9 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                         old = None
                 taken = bool(carried and old and old["id"] == carried[0]["id"])
                 onto = given.group("branch") if given else ""
-                # A rebase of that branch cannot fast-forward it: it works on its own branch and
-                # `ttp push --own` replaces that branch under a lease (push.own_lease).
+                # A rebase of that branch cannot fast-forward it: it works on its own branch and delivers
+                # there (delivery.rebase_replace new_branch), or `ttp push --own` replaces that branch
+                # under a lease (lease; push.own_lease).
                 rebase = bool(onto and REBASE_TITLE.search(title))
                 if onto:
                     labels.append(f"{'rebases' if rebase else 'pr_branch'}:{onto}")
@@ -1697,6 +1711,10 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     notes.append(f"task_add: #{new_id} {'rebases' if rebase else 'builds on'} {onto}, but own "
                                  f"pushes are off (delivery.own_push): it lands on the push branch like any other "
                                  f"change ({push.own_landing(cfg)}); never write `--own` into its spec")
+                elif rebase and rebase_replace(cfg) != "lease":
+                    notes.append(f"task_add: #{new_id} rebases {onto}: it starts from that branch on its own "
+                                 f"branch and delivers there with `ttp push --own` (a rebase cannot fast-forward "
+                                 f"{onto}); its review publishes that new branch")
                 elif rebase:
                     notes.append(f"task_add: #{new_id} rebases {onto}: it starts from that branch on its own "
                                  f"branch, and `ttp push --own` (its review's) publishes it back onto {onto} under "
@@ -2221,12 +2239,15 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     value = push.fast_forward_check(value, str((cfg.get("delivery") or {}).get("push_branch") or ""))
                 if key == "coordinator.provider_failover_to":
                     value = failover.to_of(value, cfg.get("providers"))
+                if key in ("delivery.rebase_replace", "delivery.never_force") and (why := rebase_problems(
+                        {**(cfg.get("delivery") or {}), key.split(".", 1)[1]: value})):
+                    raise ValueError("; ".join(why))
                 if key == "delivery.mirror_remotes":
                     value = push.mirror_check(value, str((cfg.get("delivery") or {}).get("push_branch") or ""))
                 # Merges count only the user's own message of this turn (none the harness posted).
                 said = _users_own(db, messages or []) if user_turn and key == MERGE_KEY else []
                 by_user = bool(said) if key == MERGE_KEY else user_turn
-                if key in NEEDS_USER and not by_user and not (key in SAFE_WHEN_OFF and value in (False, "", [], OFF_VALUE.get(key, False))):
+                if key in NEEDS_USER and not by_user and not (key in SAFE_WHEN_OFF and ((value == OFF_VALUE[key]) if key in OFF_VALUE else value in (False, "", []))):
                     open_ask = settinghold.asked(db, key)
                     raise ValueError(f"{key} needs the user's approval: "
                                      + (f"open ask #{open_ask} already asks; " if open_ask else

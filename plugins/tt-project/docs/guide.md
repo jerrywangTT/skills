@@ -1051,11 +1051,19 @@ project with `ttp config <name> jev.enabled false`. Without a key, screening is 
   is a non-bare working copy or lies inside another project's folder (`ttp list`), naming this
   setting. A local path set here explicitly is used as given; network remotes are unchanged. The
   `existing_only` branch check below asks the configured target.
+- `delivery.rebase_replace` (`new_branch` when unset) says where a rebase task (a `rebases:<branch>`
+  label) delivers. `new_branch`: on its own new branch, never onto the branch it rebases, and no
+  push is ever forced; a non-fast-forward `ttp push --own` onto an existing remote branch is refused,
+  naming this setting. `lease`: `--own` replaces the rebased branch under a lease, as below.
+  `delivery.never_force` (default false), when true, refuses every forced push in a run: a raw
+  `git push` with `--force`, `-f`, `--force-with-lease`, `--force-if-includes` or a `+refspec`, and
+  a lease push by `--own`; config validation rejects it together with `lease`. The coordinator may
+  set `new_branch` and `never_force` true itself, `lease` only on the user's word.
 - `delivery.own_push` (`existing_only` when unset) says which remote branches besides the push branch
   `ttp push --own` may push to, and every push that publishes as with `--own` (a notes branch, a
   `pr_branch:` or `rebases:` task). The branch is the one the task was built on (its latest
-  `pr_branch:` record, else its `rebases:` label, else that of the task it continues); a `rebases:`
-  branch is replaced only when every commit it gained since the rebase started (the tip the
+  `pr_branch:` record, else its `rebases:` label, else that of the task it continues); under
+  `delivery.rebase_replace` `lease` a `rebases:` branch is replaced only when every commit it gained since the rebase started (the tip the
   dispatcher built the task on, recorded as `refs/ttp/rebase-start/t<id>`; without one, every commit)
   is in HEAD by patch, else `--own` refuses, naming them, and the task rebases again onto the new
   tip. It then goes under a lease on the tip `--own` read before its checks, never force-pushed

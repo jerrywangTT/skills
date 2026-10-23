@@ -38,7 +38,9 @@ from . import (checkcap, checkdirs, cleantree, envfault, landed, locks, machines
 from .budget import DOC_SUFFIXES
 from .db import continues_id, dependency_ids, load_result
 from .project import (Project, code_tasks_may_push, durable_append, durable_write, git_fsync_env, hostname,
-                      load_registry, nice_level, own_creates_pr_branch, own_push, push_queue_on, renice, write_json)
+                      load_registry, nice_level, own_creates_pr_branch, own_push, push_queue_on, rebase_replace,
+                      renice, write_json)
+from .project import never_force as never_force_on
 
 # Exit codes, distinct so a worker can say why it did not push. BUSY: another push to the same
 # branch kept the lock past `delivery.push_wait_s`; the task hands back `waiting`.
@@ -1586,6 +1588,11 @@ def own_target(p: Project, repo: Path) -> tuple[str, str]:
                 str((_task_row(p, task) or {}).get("spec") or ""))}
             onto = named.pop() if len(named) == 1 else ""
         carried = bool(onto)
+    if not carried and not notes and task and rebase_replace(p.config()) != "lease" and any(
+            r and worktree.rebased_branch(r) == branch for r in [_task_row(p, task)] + _reviewed(p, task)):
+        raise ValueError(f"{branch} is the branch this task rebases: a rebase cannot fast-forward it, and "
+                         f"under delivery.rebase_replace new_branch (the default) --own never replaces it; "
+                         f"publish the rebase from the task's own new branch")
     if carried:
         if not worktree.valid_branch(onto):
             raise ValueError(f"this task's pr_branch label ({onto!r}) is not one valid branch name; "
@@ -2324,7 +2331,8 @@ def behind(repo: Path, remote: str, branch: str) -> str:
         return f"cannot fetch {remote}/{branch} to compare with HEAD"
     if _git(repo, "merge-base", "--is-ancestor", tip, "HEAD").returncode != 0:
         return (f"{remote}/{branch} ({tip[:10]}) is not an ancestor of HEAD: --own only fast-forwards "
-                "a branch that is not this task's own ttp/t<id>-... one, never rewrites it")
+                "a branch that is not this task's own ttp/t<id>-... one, never rewrites it (a rebase delivers "
+                "on its own new branch unless delivery.rebase_replace is lease)")
     return ""
 
 
@@ -2457,11 +2465,18 @@ def delivery_source(p: Project, task: dict | None) -> tuple[dict | None, str, bo
     one resolver of the branch a task delivers onto, for the dispatcher's routing and `ttp push --own`
     alike. `task` itself (worktree.delivery_branch: the latest of an appended `pr_branch:` line, its
     pr_branch label and its `rebases:` label), else the task it continues, and so on; (None, "", False)
-    when it carries none (also a cleared record: NO_PR_BRANCH or `pr_branch: ""`)."""
+    when it carries none (also a cleared record: NO_PR_BRANCH or `pr_branch: ""`). A rebase is read
+    so only under delivery.rebase_replace `lease`; under `new_branch` (the default) the task delivers
+    onto its own branch (rebase False), never replacing the one it rebases."""
     seen: set[int] = set()
+    lease = rebase_replace(p.config()) == "lease"
     while task and task["id"] not in seen:
         seen.add(task["id"])
-        if (found := worktree.delivery_branch(task)) is not None:
+        found = worktree.delivery_branch(task)
+        if found is not None and found[1] and not lease:
+            if own := str(task.get("branch") or ""):
+                return task, own, False
+        elif found is not None:
             return (task, *found) if found[0] else (None, "", False)
         c = continues_id(task)
         task = p.db.task(c) if c is not None else None
@@ -3099,7 +3114,7 @@ def publish(repo: Path, remote: str, branch: str, checks: list[str],
             base: str | None = None, ff_only: bool = False, recorded: dict | None = None,
             check_run_dir: str | None = None, reuse: Callable[[str, list, list], str] | None = None,
             host: str = "", lease: bool = False, start: str = "",
-            start_ref: str = "") -> int:
+            start_ref: str = "", never_force: bool = False) -> int:
     """`ttp push --own`: run `checks` on HEAD as it is and push it to remote/branch, the task's own
     branch. No rebase and no version bump, so the pushed commit is the one reviewed; without force,
     so the remote takes only a fast-forward of what it has. Without checks, as for `ttp push`, only
@@ -3119,8 +3134,12 @@ def publish(repo: Path, remote: str, branch: str, checks: list[str],
     new tip. Then it
     goes only with `--force-with-lease` on the tip read before the checks, so a branch that moves
     during them is not overwritten either. One the remote lacks is refused (a rebase never creates
-    its branch)."""
+    its branch). `never_force` (delivery.never_force) refuses a lease push outright."""
     repo = Path(_git(repo, "rev-parse", "--show-toplevel").stdout.strip() or repo)
+    if lease and never_force:
+        say(f"not replacing {remote}/{branch} under a lease: delivery.never_force is true, so nothing is "
+            f"force-pushed (delivery.rebase_replace lease needs it off); deliver the rebase on a new branch")
+        return REFUSED
     if _git(repo, "status", "--porcelain", "--untracked-files=no").stdout.strip():
         say("uncommitted changes; commit first")
         return REFUSED
@@ -3217,7 +3236,8 @@ def publish(repo: Path, remote: str, branch: str, checks: list[str],
         if _git(repo, "push", remote, f"{head}:refs/heads/{branch}", quiet=False).returncode == 0:
             say(f"pushed {head[:10]} to {remote}/{branch}")
             return 0
-        say(f"push to {remote}/{branch} was rejected (never forced: it must fast-forward what the remote has)")
+        say(f"push to {remote}/{branch} was rejected (never forced: it must fast-forward what the remote has; "
+            f"only a rebase under delivery.rebase_replace lease replaces a branch)")
         return REJECTED
     finally:
         if lock is not None:
@@ -3541,7 +3561,8 @@ def _run(p: Project, repo: Path, own: bool = False, recorded: dict | None = None
                      timed=lambda s: record_check_s(p, s), base=base,
                      ff_only=own_ff_only(branch) and not lease, lease=lease, start=start, start_ref=start_ref,
                      recorded=recorded or recorded_checks(os.environ.get("TTP_RUN_DIR")), check_run_dir=output,
-                     reuse=lambda tree, cmds, envs: _own_pass(p, tree, cmds, envs), host=d.get("checks_host") or "")
+                     reuse=lambda tree, cmds, envs: _own_pass(p, tree, cmds, envs), host=d.get("checks_host") or "",
+                     never_force=never_force_on(p.config()))
     else:
         rc = push(repo, remote, branch, checks, rounds, hold=lambda: take(p, remote, branch, wait_s),
                   version_bump=version_bump, timed=lambda s: record_check_s(p, s),

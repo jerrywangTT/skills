@@ -14,6 +14,7 @@ from . import budget as bud
 from . import chaincap, conflictfix, overlap, replymsg, settinghold, settled, taskfacts, timefmt
 from .db import continues_id, load_result
 from .hook import unread_update
+from .project import rebase_replace
 from .project import (CORRECTIONS_HEADER, OWN_FLAG, WORKER_MEMORY_CHARS, WORKER_PINNED_MIN_CHARS, WORKER_RANKED_MIN_CHARS,
                       Project, code_tasks_may_push, own_push, push_allowed, push_queue_on, worker_memory,
                       WORKER_POLICY_MIN_CHARS)
@@ -73,6 +74,7 @@ def coordinator_features(p: Project) -> set[str]:
         on.add("land")
     mode = own_push(cfg)
     on |= {"own_push"} if mode != "off" else set()
+    on |= {"rebase_lease"} if rebase_replace(cfg) == "lease" else set()
     # Unset reads as existing_only, but its section costs every coordinator turn: the own_push one names it.
     on |= {"own_push_limited"} if mode != "on" and d.get("own_push") is not None else set()
     if d.get("draft_prs", True) is not False:
@@ -666,6 +668,10 @@ def worker_task(p: Project, task: dict, cwd: str, branch: str | None, wake: dict
                     + (": its worktree is on it.\n" if branch == onto else
                        f": it could not be checked out here, so this task works on its own branch, from that "
                        f"branch's head when there is one, and the push publishes its head onto {onto}.\n"))
+    elif (old_branch := rebased_branch(task)) and branch and rebase_replace(cfg) != "lease":
+        history += (f"\nThis task rebases branch {old_branch}: it starts from that branch's head on its own branch "
+                    f"{branch} and delivers there (`ttp push --own --detach`), never onto {old_branch}: a rebase "
+                    f"cannot fast-forward it.\n")
     elif (old_branch := rebased_branch(task)) and branch:
         history += (f"\nThis task rebases branch {old_branch}: it starts from that branch's head on its own branch "
                     f"{branch}, and `ttp push --own --detach` publishes its head back onto {old_branch}. A rebase "

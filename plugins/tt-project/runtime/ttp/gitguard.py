@@ -12,6 +12,9 @@ set) the push runs with a pre-push hook of the harness's: git itself names every
 update, whatever the refspec, and the hook refuses one that is the push branch (on any remote, also
 a delete). The repository's own pre-push hook still runs after it. `--no-verify` cannot skip it.
 Anything else, or any fault reading the project, runs the real git unchanged.
+
+With delivery.never_force on, a run's push that forces in any form (--force, -f, --force-with-lease,
+--force-if-includes, a `+refspec`) is refused before git runs (forced, never_force_refusal).
 """
 from __future__ import annotations
 
@@ -22,6 +25,9 @@ from pathlib import Path
 
 # git's global options that take the next word as their value
 VALUE_OPTS = {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--super-prefix", "--config-env"}
+# `git push` options that take the next word as their value (or `--opt=value`)
+PUSH_VALUE_OPTS = {"--push-option", "--receive-pack", "--exec", "--repo"}
+FORCE_OPTS = ("--force", "--force-with-lease", "--force-if-includes")
 HOOK = """#!/bin/sh
 # tt-project: refuses a push to the push branch from a code task's run (ttp/gitguard.py).
 nl='
@@ -52,6 +58,49 @@ def split(args: list[str]) -> tuple[list[str], str, list[str]]:
         else:
             return args[:i], a, args[i + 1:]
     return args, "", []
+
+
+def forced(rest: list[str]) -> str:
+    """The first word of `git push <rest>` that forces the push (a force option, `-f` alone or bundled,
+    or a `+refspec`), else ""."""
+    i, positional = 0, False
+    while i < len(rest):
+        a = rest[i]
+        if positional or not a.startswith("-") or a == "-":
+            if a.startswith("+"):
+                return a
+        elif a == "--":
+            positional = True
+        elif a.startswith("--"):
+            if a.split("=", 1)[0] in FORCE_OPTS:
+                return a
+            if a in PUSH_VALUE_OPTS:
+                i += 1
+        else:
+            for j, c in enumerate(a[1:], 1):
+                if c == "f":
+                    return a
+                if c == "o":   # -o<value> or -o <value>
+                    i += j == len(a) - 1
+                    break
+        i += 1
+    return ""
+
+
+def never_force_refusal(args: list[str], env: dict) -> str:
+    """Why `git <args>` must not run in this run (a forced push while delivery.never_force is on), or ""."""
+    _, sub, rest = split(args)
+    if sub != "push" or not (word := forced(rest)):
+        return ""
+    task, base = env.get("TTP_TASK", ""), env.get("TTP_PROJECT", "")
+    if not task.isdigit() or not base:
+        return ""
+    from .project import Project, never_force
+    p = Project(base)
+    if not (p.state / "project.db").is_file() or not never_force(p.config()):
+        return ""
+    return (f"delivery.never_force is true: this run never force-pushes ({word}); push a fast-forward, "
+            f"or deliver a rewritten history on a new branch")
 
 
 def guarded_branch(env: dict) -> tuple[str, str]:
@@ -130,6 +179,13 @@ def command(real: str, args: list[str], env: dict) -> tuple[list[str], dict]:
 def main(argv: list[str]) -> int:
     """argv: the real git, then the arguments `git` was called with."""
     real, args = argv[0], argv[1:]
+    try:
+        why = never_force_refusal(args, dict(os.environ))
+    except Exception:   # a fault reading the project never stops git
+        why = ""
+    if why:
+        print(f"tt-project: {why}", file=sys.stderr)
+        return 1
     cmd, env = command(real, args, dict(os.environ))
     sys.stdout.flush()
     os.execve(real, cmd, env)

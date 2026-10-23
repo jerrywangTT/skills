@@ -369,10 +369,13 @@ def git_push_bypass(segments: list[list[str]]) -> str | None:
     """Why a Bash call that pushes with git called by a path (around the run's bin/git, gitguard.py)
     is refused while this run may not push to the push branch, else None."""
     from . import gitguard
-    if not any(os.path.basename(s[0]) == "git" and "/" in s[0] and gitguard.split(s[1:])[1] == "push"
-               for s in segments):
+    pushes = [s for s in segments if os.path.basename(s[0]) == "git" and "/" in s[0]
+              and gitguard.split(s[1:])[1] == "push"]
+    if not pushes:
         return None
     try:
+        if forced := next((w for s in pushes if (w := gitguard.never_force_refusal(s[1:], dict(os.environ)))), ""):
+            return forced
         branch, why = gitguard.guarded_branch(dict(os.environ))
     except Exception:
         return None
