@@ -18,8 +18,10 @@ unlanded branches that touch what its spec names (prompt_block). Common files ne
 `overlap.ignore` globs (changelogs, changesets, manifests, `__init__.py`) and hubs, tracked files
 larger than `overlap.hub_bytes`, which most changes touch in passing, and the files the check
 commands (`delivery.push_checks`) name, which specs cite as the required suite. Folders are no
-paths. No
-network, no model.
+paths. A shared file in a hot area, one a review failed on within reviewcap.AREA_WINDOW_S (its main
+file) with that change not landed, or a settled area's file, is more than a warning: task_add
+chains the new task after the newest open, unlanded task sharing it (chain), unless its spec has a
+`parallel: <why>` line. No network, no model.
 """
 from __future__ import annotations
 
@@ -31,11 +33,13 @@ import subprocess
 import time
 from pathlib import Path
 
-from . import settled
+from . import reviewcap, settled
 
 KINDS = ("code", "harness")
 OPEN = ("queued", "running", "review", "pushing", "waiting", "blocked")
 LABEL = "overlap:"           # a task's label: overlap:<ids>:<warning>, shown in the digest while queued
+PARALLEL_LABEL = "parallel:"  # a task's label: why its spec runs it beside a hot or settled area's task
+PARALLEL = re.compile(r"^[ \t]*parallel:[ \t]*(\S.*?)[ \t]*$", re.M)
 CACHE = "overlap_diffs.json"  # state/: {head: [[status, path], ...]}, one git diff per head ever
 CACHE_MAX = 400
 LANDED_CACHE = "overlap_landed.json"   # state/: [head], branch heads found on the push branch by patch
@@ -314,9 +318,11 @@ def warning(hits: list[dict]) -> str:
             f"beside {it}{f': {fix}' if fix else ''}")
 
 
-def label(hits: list[dict]) -> str:
-    """overlap:<ids the fix names>:<warning>: the digest drops it once the task waits on them all."""
-    return f"{LABEL}{','.join(map(str, advice(hits)[0]))}:{warning(hits)}" if hits else ""
+def label(hits: list[dict], chained: int | None = None) -> str:
+    """overlap:<ids the fix names>:<warning>: the digest drops it once the task waits on them all
+    (only on `chained` once task_add chained it after that task)."""
+    ids = [chained] if chained is not None else advice(hits)[0]
+    return f"{LABEL}{','.join(map(str, ids))}:{warning(hits)}" if hits else ""
 
 
 def digest_note(task: dict) -> str:
@@ -334,8 +340,40 @@ def digest_note(task: dict) -> str:
             ids = {int(x) for x in ids_s.split(",") if x.isdigit()}
             when = deferral(task).get("when") or ""
             waits = set(dependency_ids(task)) | {int(x) for x in re.findall(r"#(\d+)", when)}
+            from .landed import task_refs
+            waits |= {int(x) for x in task_refs(when) if x.isdigit()}
             return "" if ids and ids <= waits else text
     return ""
+
+
+def hot_files(p, now: float | None = None) -> list[str]:
+    """The main files (reviewcap.main_file) of reviews failed within reviewcap.AREA_WINDOW_S whose
+    change has not landed: the review areas a new task should not run beside."""
+    from .db import dependency_ids
+    now = time.time() if now is None else now
+    landed, out = _landed_ids(p.db), []
+    for rid in reviewcap.failed_reviews(p.db, now - reviewcap.AREA_WINDOW_S):
+        r = p.db.task(rid)
+        if r and rid not in landed and not set(dependency_ids(r)) & landed and (f := reviewcap.main_file(p, r)):
+            out.append(f)
+    return out
+
+
+def chain(p, hits: list[dict], now: float | None = None) -> tuple[int, str] | None:
+    """(id, why) of the newest open, unlanded task in `hits` (find) sharing a settled area's file or a
+    hot review area's (hot_files): a new task waits for it to land. None for plain overlaps."""
+    landed = _landed_ids(p.db)
+    shown = [h for h in hits if h.get("open") and h["id"] not in landed]
+    zones = {settled._base(f) for r in settled.live(p, now) for f in r.get("files") or []} if shown else set()
+    hot = None
+    for h in shown:   # the most recent first
+        paths = [f for f, _ in h["paths"]]
+        if f := next((f for f in paths if settled._base(f) in zones), None):
+            return h["id"], f"{f} is a settled area"
+        hot = hot_files(p, now) if hot is None else hot
+        if f := next((f for f in paths if any(same(f, x) for x in hot)), None):
+            return h["id"], f"{f} had a failed review within {reviewcap.AREA_WINDOW_S / 3600:g} h"
+    return None
 
 
 def prompt_block(p, task: dict) -> str:

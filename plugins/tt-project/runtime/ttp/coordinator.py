@@ -1405,6 +1405,15 @@ def _file_overlaps(p: Project, kind: str, spec: str, skip: set) -> list[dict]:
         return []
 
 
+def _overlap_chain(p: Project, clash: list[dict]) -> tuple[int, str] | None:
+    """The open task a new one sharing a hot or settled area's file waits for (overlap.chain); a fault
+    reading the areas leaves today's warning only."""
+    try:
+        return file_overlap.chain(p, clash) if clash else None
+    except Exception:
+        return None
+
+
 def defer_labels(after: float | None, when: str | None, why: str | None = None) -> list[str]:
     """The labels a deferred task carries (see db.deferral); none when it may start now."""
     if after is None and not when:
@@ -1670,7 +1679,6 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 if when and a.get("continues") is not None and (stuck := chaincap.own_wait(
                         p, [t["id"] for t in chaincap.chain(db, int(a["continues"]))], when)):
                     raise ValueError(f"task_add rejected: {stuck}")
-                labels += defer_labels(after, when, start_why(a, {}, when))
                 stale = marker_only_probe(when, p.root)
                 why = prguard.spec_problem(db, a.get("spec") or "")
                 if why:
@@ -1683,7 +1691,21 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 pin = _task_pin(cfg, a, pin_of(old or followup))
                 labels += _pin_mark(db, a.get("pin_required"), pin, old or followup)
                 clash = _file_overlaps(p, kind, a.get("spec") or "", {old["id"]} if old else set())
-                labels += [file_overlap.label(clash)] if clash else []
+                why_after = start_why(a, {}, when)
+                tie, parallel = _overlap_chain(p, clash), file_overlap.PARALLEL.search(a.get("spec") or "")
+                beside = clip(parallel.group(1), START_WHY_CHARS) if tie and parallel else ""
+                if beside:
+                    labels.append(file_overlap.PARALLEL_LABEL + beside)
+                    tie = None
+                elif tie and tie[0] not in deps and str(tie[0]) not in landed.task_refs(when):
+                    when = f"landed:#{tie[0]}" if not when else (
+                        f"ttp landed --task {tie[0]} && "
+                        + (f"ttp landed --task {m.group(1)}" if (m := landed.LANDED_PROBE.fullmatch(when)) else f"({when})"))
+                    why_after = "; ".join(x for x in (why_after, f"#{tie[0]} lands ({tie[1]})") if x)[:START_WHY_CHARS]
+                else:
+                    tie = None
+                labels += [file_overlap.label(clash, tie and tie[0])] if clash else []
+                labels += defer_labels(after, when, why_after)
                 with db.tx():
                     new_id = db.add_task(title, a.get("spec") or "", kind=kind, tier=tier,
                                          priority=int(a.get("priority") or 3), **pin,
@@ -1735,6 +1757,12 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     notes.append(f"task_add: #{new_id} added; flagged: {stale}")
                 if clash:
                     notes.append(f"task_add: #{new_id} added; {file_overlap.warning(clash)}")
+                if tie:
+                    notes.append(f"task_add: #{new_id} chained after #{tie[0]} (start_when {when}): {tie[1]}; "
+                                 f"a `parallel: <why>` spec line runs it beside instead")
+                elif beside:
+                    notes.append(f"task_add: #{new_id} runs beside a hot or settled area's task, as its spec's "
+                                 f"`parallel:` line asks: {beside}")
                 if hit := settled.turn_note(p, str(a.get("spec") or ""), f"task_add: #{new_id}"):
                     notes.append(hit)
                 if pr_ask:

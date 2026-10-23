@@ -238,3 +238,74 @@ def test_overlap_warning_names_the_most_recent_few_then_a_count(env):
     assert _labels(p, new) == [f"overlap:{','.join(map(str, top))}:{want}"]
     p.db.update_task(new, depends_on=json.dumps(top))
     assert overlap.digest_note(p.db.task(new)) == ""
+
+
+def _failed_review(p, of, ago=3600):
+    """A review of task `of` that failed `ago` seconds back (a task_failed event on it)."""
+    rid = p.db.add_task(f"Review #{of}", "s", kind="review", status="failed", depends_on=[of])
+    p.db.x("INSERT INTO events(ts, source, kind, text, task) VALUES(?, 'daemon', 'task_failed', 'x', ?)",
+           (time.time() - ago, rid))
+    return rid
+
+
+def test_task_add_chains_a_new_task_on_a_hot_or_settled_file_after_the_newest_open_task(env, monkeypatch):
+    """Five lineages changed runtime/ttp/progress.py side by side and broke each other's reviews. A new
+    code task naming a file a review failed on within 48 h (its main file, change not landed) waits
+    for the newest open task sharing it to land (start_when landed:#<id>, ANDed with its own wait);
+    a `parallel: <why>` line skips that and is recorded; a file with no failed review keeps only the
+    warning; a landed or cancelled open task chains nothing; a settled area's file chains too."""
+    from ttp import coordinator as coord, overlap, reviewcap, settled
+    from ttp.db import deferral
+    p = make(env)
+    hot, cold, calm = "runtime/ttp/progress.py", "runtime/ttp/relay.py", "runtime/ttp/sweep.py"
+    mains = {}
+    monkeypatch.setattr(reviewcap, "main_file", lambda p, r: mains.get(r["id"]))
+
+    def add(title, spec, **kw):
+        assert coord.apply(p, [{"type": "task_add", "title": title, "kind": "code", "spec": spec, **kw}]) == []
+        return p.db.one("SELECT * FROM tasks WHERE title=?", (title,))
+
+    older = p.db.add_task("older", f"Change {hot}.", kind="code", status="done")
+    mains[_failed_review(p, older)] = hot
+    first = p.db.add_task("first", f"Change {hot}.", kind="code", status="queued")
+    newest = p.db.add_task("newest", f"Change {hot} and {cold}.", kind="code", status="running")
+    t = add("chained", f"Extend {hot}.")
+    assert deferral(t)["when"] == f"landed:#{newest}", deferral(t)
+    assert f"#{newest} lands" in deferral(t)["why"]
+    assert any(n.startswith(f"task_add: #{t['id']} chained after #{newest} (start_when landed:#{newest}): {hot}")
+               for n in p.db.kv(coord.NOTES_KEY)), p.db.kv(coord.NOTES_KEY)
+    assert overlap.digest_note(t) == ""   # waiting on the newest settles the warning
+    # The next one chains after that one (now the newest), the caller's own wait kept as an AND.
+    prev = t["id"]
+    t = add("own wait", f"Extend {hot}.", start_when=f"landed:#{first}")
+    assert deferral(t)["when"] == f"ttp landed --task {prev} && ttp landed --task {first}"
+    prev = t["id"]
+    t = add("own probe", f"Extend {hot}.", start_when="test -e /tmp/x || false")
+    assert deferral(t)["when"] == f"ttp landed --task {prev} && (test -e /tmp/x || false)"
+    # A `parallel:` line skips the chain and is recorded on the task.
+    t = add("beside", f"Extend {hot}.\nparallel: a one-line hotfix the other task does not touch")
+    assert not deferral(t)
+    assert "parallel:a one-line hotfix the other task does not touch" in json.loads(t["labels"])
+    assert any(f"#{t['id']} runs beside" in n for n in p.db.kv(coord.NOTES_KEY))
+    # A file with no failed review: the warning label only.
+    t = add("cold", f"Extend {cold}.")
+    assert not deferral(t) and [x for x in json.loads(t["labels"]) if x.startswith("overlap:")]
+    # Once the failed review's change landed, the area is no longer hot.
+    p.db.x("INSERT INTO task_landings(marker, task, sha, target) VALUES('m1', ?, 'abc1234', 'b')", (older,))
+    assert not deferral(add("after landing", f"Extend {hot}."))
+    # A landed or cancelled open task chains nothing, while the area stays hot.
+    mains[_failed_review(p, p.db.add_task("stray", f"Change {hot}.", kind="code", status="done"))] = hot
+    p.db.x("UPDATE tasks SET status='cancelled' WHERE kind='code' AND status='queued' AND id>?", (newest,))
+    assert overlap.chain(p, overlap.find(p, f"Extend {hot}."))[0] == newest
+    p.db.update_task(newest, status="cancelled")
+    p.db.x("INSERT INTO task_landings(marker, task, sha, target) VALUES('m2', ?, 'def5678', 'b')", (first,))
+    assert [h["id"] for h in overlap.find(p, f"Extend {hot}.")] == [first]
+    assert overlap.chain(p, overlap.find(p, f"Extend {hot}.")) is None
+    # A settled area's file chains after the newest open task touching it, failed review or not.
+    p.db.update_task(newest, status="queued")
+    settled.add(p, [calm], "one rule", commit=False)
+    p.db.update_task(first, spec=f"Change {calm}.")
+    later = p.db.add_task("later", f"Change {calm}.", kind="code", status="blocked")
+    t = add("settled", f"Extend {calm}.")
+    assert deferral(t)["when"] == f"landed:#{later}"
+    assert f"{calm} is a settled area" in deferral(t)["why"]
