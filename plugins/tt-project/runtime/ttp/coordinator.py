@@ -1405,13 +1405,32 @@ def _file_overlaps(p: Project, kind: str, spec: str, skip: set) -> list[dict]:
         return []
 
 
-def _overlap_chain(p: Project, clash: list[dict]) -> tuple[int, str] | None:
-    """The open task a new one sharing a hot or settled area's file waits for (overlap.chain); a fault
+def _overlap_chain(p: Project, clash: list[dict], roots: set[int] = frozenset()) -> tuple[int, str] | None:
+    """The open task a new one sharing a hot or settled area's file waits for (overlap.chain), never
+    one in or waiting on the lineage of `roots` (the tasks it continues, follows or carries); a fault
     reading the areas leaves today's warning only."""
     try:
-        return file_overlap.chain(p, clash) if clash else None
+        if not clash:
+            return None
+        lineage = set(roots) | {t["id"] for r in roots for t in chaincap.chain(p.db, r)}
+        return file_overlap.chain(p, clash, lineage=lineage)
     except Exception:
         return None
+
+
+def _and_landed(p: Project, tid: int, when: str | None) -> str:
+    """`when` ANDed after a wait on task `tid` landing: `landed:#<tid>` alone, else `ttp landed --task
+    <tid> && <when as the daemon runs it>` (landed.probe_command, so an ancestor probe keeps its
+    rewrite); '' when the result is no valid probe (check_probe: too long)."""
+    if not when:
+        return f"landed:#{tid}"
+    cmd = landed.probe_command(when, p)
+    both = f"ttp landed --task {tid} && " + (cmd if cmd != when else f"({when})")
+    try:
+        check_probe(both)
+    except ValueError:
+        return ""
+    return both
 
 
 def defer_labels(after: float | None, when: str | None, why: str | None = None) -> list[str]:
@@ -1692,15 +1711,16 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 labels += _pin_mark(db, a.get("pin_required"), pin, old or followup)
                 clash = _file_overlaps(p, kind, a.get("spec") or "", {old["id"]} if old else set())
                 why_after = start_why(a, {}, when)
-                tie, parallel = _overlap_chain(p, clash), file_overlap.PARALLEL.search(a.get("spec") or "")
+                roots = {int(a["continues"])} if a.get("continues") is not None else set()
+                roots |= {t["id"] for t in (old, followup, carried and carried[0]) if t}
+                tie, parallel = _overlap_chain(p, clash, roots), file_overlap.PARALLEL.search(a.get("spec") or "")
                 beside = clip(parallel.group(1), START_WHY_CHARS) if tie and parallel else ""
                 if beside:
                     labels.append(file_overlap.PARALLEL_LABEL + beside)
                     tie = None
-                elif tie and tie[0] not in deps and str(tie[0]) not in landed.task_refs(when):
-                    when = f"landed:#{tie[0]}" if not when else (
-                        f"ttp landed --task {tie[0]} && "
-                        + (f"ttp landed --task {m.group(1)}" if (m := landed.LANDED_PROBE.fullmatch(when)) else f"({when})"))
+                elif tie and tie[0] not in deps and str(tie[0]) not in landed.task_refs(when) \
+                        and (both := _and_landed(p, tie[0], when)):
+                    when = both
                     why_after = "; ".join(x for x in (why_after, f"#{tie[0]} lands ({tie[1]})") if x)[:START_WHY_CHARS]
                 else:
                     tie = None

@@ -359,11 +359,32 @@ def hot_files(p, now: float | None = None) -> list[str]:
     return out
 
 
-def chain(p, hits: list[dict], now: float | None = None) -> tuple[int, str] | None:
+def waits_on(db, tid: int, ids: set[int], landed: set[int] | None = None, limit: int = 200) -> bool:
+    """Whether task `tid` is one of `ids` or waits on one: its depends_on and start_when task refs
+    (landed.task_refs), followed through the tasks they name. A landed task's wait is over."""
+    from .db import deferral, dependency_ids
+    from .landed import task_refs
+    landed = _landed_ids(db) if landed is None else landed
+    seen, todo = set(), [tid]
+    while todo and len(seen) < limit:
+        t = db.task(todo.pop())
+        if not t or t["id"] in seen or t["id"] in landed:
+            continue
+        if t["id"] in ids:
+            return True
+        seen.add(t["id"])
+        todo += list(dependency_ids(t)) + [int(r) for r in task_refs(deferral(t).get("when")) if r.isdigit()]
+    return False
+
+
+def chain(p, hits: list[dict], now: float | None = None, lineage: set[int] | None = None) -> tuple[int, str] | None:
     """(id, why) of the newest open, unlanded task in `hits` (find) sharing a settled area's file or a
-    hot review area's (hot_files): a new task waits for it to land. None for plain overlaps."""
+    hot review area's (hot_files): a new task waits for it to land. None for plain overlaps. A task
+    in the new one's `lineage`, or waiting on it (waits_on), is passed over: its work lands only with
+    the new task's, so waiting on it would never end."""
     landed = _landed_ids(p.db)
-    shown = [h for h in hits if h.get("open") and h["id"] not in landed]
+    shown = [h for h in hits if h.get("open") and h["id"] not in landed
+             and not (lineage and waits_on(p.db, h["id"], lineage, landed))]
     zones = {settled._base(f) for r in settled.live(p, now) for f in r.get("files") or []} if shown else set()
     hot = None
     for h in shown:   # the most recent first

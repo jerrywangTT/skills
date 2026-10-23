@@ -282,6 +282,14 @@ def test_task_add_chains_a_new_task_on_a_hot_or_settled_file_after_the_newest_op
     prev = t["id"]
     t = add("own probe", f"Extend {hot}.", start_when="test -e /tmp/x || false")
     assert deferral(t)["when"] == f"ttp landed --task {prev} && (test -e /tmp/x || false)"
+    # An ancestor probe keeps landed.probe_command's rewrite, so a sha the push queue rebased still counts.
+    prev, sha = t["id"], "abcdef1234567"
+    t = add("rebased sha check", f"Extend {hot} for the queue.", start_when=f"git merge-base --is-ancestor {sha} origin/tt/push")
+    assert deferral(t)["when"] == f"ttp landed --task {prev} && ttp landed {sha} --onto origin/tt/push"
+    # A combined probe over the start_when limit chains nothing: the caller's own wait stays.
+    long = "test -e /tmp/" + "x" * (coord.START_WHEN_CHARS - 30)
+    t = add("oversized shell gate", f"Guard {hot} with a file test.", start_when=long)
+    assert deferral(t)["when"] == long
     # A `parallel:` line skips the chain and is recorded on the task.
     t = add("beside", f"Extend {hot}.\nparallel: a one-line hotfix the other task does not touch")
     assert not deferral(t)
@@ -309,3 +317,37 @@ def test_task_add_chains_a_new_task_on_a_hot_or_settled_file_after_the_newest_op
     t = add("settled", f"Extend {calm}.")
     assert deferral(t)["when"] == f"landed:#{later}"
     assert f"{calm} is a settled area" in deferral(t)["why"]
+
+
+def test_overlap_chain_never_waits_on_a_task_that_waits_on_the_new_tasks_own_lineage(env, monkeypatch):
+    """A failed review's code task A, then B chained after it (start_when landed:#A): the fix of A
+    (continues A) must not wait on B, as B waits on A, whose work lands only with the fix. Two hops
+    (C waits on B, which waits on A) are followed too; an unrelated open task is still chained."""
+    from ttp import coordinator as coord, reviewcap
+    from ttp.db import deferral
+    p = make(env)
+    hot = "runtime/ttp/progress.py"
+    monkeypatch.setattr(reviewcap, "main_file", lambda p, r: hot)
+
+    def add(title, spec, **kw):
+        assert coord.apply(p, [{"type": "task_add", "title": title, "kind": "code", "spec": spec, **kw}]) == []
+        return p.db.one("SELECT * FROM tasks WHERE title=?", (title,))
+
+    a = p.db.add_task("A", f"Change {hot}.", kind="code", status="done")
+    _failed_review(p, a)
+    b = p.db.add_task("B", f"Change {hot}.", kind="code", status="queued",
+                      labels=[f"start_when:landed:#{a}"])
+    fix = add("Fix A", f"Fix {hot}.", continues=a)
+    assert not deferral(fix), deferral(fix)
+    p.db.update_task(fix["id"], status="cancelled")
+    c = p.db.add_task("C", f"Change {hot}.", kind="code", status="queued", depends_on=[b])
+    fix = add("Fix A again", f"Fix {hot}.", continues=a)
+    assert not deferral(fix), deferral(fix)
+    p.db.update_task(fix["id"], status="cancelled")
+    # Only C and B wait on A: an unrelated open task newer than them is still the one chained after.
+    d = p.db.add_task("D", f"Change {hot}.", kind="code", status="queued")
+    fix = add("Fix A third", f"Fix {hot}.", continues=a)
+    assert deferral(fix)["when"] == f"landed:#{d}"
+    # A task outside A's lineage still chains after the newest (C waits on A, not on it).
+    p.db.x("UPDATE tasks SET status='cancelled' WHERE id IN (?, ?)", (d, fix["id"]))
+    assert deferral(add("other", f"Extend {hot}."))["when"] == f"landed:#{c}"
