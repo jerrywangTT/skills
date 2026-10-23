@@ -134,6 +134,38 @@ def test_a_schedule_command_and_a_heal_check_whose_script_changed_mid_run_are_re
     assert _runs(tmp_path / "sick.sh") == 1
 
 
+def test_a_watcher_or_precheck_exit_1_is_its_answer_and_never_rerun_when_a_neighbour_changed(env):
+    from ttp import daemon as dm, schedrun, scriptwatch
+    p = make(env)
+    bin_dir = p.root / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    (bin_dir / "helper.sh").write_text("#!/bin/bash\ntrue\n")
+    # A watcher's first run reports, replaces a neighbour script by an atomic rename and exits 1 ("found
+    # something"); a rerun would print nothing and its report would be lost.
+    (bin_dir / "watch").write_text(
+        "#!/bin/bash\n"
+        "echo x >> \"$0.runs\"\n"
+        "if [ ! -e \"$0.ran\" ]; then\n"
+        "  : > \"$0.ran\"\n"
+        "  printf '#!/bin/bash\\nfalse\\n' > bin/helper.sh.tmp && mv bin/helper.sh.tmp bin/helper.sh\n"
+        "  echo 'chip dropped'\n"
+        "  exit 1\n"
+        "fi\n")
+    d = dm.Daemon(p.base)
+    assert d._run_command_watcher({"name": "chips"}, {"command": "bash bin/watch"}) == "ok (1 observations)"
+    assert _runs(bin_dir / "watch") == 1
+    # The schedule precheck's exit 1 ("the run goes ahead") is an answer too: run once.
+    (bin_dir / "watch.ran").unlink()
+    (bin_dir / "watch.runs").unlink()
+    out = schedrun.run_group("bash bin/watch", cwd=str(p.root), timeout=60, env=dict(os.environ), ok=(0, 1))
+    assert out.returncode == 1 and out.stdout == "chip dropped\n" and _runs(bin_dir / "watch") == 1
+    # A real failure (a bash syntax error from a script rewritten in place) is still rerun once.
+    _self_rewriting(bin_dir / "broken.sh")
+    out = schedrun.run_group("bash bin/broken.sh", cwd=str(p.root), timeout=60, env=dict(os.environ), ok=(0, 1))
+    assert out.returncode == 0 and out.stderr.startswith(f"ttp: {scriptwatch.LABEL}: bin/broken.sh\n")
+    assert _runs(bin_dir / "broken.sh") == 2
+
+
 def test_script_writes_rename_a_new_file_into_place_keep_the_mode_and_leave_no_partial_file(env, tmp_path, monkeypatch):
     from ttp import cli, project
     f = tmp_path / "bin" / "check"

@@ -4705,8 +4705,9 @@ class Daemon:
             rewake = 6 * 3600
         started = time.time()
         timeout = _watcher_timeout(payload)
-        try:
-            out = schedrun.run_group(cmd, cwd=str(self.p.root), timeout=timeout, env=command_env(self.p))
+        try:   # exit 1 is a normal run that found something: never rerun (its reports would be lost)
+            out = schedrun.run_group(cmd, cwd=str(self.p.root), timeout=timeout, env=command_env(self.p),
+                                     ok=(0, 1))
         except subprocess.TimeoutExpired:   # its whole process group is killed: a failed run
             self.observe(errors, f"watcher command timed out: {cmd}", "normal", rewake_after_s=rewake,
                          lifecycle=scr.ERROR)
@@ -4993,8 +4994,10 @@ class Daemon:
         if not cmd:
             return ""
         timeout = _watcher_timeout({"timeout_s": payload.get("precheck_timeout_s")})
-        try:
-            out = schedrun.run_group(cmd, cwd=str(self.p.root), timeout=timeout, env=command_env(self.p))
+        try:   # 0 (skip) and 1 (go ahead) are its answers; any other exit may be a script rewritten
+            # mid-run, and the rerun's answer (perhaps a skip) saves a model run that fail-open would spend
+            out = schedrun.run_group(cmd, cwd=str(self.p.root), timeout=timeout, env=command_env(self.p),
+                                     ok=(0, 1))
         except subprocess.TimeoutExpired:
             log(self.p, f"schedule {s['name']}: precheck timed out after {timeout} s; the run goes ahead")
             return ""
