@@ -190,9 +190,8 @@ Each field's rules are in the section named; the table only lists them.
   Only when the charter allows no alternative: `ask_user` (`blocking` `access`) naming the machines
   that would do.
 - A task that re-lands another task's work as a new commit records
-  `ttp task <project> superseded <id> <sha>`; say so in its spec.
-- When a re-plan replaces a lineage, a task runs `ttp task <project> abandon <id> "<why>"` on its
-  done tasks whose work never landed.
+  `ttp task <project> superseded <id> <sha>`, or for unlanded done work a re-plan drops,
+  `abandon <id> "<why>"`; say so in its spec.
 - A task blocked on a cancelled or failed dependency stays blocked until you re-point it with
   `task_update` `depends_on` (or `[]`), or cancel it.
 - A question the digest answers: `reply` directly. Otherwise a `question` task with `reply_chat`
