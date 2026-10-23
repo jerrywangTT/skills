@@ -139,42 +139,84 @@ CITE_WINDOW_S = 7 * 86400
 BLOCKS_MIN = 3   # review.rule_blocks_min: blocked-work citations that list an item
 
 
+# A text that names a restriction as its reason ("the Restrictions", "the charter forbids", "not allowed by").
+_REASON_RE = re.compile(r"\brestrictions?\b|\b(?:charter|rule)s?\s+(?:forbid|ban|prohibit|bar)\w*|"
+                        r"\b(?:not allowed|forbidden|banned|prohibited)\s+by\b", re.I)
+
+
+def _ban_acts(sentence: str) -> set[str]:
+    """A ban sentence's own action words, stemmed: the actions (coordinator._ACTIONS) after its ban
+    word outside condition clauses ("never reboot X while its queue runs": reboot), else those
+    anywhere outside them ("push only to X": push), else the first rule word after the ban word."""
+    from .coordinator import _ACTIONS, _BAN_RE, _CONDITION_RE, _rule_words, _stem
+    m = _BAN_RE.search(sentence)
+    if not m:
+        return set()
+
+    def acts(text: str) -> list[str]:
+        ws = re.findall(r"[a-z][a-z0-9-]*[a-z0-9]", _CONDITION_RE.sub(" ", text.lower()))
+        return [_stem(w) for w in ws if _ACTIONS.get(_stem(w)) or _ACTIONS.get(w)]
+    after = sentence[m.end():]
+    words = [w for w in re.findall(r"[a-z][a-z0-9-]*[a-z0-9]", after.lower()) if _rule_words(w)]
+    found = acts(after) or acts(sentence) or [_stem(w) for w in words[:1]]
+    return set(found)
+
+
+def _cites(item: str, bans: list[tuple[str, set[str]]], text: str) -> bool:
+    """Whether a blocked run's, ask's or refusal's text is about a Restrictions item's ban: it quotes
+    the item or one of its ban sentences, or it shares rule words with a ban sentence (_widens) and
+    has that ban's own action word (_ban_acts) or names a restriction as its reason (_REASON_RE).
+    Duty sentences ("Always fetch and rebase ...") and shared object words alone never cite."""
+    from .coordinator import _loose, _rule_words, _widens
+    low = _loose(text)
+    if any(_loose(x) in low for x in [item] + [s for s, _ in bans]):
+        return True
+    words = _rule_words(text)
+    reason = bool(_REASON_RE.search(text))
+    return any(_widens(s, words) and (acts & words or reason) for s, acts in bans)
+
+
 def citations(p: Project, now: float | None = None, window_s: float = CITE_WINDOW_S) -> list[dict]:
     """Per item of the charter's Restrictions sections, in charter order: {item, blocked, asks,
-    stopped} over the last `window_s`. `blocked`: task_blocked events (a run that ended blocked, or a
-    task the daemon blocked) citing the item; `asks`: asks sent to the user citing it; `stopped`:
-    coordinator actions the guard or relay refused (rejected_actions; the ask gate's ask_user refusals
-    are left out) citing it. A text cites an item when it is about one of the item's sentences
-    (coordinator._widens on its _rule_words); one text may cite several items."""
-    from .coordinator import _items, _rule_words, _sentences, _widens
+    stopped, tasks, ask_ids} over the last `window_s`. `blocked`: task_blocked events (a run that
+    ended blocked, or a task the daemon blocked) citing the item, their task ids in `tasks`; `asks`:
+    asks sent to the user citing it, their message ids in `ask_ids`; `stopped`: coordinator actions
+    the guard or relay refused (rejected_actions; the ask gate's ask_user refusals are left out)
+    citing it. A text cites an item when it is about one of the item's bans (_cites); one text may
+    cite several items."""
+    from .coordinator import _BAN_RE, _items, _sentences
     from .prompts import charter_restrictions
     try:
         body = charter_restrictions(p.charter_path.read_text())
     except OSError:
         return []
     items = [" ".join(body[s:e].split()) for s, e, _ in _items(body)]
-    rows = [{"item": x, "sentences": _sentences([x]), "blocked": 0, "asks": 0, "stopped": 0} for x in items if x]
+    rows = [{"item": x, "bans": [(s, _ban_acts(s)) for s in _sentences([x]) if _BAN_RE.search(s)],
+             "blocked": 0, "asks": 0, "stopped": 0, "tasks": [], "ask_ids": []} for x in items if x]
     if not rows:
         return []
     since = (time.time() if now is None else now) - window_s
-    texts: list[tuple[str, str]] = []
-    texts += [("blocked", e["text"]) for e in p.db.q(
-        "SELECT text FROM events WHERE kind='task_blocked' AND ts>=?", (since,))]
-    texts += [("asks", m["text"]) for m in p.db.q(
-        "SELECT text FROM messages WHERE direction='out' AND kind='ask' AND ts>=?", (since,))]
+    texts: list[tuple[str, str, int | None]] = []
+    for e in p.db.q("SELECT text, task FROM events WHERE kind='task_blocked' AND ts>=?", (since,)):
+        tid = e["task"] or (int(m[1]) if (m := re.match(r"#(\d+)\b", e["text"] or "")) else None)
+        texts.append(("blocked", e["text"], tid))
+    texts += [("asks", m["text"], m["id"]) for m in p.db.q(
+        "SELECT id, text FROM messages WHERE direction='out' AND kind='ask' AND ts>=?", (since,))]
     for e in p.db.q("SELECT text, data FROM events WHERE kind='rejected_actions' AND ts>=?", (since,)):
         try:
             got = json.loads(e["data"]) if e["data"] else None
         except ValueError:
             got = None
-        texts += [("stopped", str(x)) for x in (got if isinstance(got, list) else [e["text"]])
+        texts += [("stopped", str(x), None) for x in (got if isinstance(got, list) else [e["text"]])
                   if not str(x).startswith("ask_user:")]
-    for key, text in texts:
-        words = _rule_words(text or "")
+    for key, text, ref in texts:
         for r in rows:
-            if any(_widens(s, words) for s in r["sentences"]):
+            if _cites(r["item"], r["bans"], text or ""):
                 r[key] += 1
-    return [{k: v for k, v in r.items() if k != "sentences"} for r in rows]
+                ids = r["tasks"] if key == "blocked" else r["ask_ids"] if key == "asks" else None
+                if ids is not None and ref is not None and ref not in ids:
+                    ids.append(ref)
+    return [{k: v for k, v in r.items() if k != "bans"} for r in rows]
 
 
 def only_blocks_lines(p: Project, now: float | None = None, least: int = BLOCKS_MIN) -> list[str]:
@@ -187,5 +229,12 @@ def only_blocks_lines(p: Project, now: float | None = None, least: int = BLOCKS_
         if held >= least and not r["stopped"]:
             out.append(f"Restrictions item only blocked work in {CITE_WINDOW_S // 86400} d (held {r['blocked']} "
                        f"blocked run{'s' * (r['blocked'] != 1)} and {r['asks']} ask{'s' * (r['asks'] != 1)}, "
-                       f"stopped no banned action): \"{clip(r['item'], 160)}\"")
+                       f"stopped no banned action): \"{clip(r['item'], 160)}\"" + _ids(r))
     return out
+
+
+def _ids(r: dict) -> str:
+    """The cited task and ask ids, for the coordinator to check before it asks."""
+    got = ([f"tasks {', '.join(f'#{t}' for t in r['tasks'][:10])}"] if r["tasks"] else []) + (
+        [f"asks {', '.join(str(a) for a in r['ask_ids'][:10])}"] if r["ask_ids"] else [])
+    return f" (cited by {' and '.join(got)})" if got else ""

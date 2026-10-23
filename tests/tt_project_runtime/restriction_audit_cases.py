@@ -103,3 +103,48 @@ def test_a_charter_with_no_restrictions_gives_no_line(env):
     for n in range(3):
         _blocked_run(p, env, n)
     assert restriction_audit.citations(p) == [] and _audit(p) == []
+
+
+_PUSH_RULES = ("# demo\n\n## Restrictions (binding on every task)\n"
+               "- Never force-push to the release branch. Always fetch and rebase onto the latest tip immediately "
+               "before pushing; resolve conflicts keeping both sides' intents.\n\n## Goals\nShip v1.\n")
+
+
+def _cite(p, blocked=(), asks=()):
+    from ttp import restriction_audit
+    now = time.time()
+    for n, text in enumerate(blocked, 11):
+        p.db.x("INSERT INTO events(ts,source,kind,text,status,task) VALUES(?,?,?,?,?,?)",
+               (now, f"task:{n}", "task_blocked", f"#{n} demo → blocked: {text}", "queued", n))
+    for text in asks:
+        p.db.post("out", text, chat=None, kind="ask")
+    return restriction_audit.citations(p)[0]
+
+
+def test_a_text_sharing_only_duty_or_object_words_with_an_item_cites_nothing(env):
+    # A rebase onto the latest tip, a leak test on the branch and a token scope before a push are
+    # not about the ban on force-pushing, though they share "rebase", "latest", "push" and the branch.
+    p = make(env)
+    p.charter_path.write_text(_PUSH_RULES)
+    r = _cite(p, blocked=["after rebasing onto the latest origin/release, the prompt-size test cap fails on the tip",
+                          "the README leak test fails on the release branch tip; fix it before pushing"],
+              asks=["The gh token lacks the workflow scope: may I have it granted before the change can be pushed "
+                    "to the release branch?"])
+    assert (r["blocked"], r["asks"], r["tasks"], r["ask_ids"]) == (0, 0, [], []), r
+
+
+def test_a_text_about_the_ban_or_quoting_the_item_cites_it_and_the_line_lists_the_ids(env):
+    from ttp import restriction_audit
+    p = make(env)
+    p.charter_path.write_text(_PUSH_RULES)
+    item = restriction_audit.citations(p)[0]["item"]
+    r = _cite(p, blocked=["the rule forbids force-pushing the release branch, and the rebase rewrote its history",
+                          "the README leak test fails on the release branch tip"],
+              asks=[f"The charter says \"{item}\": may I skip the rebase this once?"])
+    ask_id = p.db.one("SELECT id FROM messages WHERE kind='ask'")["id"]
+    assert (r["blocked"], r["asks"], r["tasks"], r["ask_ids"]) == (1, 1, [11], [ask_id]), r
+    cfg = json.loads(p.config_path.read_text())
+    cfg.setdefault("review", {})["rule_blocks_min"] = 2
+    p.config_path.write_text(json.dumps(cfg))
+    (line,) = _audit(p)
+    assert line.endswith(f"(cited by tasks #11 and asks {ask_id})"), line
