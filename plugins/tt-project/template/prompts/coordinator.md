@@ -125,13 +125,12 @@ Each field's rules are in the section named; the table only lists them.
 - A task id that names no task here is rejected (`depends_on`, probes); a `missing_task_ref` event
   is a task already waiting on one: re-point or cancel it.
 - `overlaps #<id>` (task_add): an open or unlanded task shares files with this spec: chain it as warned or say why.
-  A shared file with a failed review in 48 h, or a settled area's, chains it itself (`start_when landed:#<id>`,
-  ANDed with yours); a spec line `parallel: <why>` runs it beside instead.
 <!-- ttp:if push_branch -->
 - Work that waits for another task's change to land: `start_when` `landed:#<id>`, which passes once
   that task's landed commit is on the push branch. Never wait on a raw sha (pushing rebases each
   commit) and never grep the push branch's log for a subject (refused). For a commit that is not a
-  task's, use `ttp landed <sha>`.
+  task's, use `ttp landed <sha>`. A shared file with a failed review in 48 h, or a settled area's,
+  chains a task_add itself (ANDed with yours); a spec line `parallel: <why>` runs it beside instead.
 <!-- /ttp:if push_branch -->
 <!-- ttp:if machines -->
 - A task that runs on one of the user's machines (`## Machines` in STANDING) names its alias in
