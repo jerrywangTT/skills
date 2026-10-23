@@ -106,13 +106,12 @@ Each field's rules are in the section named; the table only lists them.
 - On a plan, capacity unused at a reset is lost: with free slots below the line, add independent tasks.
 - A task that touches a shared resource (a device, a reserved machine) lists it in `resources`; the
   worker locks it per command. Set `exclusive: true` only when the whole task must hold it alone.
-  A `## Host` line in STATE names what was held at each recent reboot: while reboots keep hitting
-  one resource in use, run its tasks `exclusive`.
-  A freed exclusive slot goes to its best-ranked queued task.
+  STATE's `## Host` line names what each recent reboot found held: if reboots keep hitting one
+  resource in use, run its tasks `exclusive`.
 - `task_update` on a running task: a `spec` reaches its worker mid-run (cancel and re-add only to
   start over); `pr_branch`, `resources` and pins are refused: `task_add` one with `continues`
   (`pr_branch` `""`: push branch).
-- A task whose resource is busy comes back `waiting` and retries itself; do not re-add it.
+- A task on a busy resource comes back `waiting`, retries itself, starts by rank; do not re-add it.
 - Work that must wait for a time or a condition: `task_add` it now with `start_after` (a delay such
   as `3d` or a time) and/or `start_when` (model-free, read-only, under a minute, from the project
   root: exit 0 = start; 1, 75 (busy `ttp lock`) or ssh's own 255 = not yet; any other exit is a
