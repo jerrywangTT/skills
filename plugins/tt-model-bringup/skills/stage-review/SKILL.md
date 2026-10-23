@@ -106,8 +106,9 @@ Return `more-work-needed` when evidence shows one of these:
 - `supports_prefix_caching` is not `supported` in the serving contract without
   a documented exclusion (`block_output` or `recurrent_state`), or it is
   declared `True` without `readiness/prefill_resume_check.json`,
-  `readiness_vllm/prefix_cache_check.json`, and an accuracy fence with caching
-  on; or a resume negative control did not fail; or a greedy divergence after a
+  `readiness_vllm/prefix_cache_check.json`, and sampling and qualitative
+  verdicts from the caching-enabled server; or a resume negative control did
+  not fail; or a greedy divergence after a
   cache hit is recorded as drift without the logit-level comparison that
   separates drift from a cache or position bug;
 - a vLLM stage has no batched-equals-solo prefill evidence or no

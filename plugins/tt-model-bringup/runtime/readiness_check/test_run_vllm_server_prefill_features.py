@@ -133,16 +133,35 @@ def test_prefix_cache_verdict_tolerates_bf16_divergence_after_the_hard_window():
     assert record["requests"][1]["greedy_identical_through"] == 40
 
 
-def test_attach_serial_reference_records_ttft_ratios(tmp_path):
-    serial = tmp_path / "serial.json"
-    serial.write_text(json.dumps({"ttft_ms": {"p50": 2000.0, "p99": 5000.0, "mean": 2500.0}}))
+def test_attach_serial_reference_records_ttft_ratios_and_config_match(tmp_path):
+    config = {"prompt_len": 128, "output_len": 32, "num_requests": 32, "concurrency": 32}
+    serial = {"ttft_ms": {"p50": 2000.0, "p99": 5000.0, "mean": 2500.0}, "config": config}
     summary_file = tmp_path / "burst.json"
-    summary = {"ttft_ms": {"p50": 1000.0, "p99": 2000.0, "mean": 1000.0}}
-    result = _attach_serial_reference(summary_file, summary, serial)
+    summary = {"ttft_ms": {"p50": 1000.0, "p99": 2000.0, "mean": 1000.0}, "config": dict(config)}
+    result = _attach_serial_reference(summary_file, summary, serial, tmp_path / "serial.json")
     assert result["serial_reference"]["ttft_ratio_p99"] == pytest.approx(0.4)
     assert result["serial_reference"]["ttft_ratio_mean"] == pytest.approx(0.4)
+    assert result["serial_reference"]["config_matches"] is True
     assert json.loads(summary_file.read_text())["serial_reference"]["ttft_ratio_p50"] == pytest.approx(0.5)
-    assert _attach_serial_reference(summary_file, {"ttft_ms": {}}, None) == {"ttft_ms": {}}
+    mismatched = _attach_serial_reference(summary_file, {"ttft_ms": {}, "config": {**config, "concurrency": 8}}, serial, None)
+    assert mismatched["serial_reference"]["config_matches"] is False
+    assert _attach_serial_reference(summary_file, {"ttft_ms": {}}, None, None) == {"ttft_ms": {}}
+
+
+def test_run_summary_merges_hold_open_and_attached_runs(tmp_path):
+    path = tmp_path / "vllm_run_summary.json"
+    run_vllm_server._write_run_summary(
+        path, {"stages": ["serve"], "server_command": ["vllm"], "enable_prefix_caching": True, "outputs": {}}
+    )
+    run_vllm_server._write_run_summary(
+        path,
+        {"stages": ["prefix_cache"], "server_command": None, "enable_prefix_caching": None, "outputs": {"prefix_cache": "p.json"}},
+    )
+    merged = json.loads(path.read_text())
+    assert merged["server_command"] == ["vllm"]
+    assert merged["enable_prefix_caching"] is True
+    assert merged["stages"] == ["prefix_cache", "serve"]
+    assert merged["outputs"] == {"prefix_cache": "p.json"}
 
 
 def test_module_constants_name_the_counters_the_check_reads():

@@ -297,11 +297,13 @@ def run_prefill_resume_check(
                     record["reasons"] = [str(exc)]
                     return record
                 record["cases"].append(case)
+                controls_text = ", ".join(
+                    f"{name}:{result['failed_as_expected']}" for name, result in case["controls"].items()
+                )
                 print(
                     f"L={length:<6} s={case['start']:<6} {case['kind']:<22} "
                     f"pcc_mean={case['pcc_mean']:.4f} pcc_min={case['pcc_min']:.4f} "
-                    f"top1={case['top1_agreement']:.3f} pass={case['pass']} "
-                    f"controls={{{', '.join(f'{k}:{v['failed_as_expected']}' for k, v in case['controls'].items())}}}"
+                    f"top1={case['top1_agreement']:.3f} pass={case['pass']} controls={{{controls_text}}}"
                 )
     finally:
         teardown = getattr(generator, "teardown", None)

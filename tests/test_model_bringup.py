@@ -216,7 +216,7 @@ def test_gates_fail_critical_for_malformed_serving_contract(installed, stage, fi
         [{'prompt': 'p', 'greedy_completion': completion, 'sampled_completion': completion}]))
     (model / 'readiness_vllm/vllm_prefill_burst_benchmark.json').write_text(json.dumps(
         {'completed_requests': 32, 'config': {'num_requests': 32}, 'ttft_ms': {'p99': 1000.0},
-         'serial_reference': {'ttft_ratio_p99': 0.4}}))
+         'serial_reference': {'ttft_ratio_p99': 0.4, 'ttft_ratio_mean': 0.4, 'config_matches': True}}))
     (doc / 'context_contract.json').write_text(json.dumps({'hf_advertised_context': 8192, 'current_supported_context': 8192}))
     contract = valid_serving_contract()
     path = doc / 'full_model/serving_contract.json'
@@ -292,6 +292,14 @@ def test_live_inventory_requires_enabled_skills_at_selected_installation(monkeyp
     skills[-1]['path'] = '/unselected/stale/cache/SKILL.md'
     with pytest.raises(RuntimeError, match='missing or disabled'):
         runner.verify_enabled_installations({'data': [{'skills': skills}]})
+
+
+def test_runtime_and_script_modules_compile_under_ci_interpreter():
+    import py_compile
+    for path in list((PLUGIN / 'runtime').rglob('*.py')) + list((PLUGIN / 'scripts').glob('*.py')):
+        if '__pycache__' in path.parts:
+            continue
+        py_compile.compile(str(path), doraise=True)
 
 
 def test_import_provenance_and_publication_boundary():

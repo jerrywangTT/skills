@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-PLUGIN = Path(__file__).resolve().parents[1]
+PLUGIN = Path(__file__).resolve().parents[1] / 'plugins/tt-model-bringup'
 CHECKER = PLUGIN / 'scripts/check_prefill_features.py'
 
 
@@ -35,10 +35,11 @@ def resume(status='pass', control_failed=True):
                                      'failed_as_expected': control_failed}}}]}
 
 
-def burst(ratio=0.4, completed=32, with_reference=True):
+def burst(ratio=0.4, completed=32, with_reference=True, mean_ratio=None, config_matches=True):
     data = {'completed_requests': completed, 'config': {'num_requests': 32}, 'ttft_ms': {'p99': 1000.0}}
     if with_reference:
-        data['serial_reference'] = {'ttft_ratio_p99': ratio, 'ttft_ratio_mean': ratio}
+        data['serial_reference'] = {'ttft_ratio_p99': ratio, 'ttft_ratio_mean': ratio if mean_ratio is None else mean_ratio,
+                                    'config_matches': config_matches}
     return data
 
 
@@ -131,6 +132,39 @@ def test_burst_gate_is_advisory_in_vllm_and_critical_when_required(tmp_path):
     result = run(no_reference, '--require-burst')
     assert result.returncode == 2
     assert 'serial_reference' in result.stderr
+
+
+def test_burst_mean_ratio_and_config_mismatch_are_gated(tmp_path):
+    model = tmp_path / 'mean'
+    full_evidence(model, burst=burst(ratio=0.4, mean_ratio=0.7))
+    result = run(model, '--require-burst')
+    assert result.returncode == 2
+    assert 'mean TTFT ratio' in result.stderr
+    mismatch = tmp_path / 'mismatch'
+    full_evidence(mismatch, burst=burst(config_matches=False))
+    result = run(mismatch, '--require-burst')
+    assert result.returncode == 2
+    assert 'different workload config' in result.stderr
+
+
+def test_plugin_owned_prefix_caching_is_blocked_not_failed(tmp_path):
+    model = tmp_path / 'model'
+    row = {'item': 'supports_prefix_caching', 'kind': 'capability', 'status': 'plugin_owned',
+           'record': 'doc/vllm_integration/plugin_changes.md'}
+    data = contract()
+    data['rows'] = [row]
+    write(model / 'doc/full_model/serving_contract.json', data)
+    write(model / 'readiness_vllm/vllm_prefill_burst_benchmark.json', burst())
+    missing_record = run(model, '--stage', 'vllm')
+    assert missing_record.returncode == 2
+    assert 'justification record is missing' in missing_record.stderr
+    write(model / 'doc/vllm_integration/plugin_changes.md', '# record\n')
+    blocked = run(model, '--stage', 'vllm')
+    assert blocked.returncode == 1, blocked.stderr
+    assert 'blocked on the plugin change' in blocked.stderr
+    full_evidence(model, contract=data)
+    write(model / 'doc/vllm_integration/plugin_changes.md', '# record\n')
+    assert run(model, '--stage', 'vllm').returncode == 0
 
 
 def test_incomplete_burst_is_always_critical(tmp_path):

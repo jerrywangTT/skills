@@ -25,6 +25,7 @@ RESUME_CHECK_PATH = Path("readiness/prefill_resume_check.json")
 BURST_PATH = Path("readiness_vllm/vllm_prefill_burst_benchmark.json")
 PREFIX_CACHE_EXCLUSIONS = ("block_output", "recurrent_state")
 DEFAULT_BURST_TTFT_RATIO_MAX = 0.6
+DEFAULT_BURST_TTFT_MEAN_RATIO_MAX = 0.5
 
 EXIT_PASS = 0
 EXIT_ADVISORY = 1
@@ -114,7 +115,14 @@ def check_prefix_cache(model_dir: Path, row: dict, critical: list[str], advisory
             critical.append("resumed-prefill check ran no negative control; widen --window or add a longer length")
 
 
-def check_burst(model_dir: Path, require: bool, ratio_max: float, critical: list[str], advisory: list[str]) -> None:
+def check_burst(
+    model_dir: Path,
+    require: bool,
+    ratio_max: float,
+    mean_ratio_max: float,
+    critical: list[str],
+    advisory: list[str],
+) -> None:
     burst = load_json(model_dir / BURST_PATH)
     sink = critical if require else advisory
     if burst is None:
@@ -128,14 +136,18 @@ def check_burst(model_dir: Path, require: bool, ratio_max: float, critical: list
     if not isinstance(reference, dict):
         sink.append("prefill burst has no serial_reference; rerun with --prefill-burst-serial-result <serial summary>")
         return
-    ratio = reference.get("ttft_ratio_p99")
-    if not isinstance(ratio, (int, float)):
-        sink.append("prefill burst serial_reference has no ttft_ratio_p99")
-    elif ratio > ratio_max:
-        sink.append(f"prefill burst p99 TTFT ratio {ratio:.3f} exceeds {ratio_max}; batched prefill did not deliver")
+    if reference.get("config_matches") is False:
+        sink.append("prefill burst serial_reference was measured with a different workload config; rerun the serial pass")
+        return
+    for key, limit, label in (("ttft_ratio_p99", ratio_max, "p99"), ("ttft_ratio_mean", mean_ratio_max, "mean")):
+        ratio = reference.get(key)
+        if not isinstance(ratio, (int, float)):
+            sink.append(f"prefill burst serial_reference has no {key}")
+        elif ratio > limit:
+            sink.append(f"prefill burst {label} TTFT ratio {ratio:.3f} exceeds {limit}; batched prefill did not deliver")
 
 
-def run(model_dir: Path, *, stage: str, require_burst: bool, ratio_max: float) -> int:
+def run(model_dir: Path, *, stage: str, require_burst: bool, ratio_max: float, mean_ratio_max: float) -> int:
     contract = load_json(model_dir / CONTRACT_PATH)
     if contract is None:
         raise CheckError(f"Missing serving contract {model_dir / CONTRACT_PATH}")
@@ -155,10 +167,23 @@ def run(model_dir: Path, *, stage: str, require_burst: bool, ratio_max: float) -
             served = load_json(model_dir / PREFIX_CACHE_PATH)
             if served is not None and served.get("status") == "pass":
                 critical.append(f"contract excludes prefix caching ({exclusion}) but the served check passed; fix the contract")
+    elif row.get("status") == "plugin_owned":
+        record = row.get("record")
+        if not isinstance(record, str) or not (model_dir / record).is_file():
+            critical.append("supports_prefix_caching is plugin_owned but its justification record is missing")
+        else:
+            served = load_json(model_dir / PREFIX_CACHE_PATH)
+            if served is not None and served.get("status") == "pass":
+                check_prefix_cache(model_dir, row, critical, advisory)
+            else:
+                advisory.append(
+                    f"prefix caching is blocked on the plugin change recorded in {record}; "
+                    "served prefix-cache evidence is required once that change is implemented"
+                )
     else:
         check_prefix_cache(model_dir, row, critical, advisory)
 
-    check_burst(model_dir, require_burst, ratio_max, critical, advisory)
+    check_burst(model_dir, require_burst, ratio_max, mean_ratio_max, critical, advisory)
 
     for line in critical:
         print(f"critical: {line}", file=sys.stderr)
@@ -186,10 +211,17 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--stage", choices=("vllm", "optimized-vllm"), default="vllm")
     parser.add_argument("--require-burst", action="store_true", help="Treat a missing or failed prefill burst as critical.")
     parser.add_argument("--burst-ttft-ratio-max", type=float, default=DEFAULT_BURST_TTFT_RATIO_MAX)
+    parser.add_argument("--burst-ttft-mean-ratio-max", type=float, default=DEFAULT_BURST_TTFT_MEAN_RATIO_MAX)
     args = parser.parse_args(argv)
     try:
         model_dir = resolve_model_dir(args.model_dir or None, args.hf_model or None)
-        return run(model_dir, stage=args.stage, require_burst=args.require_burst, ratio_max=args.burst_ttft_ratio_max)
+        return run(
+            model_dir,
+            stage=args.stage,
+            require_burst=args.require_burst,
+            ratio_max=args.burst_ttft_ratio_max,
+            mean_ratio_max=args.burst_ttft_mean_ratio_max,
+        )
     except CheckError as exc:
         print(f"critical: {exc}", file=sys.stderr)
         return EXIT_CRITICAL if "Missing serving contract" in str(exc) else EXIT_ERROR

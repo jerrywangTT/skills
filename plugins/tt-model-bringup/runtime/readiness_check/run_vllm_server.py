@@ -133,7 +133,7 @@ ALL_STAGES: tuple[str, ...] = (*DEFAULT_STAGES, STAGE_PREFIX_CACHE, STAGE_PREFIL
 
 # Prefix-cache check: one shared prompt sent cold, then warm, with counter
 # deltas from /metrics around every request.
-DEFAULT_PREFIX_CACHE_PROMPT_TOKENS = 2300
+DEFAULT_PREFIX_CACHE_PROMPT_TOKENS = 2305
 DEFAULT_PREFIX_CACHE_OUTPUT_TOKENS = 64
 PREFIX_CACHE_THRESHOLDS: dict[str, float] = {
     "warm_hit_rate_min": 0.9,
@@ -1051,6 +1051,8 @@ def _run_prefix_cache_check(
         rate = f"{entry['hit_rate']:.2f}" if entry["hit_rate"] is not None else "n/a"
         print(f"  {label:<6} {kind:<4} ttft={ttft:>12} hit_rate={rate} tokens={len(entry['tokens'])}")
 
+    reset_before = _reset_prefix_cache(server_url)
+    print(f"  reset_prefix_cache before cold1: {'ok' if reset_before else 'unavailable'}")
     one("cold1", "cold")
     one("warm1", "warm")
     one("warm2", "warm")
@@ -1097,6 +1099,7 @@ def _run_prefix_cache_check(
         "output_tokens": output_tokens,
         "thresholds": thresholds,
         "apc_log_enabled": _server_log_apc_state(server_log),
+        "reset_prefix_cache_before_cold1": reset_before,
         "reset_prefix_cache_available": reset_ok,
         "requests": requests_log,
         "shared_prefix_bench": shared,
@@ -1110,12 +1113,23 @@ def _run_prefix_cache_check(
     return record
 
 
-def _attach_serial_reference(summary_file: Path, summary: dict[str, Any], serial_result: Optional[Path]) -> dict[str, Any]:
-    if serial_result is None:
+BURST_CONFIG_KEYS = ("prompt_len", "output_len", "num_requests", "concurrency")
+
+
+def _attach_serial_reference(
+    summary_file: Path,
+    summary: dict[str, Any],
+    serial: Optional[dict[str, Any]],
+    serial_path: Optional[Path],
+) -> dict[str, Any]:
+    """Record burst/serial TTFT ratios. `serial` is read before the burst run so the same path is safe."""
+    if serial is None:
         return summary
-    serial = json.loads(serial_result.read_text())
     serial_ttft = serial.get("ttft_ms") or {}
     burst_ttft = summary.get("ttft_ms") or {}
+    serial_config = serial.get("config") or {}
+    burst_config = summary.get("config") or {}
+    config_matches = all(serial_config.get(key) == burst_config.get(key) for key in BURST_CONFIG_KEYS)
 
     def ratio(key: str) -> Optional[float]:
         s = serial_ttft.get(key)
@@ -1123,7 +1137,9 @@ def _attach_serial_reference(summary_file: Path, summary: dict[str, Any], serial
         return (b / s) if isinstance(s, (int, float)) and s > 0 and isinstance(b, (int, float)) else None
 
     summary["serial_reference"] = {
-        "path": str(serial_result),
+        "path": str(serial_path) if serial_path else None,
+        "serial_config": {key: serial_config.get(key) for key in BURST_CONFIG_KEYS},
+        "config_matches": config_matches,
         "serial_ttft_ms": serial_ttft,
         "ttft_ratio_p99": ratio("p99"),
         "ttft_ratio_mean": ratio("mean"),
@@ -1132,9 +1148,30 @@ def _attach_serial_reference(summary_file: Path, summary: dict[str, Any], serial
     summary_file.write_text(json.dumps(summary, indent=2) + "\n")
     print(
         f"  serial reference: p99 ratio={summary['serial_reference']['ttft_ratio_p99']}, "
-        f"mean ratio={summary['serial_reference']['ttft_ratio_mean']}"
+        f"mean ratio={summary['serial_reference']['ttft_ratio_mean']}, config_matches={config_matches}"
     )
     return summary
+
+
+def _write_run_summary(path: Path, summary: dict[str, Any]) -> None:
+    """Merge into an existing summary so a hold-open server and attached check runs share one file."""
+    existing: dict[str, Any] = {}
+    if path.exists():
+        try:
+            existing = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            existing = {}
+    merged = dict(existing)
+    for key, value in summary.items():
+        if key == "outputs":
+            merged["outputs"] = {**(existing.get("outputs") or {}), **value}
+        elif key == "stages":
+            merged["stages"] = sorted(set(existing.get("stages") or []) | set(value))
+        elif value is None and existing.get(key) is not None:
+            continue
+        else:
+            merged[key] = value
+    path.write_text(json.dumps(merged, indent=2) + "\n")
 
 
 def _shutdown(proc: subprocess.Popen, log_file: Path) -> None:
@@ -1421,7 +1458,8 @@ def _main() -> None:
         default=None,
         help=(
             "Normalized summary JSON of the same prefill_burst workload measured with batched prefill "
-            "disabled. The stage records burst/serial TTFT ratios against it."
+            "disabled. It is read before the burst runs, so the stage's own output path is accepted; "
+            "the stage records burst/serial TTFT ratios and whether the workload configs match."
         ),
     )
     args = parser.parse_args()
@@ -1461,7 +1499,9 @@ def _main() -> None:
     if STAGE_SAMPLING in stages:
         _find_plugin_tests_dir()
 
-    apc_log_source = server_log if serve_locally else (args.server_log or server_log)
+    apc_log_source = server_log if serve_locally else args.server_log
+    if not serve_locally and args.enable_prefix_caching is not None:
+        parser.error("--enable-prefix-caching only applies when `serve` is in --stages; use --server-log to record an external server")
     run_summary: dict[str, Any] = {
         "stages": stages,
         "hf_model": args.hf_model,
@@ -1472,7 +1512,7 @@ def _main() -> None:
         "max_model_len": args.max_model_len,
         "block_size": args.block_size,
         "tt_config": merged_tt_config,
-        "enable_prefix_caching": args.enable_prefix_caching,
+        "enable_prefix_caching": args.enable_prefix_caching if serve_locally else None,
         "apc_log_enabled": None,
         "apc_log_source": str(apc_log_source) if apc_log_source else None,
         "outputs": {},
@@ -1612,6 +1652,8 @@ def _main() -> None:
                 )
                 run_summary["outputs"]["prefix_cache"] = str(output_dir / "prefix_cache_check.json")
             elif stage == STAGE_PREFILL_BURST:
+                serial_path = args.prefill_burst_serial_result.resolve() if args.prefill_burst_serial_result else None
+                serial = json.loads(serial_path.read_text()) if serial_path else None
                 burst_summary = _run_serving_benchmark(
                     server_url=server_url,
                     hf_model=args.hf_model,
@@ -1632,9 +1674,7 @@ def _main() -> None:
                     additional_args=additional_benchmark_args,
                 )
                 _attach_serial_reference(
-                    output_dir / "vllm_prefill_burst_benchmark.json",
-                    burst_summary,
-                    args.prefill_burst_serial_result.resolve() if args.prefill_burst_serial_result else None,
+                    output_dir / "vllm_prefill_burst_benchmark.json", burst_summary, serial, serial_path
                 )
                 run_summary["outputs"]["prefill_burst"] = str(output_dir / "vllm_prefill_burst_benchmark.json")
 
@@ -1645,7 +1685,7 @@ def _main() -> None:
         if server_proc is not None:
             _shutdown(server_proc, server_log)
         run_summary["apc_log_enabled"] = _server_log_apc_state(apc_log_source)
-        run_summary_file.write_text(json.dumps(run_summary, indent=2) + "\n")
+        _write_run_summary(run_summary_file, run_summary)
         print(f"Run summary: {run_summary_file}")
 
 

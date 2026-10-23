@@ -16,7 +16,7 @@ Measured context: a 16K shared prefix cut TTFT from 24.8 s to 179 ms on one chip
 | `page_table`, `page_tables_per_layer`, `kv_cache` | vLLM-owned block addresses and the cache the adapter allocated. |
 | `empty_slots` | Destination device-state slot per row, when the model keeps per-slot state. |
 
-Row `i` computes `tokens[i, start_pos[i]:prompt_lens[i]]`. A step is all-prefill or all-decode. The vLLM hybrid KV coordinator aligns a cache hit to the least common multiple of the model's block sizes and caps it at `prompt_len - 1`; chunked and resumed starts can be any value. Read the pinned plugin's `docs/MODEL_EXECUTION.md` and `docs/SCHEDULING.md` for the current wording.
+Row `i` computes `tokens[i, start_pos[i]:prompt_lens[i]]`. A step is all-prefill or all-decode. The vLLM hybrid KV coordinator aligns a cache hit to the least common multiple of the model's block sizes and caps it at `prompt_len - 1`; chunked and resumed starts can be any value. Read the pinned plugin's execution and scheduling documents (currently `docs/MODEL_EXECUTION.md` and `docs/SCHEDULING.md` on `main`; an older pin may hold the same contract in `docs/SCHEDULING.md` and the model runner source) for the current wording.
 
 ## Continuation invariants
 
@@ -73,13 +73,13 @@ python -m readiness_check.run_vllm_server --stages prefix_cache \
   --server-log models/autoports/<model>/readiness_vllm/server.log
 ```
 
-The stage sends one deterministic prompt of about 2300 tokens cold, warm, warm, resets the prefix cache, then cold and warm again. Around every request it reads `vllm:prefix_cache_queries` and `vllm:prefix_cache_hits` from `/metrics`, and it records TTFT from the first streamed chunk, the first token and its logprob, and 64 greedy tokens. It also runs the shared-prefix `vllm bench serve` workload (4 prefixes of 2048 tokens, 128-token suffixes, 32 requests at concurrency 8) and records its hit rate. It writes `readiness_vllm/prefix_cache_check.json`; every run also writes `readiness_vllm/vllm_run_summary.json` with the server command, the flag, and the "Automatic prefix caching is enabled" state read from the log.
+The stage resets the prefix cache, sends one deterministic prompt of 2305 tokens cold, warm, warm, resets again, then cold and warm again. Around every request it reads `vllm:prefix_cache_queries` and `vllm:prefix_cache_hits` from `/metrics`, and it records TTFT from the first streamed chunk, the first token and its logprob, and 64 greedy tokens. It also runs the shared-prefix `vllm bench serve` workload (4 prefixes of 2048 tokens, 128-token suffixes, 32 requests at concurrency 8) and records its hit rate. It writes `readiness_vllm/prefix_cache_check.json`; every run also writes `readiness_vllm/vllm_run_summary.json` with the server command, the flag, and the prefix-caching state read from the log. The prompt length is one token past a 256 multiple so a repeat hits every full block for block sizes up to 256; with a larger block or lcm, pass `--prefix-cache-prompt-tokens` as `k * lcm + 1`.
 
 Verdict:
 
 | Gate | Threshold |
 |---|---|
-| Server log | "Automatic prefix caching is enabled" present |
+| Server log | a "disabled" line fails; no log available is advisory, so pass `--server-log` |
 | Warm request token hit rate | >= 0.9 |
 | Cold request token hit rate | <= 0.05 |
 | Median warm TTFT / cold TTFT | <= 0.5 |
@@ -88,13 +88,18 @@ Verdict:
 | Greedy output | identical through 16 tokens; divergence index after that is recorded, not failed |
 | Shared-prefix hit rate | >= 0.7 |
 
-Accuracy fence: run the Stage 11 lm-eval subsets, or the project's accepted accuracy set, once with APC on and compare against the accepted APC-off result. Scores must agree within the benchmark stage's tolerance. Record both. Full-output greedy equality is not required; the resumed chunk starts at the cached length, which moves the chunk grid, and BF16 logits differ at the margin.
+Accuracy fence at this stage: the `sampling` and `qualitative` stages run against the same caching-enabled server, so their verdicts are the fence here; record the prefix-caching state beside them. Full-output greedy equality is not required; the resumed chunk starts at the cached length, which moves the chunk grid, and BF16 logits differ at the margin. A fixed-subset lm-eval comparison with caching on against the accepted caching-off result belongs to the benchmark stage and is not required to pass this gate.
 
-Do not use `additional_config.tt.prefill_chunk_alignment` to chase cache-hit numerics; it rounds partial chunk ends only and does not change where a hit resumes. It is useful for shape stability of chunked continuations, which keeps first-encounter programs, and the decode-trace releases they cause, bounded.
+Where the pinned plugin offers `additional_config.tt.prefill_chunk_alignment`, do not use it to chase cache-hit numerics; it rounds partial chunk ends only and does not change where a hit resumes. It is useful for shape stability of chunked continuations, which keeps first-encounter programs, and the decode-trace releases they cause, bounded.
 
 ### Sliding-window models under the pinned plugin
 
-The upstream runner trims the block table to `min(cdiv(max_model_len, block_size), num_blocks)`. A sliding-window continuation needs the full absolute width, or a late chunk fails with a page table that does not cover its history. If the pinned plugin trims, this is a plugin defect under [plugin changes](plugin-changes.md) case 1: record it as `plugin_owned` in the serving contract, write the justification record with the reproducer, the model-side alternative and why it is wrong, and the regression test, and follow the authorization rules there. Do not solve it with a model-specific plugin branch or an undocumented capability key.
+Two plugin behaviors can block a sliding-window model that meets the contract above. Both are plugin-owned under [plugin changes](plugin-changes.md), not reasons to declare the capability `False`:
+
+- Some plugin revisions switch automatic prefix caching off for any model whose config has a sliding window, and log "Automatic prefix caching is disabled". That is a default-behavior change for a model that declares and proves the capability: case 1 when the plugin's own capability document says the declaration permits caching, case 2 otherwise. Removing the veto changes plugin default behavior, so it needs human authorization.
+- The runner trims the block table to `min(cdiv(max_model_len, block_size), num_blocks)`. A sliding-window continuation needs the full absolute width, or a late chunk fails with a page table that does not cover its history. This is case 1.
+
+For either, record the row as `plugin_owned` in the serving contract, write the justification record with the reproducer, the model-side alternative and why it is wrong, the effect on other models, and the regression test, and follow the authorization rules. The Stage 9 gate reports a `plugin_owned` row without served evidence as advisory, so the stage ends `blocked` on the authorization rather than failed. Do not solve either with a model-specific plugin branch or an undocumented capability key.
 
 ## Batched prefill
 
@@ -126,7 +131,7 @@ python -m readiness_check.run_vllm_server --stages prefill_burst \
   --prefill-burst-serial-result <serial summary json>
 ```
 
-Run the stage once with batched prefill disabled through the environment override and keep that `vllm_prefill_burst_benchmark.json` as the serial reference, then run it with batched prefill on and pass the serial file. Gate: p99 TTFT ratio <= 0.6 and mean ratio <= 0.5. Stage 9 reports this as advisory; Stage 10 requires it.
+Run the stage once with batched prefill disabled through the environment override and copy the resulting `vllm_prefill_burst_benchmark.json` to a distinct name such as `vllm_prefill_burst_serial_benchmark.json`, then run it with batched prefill on and pass the copy. The stage reads the serial file before it runs, so passing the stage's own output path is accepted, but keep the copy as evidence. The stage records `serial_reference.config_matches`; a serial run with a different workload shape does not count. Gate: p99 TTFT ratio <= 0.6 and mean ratio <= 0.5. Stage 9 reports this as advisory; Stage 10 requires it.
 
 Single-user unchanged: the primary 128/128/1 TTFT p50 and TPOT mean stay within 5 percent of the pre-change `vllm_benchmark.json`, and the mixed-shape trace reuse check shows zero recaptures after warmup with the batched path active.
 
@@ -138,6 +143,6 @@ Single-user unchanged: the primary 128/128/1 TTFT p50 and TPOT mean stay within 
 
 - Serving contract rows for `supports_prefix_caching` and batched prefill with the artifact paths.
 - `readiness/prefill_resume_check.json` with controls, and the model-local sliding-window control when applicable.
-- `readiness_vllm/vllm_run_summary.json`, `readiness_vllm/prefix_cache_check.json`, the shared-prefix benchmark files, and the APC-on accuracy fence beside the APC-off result.
+- `readiness_vllm/vllm_run_summary.json`, `readiness_vllm/prefix_cache_check.json`, the shared-prefix benchmark files, and the sampling and qualitative verdicts recorded against the caching-enabled server.
 - `readiness_vllm/vllm_prefill_burst_benchmark.json` with `serial_reference`, the batched-equals-solo test output, the warmup bucket list, and the program-cache entry counts before and after the workload.
 - Before and after primary single-user metrics.

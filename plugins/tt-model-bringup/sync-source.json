@@ -225,7 +225,7 @@
       "destination": "skills/stage-review/SKILL.md",
       "blob": "7c89b9d281aa1a853a273d3ff4b1c16ad8ccac0d",
       "source_sha256": "b84c344e6a2c0130569dc7e4147ad748d44aa04afa11f181b0711d00afbe3466",
-      "packaged_sha256": "665bc0eb65dbee980a4f8d0911936e22be83bffd54a09a8c8c84f54e932d37ab"
+      "packaged_sha256": "fcd9cf7aba5f5e8321196c906eb50e4171d273a72be8886b35d24091f4ca88d2"
     },
     {
       "source": ".agents/skills/stage-review/agents/openai.yaml",
@@ -274,7 +274,7 @@
       "destination": "skills/vllm-integration/SKILL.md",
       "blob": "05d9e19f7cfbb596d209c504cc49e063b9361da1",
       "source_sha256": "a23a516ab0e8afc3a5dd6ddd72a42781997fb454872139e70605ecbd234e114c",
-      "packaged_sha256": "58b8dae4b33f5bece183019745e9c39e8abc4952bae898a657ef787bfb01cce5"
+      "packaged_sha256": "b8a8a7f8f39bcc94fcc03a7d4797376f4e68b651aa721ff449f1f5d8a515a36f"
     },
     {
       "source": ".agents/skills/vllm-integration/agents/openai.yaml",
@@ -365,7 +365,7 @@
       "destination": "runtime/readiness_check/run_vllm_server.py",
       "blob": "854a62c6b4caedd64708da951c89c51af96d10d2",
       "source_sha256": "051d45493d4a822da38395f506188f08d46cba981ef1e1e9d7a0a74efd7c291c",
-      "packaged_sha256": "85a9862be2a260895d2f1f9deae4dfc1a646a906691fe749b2c89390db2c4436"
+      "packaged_sha256": "d9eaf9330b23e71ded43e882ddb0b1dde9c5f64f4fde8f2f9a434e924bb197bf"
     },
     {
       "source": "models/common/readiness_check/schema.py",
