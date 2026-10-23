@@ -10183,7 +10183,9 @@ class Daemon:
 
     def _open_hop(self, code: dict) -> dict | None:
         """The open code task, oldest first, that continues code task `code`'s branch (`continues:`, directly
-        or through its chain), other than a fix of a review: a split's hop. None when there is none."""
+        or through its chain), other than a fix of a review: a split's hop. None when there is none.
+        A hop that waits (start_when or retry_when) on a task of that chain landing is no hop: it can
+        add nothing to the branch before the change lands, which needs the fix first (review #3624)."""
         for t in self.p.db.q("SELECT * FROM tasks WHERE kind='code' AND status NOT IN (?,?,?) AND id>? "
                              "AND labels LIKE '%continues:%' ORDER BY id", (*TERMINAL_TASK_STATES, code["id"])):
             if '"review_fix:' in (t["labels"] or "") or '"pr_fix:' in (t["labels"] or ""):
@@ -10192,7 +10194,9 @@ class Daemon:
             while c is not None and c not in seen and c != code["id"] and (x := self.p.db.task(c)):
                 seen.add(c)
                 c = continues_id(x)
-            if c == code["id"]:
+            waits = {r for probe in (deferral(t).get("when"), load_result(t["result"]).get("retry_when"))
+                     for r in landed.task_refs(str(probe or ""))}
+            if c == code["id"] and not waits & {str(i) for i in seen | {code["id"]}}:
                 return t
         return None
 

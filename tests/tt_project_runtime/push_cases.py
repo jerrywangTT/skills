@@ -11226,3 +11226,61 @@ def test_prune_rebase_starts_removes_a_finished_tasks_ref_and_keeps_a_continued_
     assert worktree.rebase_start(p.root, tid) == ""
     assert worktree.prune_rebase_starts(p, []) == []
     worktree.sweep(p)
+
+
+def _split_with_a_landing_hop(env, p, title="abandon"):
+    """Today's case through the real writers: a code task hands off done with a `continue:` follow-up
+    (the daemon queues its hop and marks it a split), the hop finds nothing to do before the change
+    lands and waits on landed:#<it>, and the coordinator then queues the review of its branch by
+    hand. Returns (code task id, branch, review id, hop id)."""
+    root, branch, _, reviews = _finish_code(env, p, title, {"a.py": 10}, result=_cont(title))
+    assert not reviews, "a split got a review"
+    (hop,) = p.db.q("SELECT * FROM tasks WHERE parent=?", (root,))
+    from ttp import worktree
+    from ttp.daemon import Daemon
+    from ttp.providers.base import RunUsage as Usage
+    _, hbranch = worktree.ensure(p, p.db.task(hop["id"]))
+    p.db.update_task(hop["id"], status="running", branch=hbranch)
+    run_dir = env["tmp"] / f"run-{hop['id']}"
+    run_dir.mkdir()
+    (run_dir / "result.json").write_text(json.dumps(
+        {"status": "waiting", "summary": f"nothing to do before #{root} lands", "retry_when": f"landed:#{root}",
+         "waiting_for": f"#{root} landing", "retry_after_s": 1800}))
+    Daemon(p.base)._finish_worker({"task": hop["id"], "note": "{}"}, Usage(cost_usd=1.0), "ok", run_dir)
+    assert p.db.task(hop["id"])["status"] == "queued"
+    rev = p.db.add_task(f"Review #{root}: {title}", f"Independently review code task #{root}, branch {branch}.",
+                        kind="review", tier="standard", origin="coordinator")
+    return root, branch, rev, hop["id"]
+
+
+def test_a_failed_review_never_hands_its_findings_to_a_hop_that_waits_on_the_reviewed_change_landing(env):
+    """Review #3624's case: the open hop continuing the reviewed task waited on that task landing,
+    so it could never fix the branch, and its re-review would have run on the same head. The fix
+    goes to a new Fix review task, and the re-review waits on that."""
+    p = make(env)
+    root, branch, rev, hop = _split_with_a_landing_hop(env, p)
+    spec = p.db.task(hop)["spec"]
+    _fail_review(env, p, rev, [{"title": "refuse an open review", "spec": "abandon refuses a task under review"}])
+    fixes = p.db.q("SELECT * FROM tasks WHERE title LIKE ?", (f"Fix review #{rev}:%",))
+    assert len(fixes) == 1, "no fix task: the hop waiting on the landing took the findings"
+    fix = fixes[0]
+    assert f"review_fix:{rev}" in _labels(p, fix["id"]) and f"continues:{root}" in _labels(p, fix["id"])
+    assert p.db.task(hop)["spec"] == spec and f"review_fix:{rev}" not in _labels(p, hop)
+    (rr,) = p.db.q("SELECT * FROM tasks WHERE kind='review' AND id!=?", (rev,))
+    assert json.loads(rr["depends_on"]) == [fix["id"]]
+    assert p.db.unmet_dependencies([rr])[rr["id"]] == [fix["id"]], "the re-review can run before its fix"
+
+
+def test_a_failed_review_still_gives_a_working_split_hop_its_findings(env):
+    """No regression: a hop that builds on the branch (no landed wait on its chain) still takes the
+    findings, and the re-review waits on it."""
+    p = make(env)
+    root, branch, _, _ = _finish_code(env, p, "parser", {"a.py": 10}, result=_cont("parser"))
+    (hop,) = p.db.q("SELECT * FROM tasks WHERE parent=?", (root,))
+    rev = p.db.add_task(f"Review #{root}: parser", f"Independently review code task #{root}, branch {branch}.",
+                        kind="review", tier="standard", origin="coordinator")
+    _fail_review(env, p, rev, [{"title": "fix the parser", "spec": "the parser drops the last token"}])
+    assert not p.db.q("SELECT id FROM tasks WHERE title LIKE 'Fix review%'")
+    assert f"review_fix:{rev}" in _labels(p, hop["id"])
+    (rr,) = p.db.q("SELECT * FROM tasks WHERE kind='review' AND id!=?", (rev,))
+    assert json.loads(rr["depends_on"]) == [hop["id"]]
