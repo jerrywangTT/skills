@@ -62,15 +62,15 @@ def scan(text: str) -> list:
 def write_shims(folder: Path) -> list:
     """Write logging stand-ins for the pattern-kill commands into `folder`. Each one appends its
     arguments to `folder`/killscan.log, kills nothing and exits 1 ("no process matched")."""
+    from .project import durable_write
     folder.mkdir(parents=True, exist_ok=True)
     log = folder / "killscan.log"
     paths = []
     for name in SHIMMED:
         path = folder / name
-        path.write_text("#!/bin/sh\n"
-                        "# ttp killscan shim: logs the call, kills nothing\n"
-                        f"printf '%s\\n' \"{name} $*\" >> {shlex.quote(str(log))}\n"
-                        "exit 1\n")
-        path.chmod(0o755)
+        durable_write(path, "#!/bin/sh\n"
+                            "# ttp killscan shim: logs the call, kills nothing\n"
+                            f"printf '%s\\n' \"{name} $*\" >> {shlex.quote(str(log))}\n"
+                            "exit 1\n", mode=0o755, sync=False)   # never rewritten under a running shim
         paths.append(path)
     return paths

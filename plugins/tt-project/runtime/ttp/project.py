@@ -10,6 +10,7 @@ import json
 import math
 import os
 import re
+import shutil
 import socket
 import subprocess
 import threading
@@ -1756,11 +1757,13 @@ def sync_all() -> None:
         os.sync()
 
 
-def durable_write(path: Path, text: str | bytes, mode: int | None = None) -> None:
+def durable_write(path: Path, text: str | bytes, mode: int | None = None, sync: bool = True) -> None:
     """Replace `path` with `text` so a power cut leaves the old content or the new, never an empty
     or half-written file: a temporary file in the same directory is written and synced, renamed over
     `path`, and the directory is synced so the rename lasts too. The file keeps its mode unless
-    `mode` is given (a new file gets `mode`, else the umask's default)."""
+    `mode` is given (a new file gets `mode`, else the umask's default). Never written in place, so a
+    shell running the old file as a script keeps reading it whole. `sync=False` skips both syncs (a
+    caller that syncs the whole tree after)."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     data = text.encode() if isinstance(text, str) else text
@@ -1775,14 +1778,28 @@ def durable_write(path: Path, text: str | bytes, mode: int | None = None) -> Non
         with os.fdopen(fd, "wb") as f:
             f.write(data)
             f.flush()
-            os.fsync(f.fileno())
+            if sync:
+                os.fsync(f.fileno())
         if mode is not None:
             os.chmod(tmp, mode)
         os.replace(tmp, path)
     except BaseException:
         tmp.unlink(missing_ok=True)
         raise
-    fsync_dir(path.parent)
+    if sync:
+        fsync_dir(path.parent)
+
+
+def replace_copy(src: str | Path, dst: str | Path, *, follow_symlinks: bool = True) -> str:
+    """shutil.copy2 that never rewrites `dst` in place (shutil.copytree's copy_function for installed
+    trees): a temporary file renamed over it, with the source's mode and times, so a script a shell is
+    running keeps its old content to the end. Not synced: the caller syncs the tree (sync_all)."""
+    src, dst = Path(src), Path(dst)
+    if dst.is_dir():
+        dst = dst / src.name
+    durable_write(dst, src.read_bytes(), mode=src.stat().st_mode & 0o7777, sync=False)
+    shutil.copystat(src, dst)
+    return str(dst)
 
 
 def durable_append(path: Path, text: str) -> None:

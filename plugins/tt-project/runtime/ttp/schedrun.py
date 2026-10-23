@@ -23,6 +23,7 @@ import threading
 import time
 from typing import Any, Callable
 
+from . import scriptwatch
 from .runner import proc_start
 
 GROUPS_KEY = "schedule_groups"   # kv: pgid -> {schedule, start}: live process groups of schedule runs
@@ -172,7 +173,19 @@ def kill_all(db: Any) -> list[str]:
 def run_group(cmd: str, *, cwd: str, timeout: float, env: dict | None) -> subprocess.CompletedProcess:
     """subprocess.run(cmd, shell=True) in a session of its own, kept in GROUPS_KEY while it runs. A
     timeout kills the whole group (the shell's children too) and raises TimeoutExpired; a daemon stop
-    in the meantime raises Stopped."""
+    in the meantime raises Stopped. A run that exits non-zero while a script it names was rewritten
+    runs once more in the time left (scriptwatch), its stderr starting with that note."""
+    end = time.monotonic() + timeout
+    said: list[str] = []
+    out = scriptwatch.rerun(lambda: _run_group(cmd, cwd=cwd, timeout=max(end - time.monotonic(), 1), env=env),
+                            lambda r: r.returncode != 0, cmd, cwd, env, said.append,
+                            again=lambda: end - time.monotonic() >= 1)
+    if said:
+        out.stderr = "".join(f"ttp: {line}\n" for line in said) + (out.stderr or "")
+    return out
+
+
+def _run_group(cmd: str, *, cwd: str, timeout: float, env: dict | None) -> subprocess.CompletedProcess:
     proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                             cwd=cwd, env=env, start_new_session=True)
     spawned(proc.pid)

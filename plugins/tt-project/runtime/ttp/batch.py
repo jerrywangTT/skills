@@ -38,7 +38,8 @@ import tokenize
 from collections import deque
 from pathlib import Path
 
-from . import checkcap, checkdirs, conflictfix, envfault, locks, push, pushpass, runner, scopehold, suitecost, worktree
+from . import (checkcap, checkdirs, conflictfix, envfault, locks, push, pushpass, runner, scopehold, scriptwatch,
+               suitecost, worktree)
 from .project import Project, command_env, durable_write, write_json
 
 WORKTREE = "push"             # the batch's own checkout under the project's worktrees (never t<id>)
@@ -1137,8 +1138,10 @@ class Batch:
                     say(f"resuming {cmd}: {len(done)} test file(s) passed in an earlier run on tree {tree[:10]}; running the rest")
                 if push.remote_host(cmd):
                     say(f"running {cmd}{push.where(cmd)}")
-                rc, tail, _ = _stream(push.check_argv(cmd, self.wt), self.wt,
-                                      env={**env, **extra, **slot.env()}, pass_fds=checkdirs.inherited())
+                rc, tail, _ = scriptwatch.rerun(
+                    lambda: _stream(push.check_argv(cmd, self.wt), self.wt,
+                                    env={**env, **extra, **slot.env()}, pass_fds=checkdirs.inherited()),
+                    lambda r: r[0] != 0, None if push.remote_host(cmd) else str(cmd), self.wt, env, say)
                 suite_out.append(tail)
                 if fault := push.remote_fault(cmd, rc, self.wt):
                     raise envfault.Fault(fault)   # the check host, not this head: push_phase holds the batch

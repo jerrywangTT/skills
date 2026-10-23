@@ -34,7 +34,7 @@ from typing import Any, Callable
 from urllib.parse import quote, unquote
 
 from . import (checkcap, checkdirs, cleantree, envfault, landed, locks, machines, prguard, remotecheck, runner, sandbox,
-               settinghold, timefmt, worktree)
+               scriptwatch, settinghold, timefmt, worktree)
 from .budget import DOC_SUFFIXES
 from .db import continues_id, dependency_ids, load_result
 from .project import (Project, code_tasks_may_push, durable_append, durable_write, git_fsync_env, hostname,
@@ -3429,7 +3429,9 @@ def _run_one(cmd: Any, repo: Path, env: dict, say: Callable[[str], None]) -> int
     could not run it (an environment fault, recorded as runner_wait records a missing runner)."""
     if remote_host(cmd):
         say(f"running {cmd}{where(cmd)}")
-    rc = subprocess.run(check_argv(cmd, repo, env), cwd=repo, env=env, pass_fds=checkdirs.inherited()).returncode
+    rc = scriptwatch.rerun(
+        lambda: subprocess.run(check_argv(cmd, repo, env), cwd=repo, env=env, pass_fds=checkdirs.inherited()).returncode,
+        bool, None if remote_host(cmd) else str(cmd), repo, env, say)
     if rc == 0:
         return 0
     if fault := remote_fault(cmd, rc, repo):

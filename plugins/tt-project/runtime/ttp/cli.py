@@ -30,12 +30,12 @@ from . import __version__, poll_s
 from .db import CHANGES_NEEDED, chat_floor, task_outcome
 from . import outbox
 from .devq import unmask_devices
-from . import sshcmd, timefmt
+from . import scriptwatch, sshcmd, timefmt
 from . import schedule as sched
 from .project import (NAME_RE, Project, hostname, load_registry, load_secrets, register, save_secret,
                       durable_append, durable_write, write_json, ACCOUNT_KEYS, DEFAULT_CONFIG, deep_merge,
                       load_account_settings, set_account_setting, zombie, device_timeout_max, command_env,
-                      NOTE_RUN_ENV, in_run, sync_all, MEMORY_AUDIENCES)
+                      NOTE_RUN_ENV, in_run, replace_copy, sync_all, MEMORY_AUDIENCES)
 
 RUNTIME = Path(__file__).resolve().parent.parent              # .../runtime (plugin or project copy)
 PLUGIN_ROOT = RUNTIME.parent                                   # plugin root, or a project's harness/
@@ -541,7 +541,10 @@ def detect_provider() -> str:
 
 
 def _copy_tree(src: Path, dst: Path) -> None:
-    shutil.copytree(src, dst, dirs_exist_ok=True, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+    """Copy `src` over `dst`, each file renamed into place (replace_copy): an installed script a shell
+    is running is never rewritten under it."""
+    shutil.copytree(src, dst, dirs_exist_ok=True, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+                    copy_function=replace_copy)
 
 
 def _git(cwd: Path, *args: str) -> str:
@@ -2560,9 +2563,17 @@ def cmd_checks(a) -> None:
                 group = bool(getattr(a, "own_group", False))
                 env = {**push.check_env("checks", run_dir=getattr(a, "check_run_dir", None)), **child_env,
                        "PWD": cwd}
-                rc = _run_check(_low_priority(push.check_argv(c, cwd, env)), group, cwd=cwd, stdout=out,
-                                stderr=subprocess.STDOUT, env=env,
-                                pass_fds=(a.tmp_fd,) if group and getattr(a, "tmp_fd", None) is not None else ())
+                def said(line: str) -> None:   # a script it runs was rewritten as it ran: once more
+                    nonlocal check_start
+                    print(f"ttp checks: {line}", flush=True)
+                    out.write(f"ttp checks: {line}\n")
+                    out.flush()
+                    check_start = out.tell()
+                rc = scriptwatch.rerun(
+                    lambda: _run_check(_low_priority(push.check_argv(c, cwd, env)), group, cwd=cwd, stdout=out,
+                                       stderr=subprocess.STDOUT, env=env,
+                                       pass_fds=(a.tmp_fd,) if group and getattr(a, "tmp_fd", None) is not None else ()),
+                    bool, None if push.remote_host(c) else str(c), cwd, env, said)
                 if rc != 0:
                     passed, failed = False, c
                     if cwd != top:   # what only this worktree has may be what the check missed
@@ -5944,8 +5955,7 @@ def cmd_setup(a) -> None:
     bindir = Path(a.bin_dir).expanduser()
     bindir.mkdir(parents=True, exist_ok=True)
     shim = bindir / "ttp"
-    shim.write_text(shim_text(sys.executable, cur / "bin" / "ttp"))
-    shim.chmod(0o755)
+    durable_write(shim, shim_text(sys.executable, cur / "bin" / "ttp"), mode=0o755)
     on_path = str(bindir) in os.environ.get("PATH", "").split(":")
     print(f"ttp {__version__} ({commit}) installed: {shim}" + ("" if on_path else f" (add {bindir} to PATH)"))
     from .service import plan

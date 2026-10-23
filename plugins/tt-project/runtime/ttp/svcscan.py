@@ -196,13 +196,13 @@ def _sudo_shim(log: str) -> str:
 def write_shims(folder: Path) -> list:
     """Write logging stand-ins for systemctl, service and sudo into `folder`. Calls are appended to
     `folder`/svcscan.log; a changing call exits 0 and changes nothing."""
+    from .project import durable_write
     folder.mkdir(parents=True, exist_ok=True)
     log = shlex.quote(str(folder / "svcscan.log"))
     paths = []
     for name, body in (("systemctl", _systemctl_shim(log)), ("service", _service_shim(log)),
                        ("sudo", _sudo_shim(log))):
         path = folder / name
-        path.write_text(body)
-        path.chmod(0o755)
+        durable_write(path, body, mode=0o755, sync=False)   # never rewritten under a running shim
         paths.append(path)
     return paths

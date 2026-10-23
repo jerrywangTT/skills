@@ -188,7 +188,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Callable
 
-from . import outagemsg, pageto, schedrun, screen, timefmt
+from . import outagemsg, pageto, schedrun, screen, scriptwatch, timefmt
 from .db import DB
 from .project import command_env, durable_write
 
@@ -578,7 +578,12 @@ def check(spec: dict, state: dict, cwd: str, env: dict | None = None) -> tuple[i
     fn = _PRESET_CHECKS.get(spec.get("preset") or "")
     if fn and not spec.get("check"):
         return fn(spec, state, cwd)
-    return _shell(spec["check"], cwd, spec["timeout_s"], env)
+    end = time.monotonic() + spec["timeout_s"]
+    said: list[str] = []
+    rc, out = scriptwatch.rerun(lambda: _shell(spec["check"], cwd, max(end - time.monotonic(), 1), env),
+                                lambda r: r[0] != 0, spec["check"], cwd, env or _env(), said.append,
+                                again=lambda: end - time.monotonic() >= 1)
+    return rc, "\n".join([out, *said]) if said else out
 
 
 def finding(rc: int, out: str) -> bool:
