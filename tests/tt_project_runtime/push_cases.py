@@ -8775,6 +8775,49 @@ def test_the_push_audit_does_not_flag_an_on_pass_cmd_whose_push_is_on_the_remote
     assert a["gaps"] == [] and a["counts"]["confirmed"] == 1, a
 
 
+def _letter_sha_commit(repo, n=10):
+    """A commit on HEAD whose first `n` hex characters hold no digit (found by its message), checked out."""
+    import hashlib
+    tree, parent = _git_out(repo, "rev-parse", "HEAD^{tree}"), _git_out(repo, "rev-parse", "HEAD")
+    head = f"tree {tree}\nparent {parent}\nauthor t <t@t> 0 +0000\ncommitter t <t@t> 0 +0000\n\n"
+    for i in range(10 ** 6):
+        body = (head + f"edit {i}\n").encode()
+        sha = hashlib.sha1(b"commit %d\0" % len(body) + body).hexdigest()
+        if not any(ch.isdigit() for ch in sha[:n]):
+            break
+    made = subprocess.run(["git", "-C", str(repo), "hash-object", "-t", "commit", "-w", "--stdin"], input=body,
+                          capture_output=True, check=True).stdout.decode().strip()
+    assert made == sha
+    _git_out(repo, "reset", "-q", "--hard", sha)
+    return sha
+
+
+def test_the_push_audit_reads_a_claimed_short_sha_that_has_no_digit(env, monkeypatch, tmp_path):
+    """Replay: two audit tests failed together in one push batch because the commit they made in the same
+    second had a 10-character prefix with no digit, which the summary parser did not read as a sha: the
+    claim was dropped and the on_pass audit reported a gap. A hex-only word that names a ref, not a
+    commit it prefixes, is still no claim."""
+    from ttp import pushclaim
+    p, repo, origin, _ = _push_setup(env, monkeypatch, ["true"])
+    sha = _letter_sha_commit(repo)
+    _git_out(repo, "push", "-q", "origin", "HEAD:refs/heads/proj")
+    tid = _audit_done(p, "waited", f"pushed {sha[:10]} to origin/proj")
+    p.db.update_task(tid, result=json.dumps({"status": "done", "summary": f"pushed {sha[:10]} to origin/proj",
+                                             "run_status": "model-free"}))
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "result.json").write_text(json.dumps({"status": "waiting", "on_pass_cmd": "ttp push --result x"}))
+    now = time.time()
+    p.db.x("INSERT INTO runs(task,role,provider,started,ended,status,dir) VALUES(?,?,?,?,?,?,?)",
+           (tid, "worker", "fake", now - 120, now - 60, "ok", str(run_dir)))
+    a = pushclaim.audit(p)
+    assert a["gaps"] == [] and a["counts"]["confirmed"] == 1, a
+    assert [c["sha"] for c in pushclaim.text_claims(p, f"Pushed {sha[:10].upper()} to origin/proj")] == [sha]
+    word = next(w for w in ("deadbeef", "facade0f", "decade00") if not sha.startswith(w))
+    _git_out(repo, "branch", word, sha)
+    assert pushclaim.text_claims(p, f"pushed {word} to origin/proj") == []
+
+
 def _pinned_plan(repo, git_cmd, plan="checks/harness.json"):
     """A committed harness check plan that pins watch.py by digest; its at-HEAD check-plan command."""
     import hashlib

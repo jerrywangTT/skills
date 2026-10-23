@@ -53,7 +53,9 @@ CARRIED = "carried"              # a cache's keys read on an earlier tick (a set
 AUDIT_EVERY_S, AUDIT_DAYS, AUDIT_REFS = 3600, 2, 20
 ON_PASS_DIR = "on_pass"          # daemon.ON_PASS_DIR
 
-_SHA = r"`?((?=[0-9a-f]*\d)[0-9a-f]{7,40})`?"
+# A short sha may have no digit (about 1 in 1,000 at 7 characters): a token counts only once it resolves
+# as a commit it prefixes (text_claims), which a word or a ref name does not.
+_SHA = r"`?([0-9a-f]{7,40})`?"
 _REF = r"`?([A-Za-z0-9][\w./@+-]*\w)`?"
 # "pushed abc1234 to dev", "landed as abc1234 on origin/dev", "pushed to dev as abc1234", "pushed tag v1 at abc1234"
 _TAG = re.compile(rf"\bpushed\s+(?:the\s+)?tag\s+{_REF}\s+(?:at|to|on)\s+{_SHA}", re.I)
@@ -126,7 +128,7 @@ def text_claims(p, text: str, repo=None) -> list[dict]:
                 continue   # one phrase, one claim
             found.append((m.start(), m.end()))
             full = _commit(repo, sha)
-            if not full:
+            if not full or not full.startswith(sha.lower()):
                 continue
             target = None
             if ref and ref.lower() not in _NOT_REFS:
