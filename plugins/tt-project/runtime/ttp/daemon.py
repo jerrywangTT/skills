@@ -705,6 +705,11 @@ class Daemon:
         self._probe_live: dict[int, tuple[str, float, str]] = {}   # task -> its probe's last line, when read, probe
         self._woke_on: dict[int, tuple[int | str, float, str]] = {}   # task -> the verdict its last wake came on (wake gate)
         self._wait_what_errs: set[str] = set()   # causes of lock-probe errors already logged (_wait_what)
+        # Exclusive slot reservations (_slot_reservations): canonical lock -> {"task", "holder", "free_since"},
+        # the (lock, task) pairs whose reservation timed out, and the pass's reservers while dispatch runs.
+        self._slot_resv: dict[str, dict] = {}
+        self._slot_resv_lapsed: set[tuple[str, int]] = set()
+        self._slot_resv_pass: dict[str, int] | None = None
         # running on_pass_cmd: task -> proc, started, timeout, its output dir, the waiting run's id, command
         self._on_pass: dict[int, tuple[subprocess.Popen, float, float, Path, int, str, str, str]] = {}
         self._on_pass_waits: set[tuple[int, int]] = set()   # (task, run) whose wait was logged once
@@ -3470,7 +3475,7 @@ class Daemon:
         if status == "resource_busy":
             # The run lost the race for its resource and never started its agent: not an attempt.
             db.update_task(task["id"], status="queued", not_before=time.time() + 30,
-                           blocked_reason="its resource stayed busy before the run could start; retries")
+                           blocked_reason=f"{RESOURCE_BUSY_NOTE} before the run could start; retries")
             return
         rstatus = result.get("status") if isinstance(result, dict) else None
         # A project's own result rule (`done` plus a verdict): the change must not proceed. The task is
@@ -5120,7 +5125,7 @@ class Daemon:
         more = f" (+{len(lines) - STALL_LIST_MAX} more)" if len(lines) > STALL_LIST_MAX else ""
         why = ctx.get("holds", {})
         held = [f"#{t['id']} {t['title'][:60]}: {hold_reason(why[t['id']])}" for t in ready
-                if holds[t["id"]] == "resource" and (why.get(t["id"]) or {}).get("kind") in ("busy", "lock")]
+                if holds[t["id"]] == "resource" and (why.get(t["id"]) or {}).get("kind") in ("busy", "lock", "reserved")]
         text = (f"Stall: dispatch would start {len(stuck)} queued task(s) now, but no worker run has started for "
                 f"{hours:g} h or more (last worker run started: {when}). Find out why they do not start "
                 f"(daemon log, run start errors):\n"
@@ -5811,8 +5816,20 @@ class Daemon:
         running = db.q("SELECT provider, COUNT(*) n FROM runs WHERE role!='coordinator' AND status='running' "
                        "GROUP BY provider")
         busy = {r["provider"]: r["n"] for r in running}
-        ready = db.ready_tasks()
         self.check_disk()
+        try:
+            self._slot_resv_pass = self._slot_reservations(time.time())
+        except Exception:   # a broken reservation pass never stops dispatch: it runs in plain pick order
+            log(self.p, "slot reservations failed\n" + traceback.format_exc())
+            self._slot_resv_pass = {}
+        try:
+            self._dispatch(busy)
+        finally:
+            self._slot_resv_pass = None
+
+    def _dispatch(self, busy: dict) -> None:
+        db = self.p.db
+        ready = db.ready_tasks()   # read after _slot_reservations, which may have woken a reserving task
         reached = set()     # tasks that got past the gates to the resource check
         paused = db.paused_resources()
         now, core = time.time(), self.cfg.get("core_provider", "claude")
@@ -8868,6 +8885,8 @@ class Daemon:
             if hit:   # a pause of one device name holds the tasks that name another
                 return {"kind": "pause", "resource": hit[0]}
         running = self.p.db.q("SELECT id, labels FROM tasks WHERE status='running'")
+        reservers = self._slot_resv_pass if self._slot_resv_pass is not None else \
+            (self._slot_reservers(time.time()) if _exclusive(task) else {})
 
         def _locks_of(names: list[str]) -> set[str]:
             return {locks.canonical(self.cfg, r) for r in names}
@@ -8883,8 +8902,13 @@ class Daemon:
             # Running exclusive tasks count even before their supervisor has taken its slot; the
             # lock files show the slots `ttp lock` commands hold.
             busy = [t["id"] for t in running if lock in _locks_of(_exclusive(t))]
+            first = reservers.get(lock)
             if len(busy) >= limit:
+                if reserve and first == task["id"]:
+                    locks.reserve(self._reserve_path(res), shared.holder(self.p, res, hold.who(task['id']), self.cfg))
                 return {"kind": "busy", "resource": res, "tasks": busy}
+            if first is not None and first != task["id"]:
+                return {"kind": "reserved", "resource": res, "task": first}
             paths = self._slot_paths(res)
             if not locks.any_free(paths):
                 mine = shared.holder(self.p, res, hold.who(task['id']), self.cfg)
@@ -8919,6 +8943,161 @@ class Daemon:
     def _reserve_path(self, res: str) -> Path:
         lock = locks.canonical(self.cfg, res)
         return locks.reserve_path(shared.locks_dir(self.p, lock, self.cfg), lock)
+
+    def _slot_reserve_s(self) -> float:
+        try:
+            return float((self.cfg.get("budget") or {}).get("exclusive_reserve_s", 600) or 0)
+        except (TypeError, ValueError):
+            return 600.0
+
+    def _slot_contenders(self, now: float) -> tuple[dict[str, list[dict]], dict[str, list[dict]]]:
+        """Per canonical lock of an `exclusive:` resource: the queued tasks that would take one of its
+        slots, in dispatch's pick order (db.ready_tasks), and the ready `resource:` tasks that use it per
+        command. A contender is ready now, or waits only because the resource was busy, whatever its
+        retry timer says: a hand-off waiting on nothing but `ttp lock --probe` of its exclusive resources,
+        or a run that lost the race for its slot. A task that needs a paused resource is none: a pause wins."""
+        def canon(r: str) -> str:
+            return locks.canonical(self.cfg, r)
+        paused = {canon(r) for r in self.p.db.paused_resources()}
+        excl: dict[str, list[dict]] = {}
+        users: dict[str, list[dict]] = {}
+        for t in self.p.db.ready_tasks(later=True):
+            if {canon(r) for r in coord.task_resources(t)} & paused:
+                continue
+            due = not t["not_before"] or t["not_before"] <= now
+            mine = {canon(r) for r in _exclusive(t)}
+            if mine and not due:
+                prev = load_result(t["result"])
+                names = locks.probe_resources(str(prev.get("retry_when") or "")) \
+                    if prev.get("status") == "waiting" else []
+                due = (t["blocked_reason"] or "").startswith(RESOURCE_BUSY_NOTE) or \
+                    bool(names) and {canon(n) for n in names} <= mine
+                if not due:
+                    continue
+                for lock in mine:
+                    excl.setdefault(lock, []).append(t)
+                continue
+            for lock in mine:
+                excl.setdefault(lock, []).append(t)
+            for lock in {canon(r) for r in _shared(t)} - mine:
+                users.setdefault(lock, []).append(t)
+        return excl, users
+
+    def _slot_plan(self, now: float) -> tuple[dict[str, int], dict[str, list[dict]]]:
+        """(canonical exclusive lock -> the task that reserves it, the contenders per lock). The reserver is
+        a lock's first contender (_slot_contenders) when it outranks every other contender and every ready
+        task that uses the resource per command: a required owner of an open obligation above one that is
+        none, else a better priority. Equal ranks reserve nothing and keep plain pick order. A reservation
+        that lapsed (_slot_reservations) is not made again for that task while the slot stays free.
+        None at all with budget.exclusive_reserve_s 0."""
+        if self._slot_reserve_s() <= 0:
+            return {}, {}
+        excl, users = self._slot_contenders(now)
+        if not excl:
+            return {}, excl
+        from . import obligations
+        try:
+            due = obligations.owner_due(self.p.db)
+        except Exception:   # unreadable obligations only lose the boost, as in db.ready_tasks
+            due = {}
+
+        def rank(t: dict) -> tuple:
+            return t["id"] not in due, int(t["priority"] or 3)
+        out = {}
+        for lock, ts in excl.items():
+            top = ts[0]
+            rest = ts[1:] + [u for u in users.get(lock, []) if u["id"] != top["id"]]
+            if (lock, top["id"]) not in self._slot_resv_lapsed and all(rank(top) < rank(o) for o in rest):
+                out[lock] = top["id"]
+        return out, excl
+
+    def _slot_reservers(self, now: float) -> dict[str, int]:
+        """Canonical exclusive lock -> the task that reserves it (_slot_plan): no other task starts on it
+        as an exclusive holder meanwhile (_resource_hold's "reserved")."""
+        return self._slot_plan(now)[0]
+
+    def _slot_open(self, res: str, tid: int) -> bool:
+        """Whether an exclusive task `tid` would find a slot of `res` now: fewer running exclusive holders
+        than its slots, and a slot lock free or kept for the task's own detached jobs."""
+        lock = locks.canonical(self.cfg, res)
+        running = self.p.db.q("SELECT labels FROM tasks WHERE status='running'")
+        if sum(1 for t in running if lock in {locks.canonical(self.cfg, r) for r in _exclusive(t)}) \
+                >= shared.slots(self.p, lock, self.cfg):
+            return False
+        paths = self._slot_paths(res)
+        if locks.any_free(paths):
+            return True
+        mine = shared.holder(self.p, res, hold.who(tid), self.cfg)
+        return any(hold.own_keeper(lb, mine) for lb in locks.held_labels(paths))
+
+    def _slot_reservations(self, now: float) -> dict[str, int]:
+        """Dispatch's reservation pass, before it reads the ready tasks; returns the reservers
+        (_slot_plan). Each reserver's resource is reserved, so new `ttp lock` commands of other tasks wait
+        as well (a ready reserver that dispatch then does not reach drops that, as before). A lock's first
+        contender in pick order, reserver or not, still on its retry timer is woken as soon as every
+        resource it needs has a free slot, so a free slot goes to it ahead of later tasks. A running
+        task is never preempted. A reservation ends once its task starts, leaves the queue (cancelled,
+        blocked, deferred), needs a paused resource or is outranked, and lapses (logged) once it has kept
+        a free slot unused for budget.exclusive_reserve_s (default 600), so a reserver that cannot start
+        never starves the resource; it is not made again for that task until the resource is taken."""
+        db = self.p.db
+
+        def name(lock: str, task: dict) -> str:   # the task's own label for the lock (aliases share one lock)
+            return next((r for r in _exclusive(task) if locks.canonical(self.cfg, r) == lock), lock)
+        for lock, tid in list(self._slot_resv_lapsed):
+            t = db.task(tid)
+            if not t or t["status"] != "queued" or not self._slot_open(name(lock, t), tid):
+                self._slot_resv_lapsed.discard((lock, tid))
+        want, excl = self._slot_plan(now)
+        for lock, r in list(self._slot_resv.items()):
+            if want.get(lock) != r["task"]:
+                del self._slot_resv[lock]
+                if (db.task(r["task"]) or {}).get("status") != "running":   # a started run keeps its own
+                    locks.unreserve(self._reserve_path(lock), r["holder"])
+        limit = self._slot_reserve_s()
+        for lock, tid in list(want.items()):
+            task = next(t for t in excl[lock] if t["id"] == tid)
+            res = name(lock, task)
+            mine = shared.holder(self.p, res, hold.who(tid), self.cfg)
+            r = self._slot_resv.get(lock)
+            if not r:
+                r = self._slot_resv[lock] = {"task": tid, "holder": mine, "free_since": None}
+                log(self.p, f"task {tid}: reserves {res} (priority {task['priority']}; "
+                            f"{len(excl[lock]) - 1} other task(s) queued for it)")
+            free = self._slot_open(res, tid)
+            r["free_since"] = (r["free_since"] or now) if free else None
+            path = self._reserve_path(res)
+            if free and now - r["free_since"] >= limit:
+                self._slot_resv_lapsed.add((lock, tid))
+                del self._slot_resv[lock], want[lock]
+                locks.unreserve(path, mine)
+                log(self.p, f"task {tid}: its reservation of {res} lapsed: the slot stayed free and unused "
+                            f"for {limit:g} s (budget.exclusive_reserve_s)")
+                continue
+            other = locks.reserved_by(path)
+            if other and other != mine and other in {shared.holder(self.p, res, hold.who(t["id"]), self.cfg)
+                                                     for t in excl[lock]}:
+                locks.unreserve(path, other)   # an outranked contender's lock-type reservation
+            locks.reserve(path, mine)
+        # The first contender of each lock takes a free slot in pick order even when it reserves nothing
+        # (an equal rank): one still on its retry timer is woken before dispatch reads the ready tasks.
+        woken = set()
+        for lock, ts in excl.items():
+            task = ts[0]
+            # A run that lost the race for its slot keeps its short backoff (it still reserves meanwhile).
+            if task["id"] in woken or (task["not_before"] or 0) <= now or \
+                    (task["blocked_reason"] or "").startswith(RESOURCE_BUSY_NOTE) or \
+                    (lock, task["id"]) in self._slot_resv_lapsed or want.get(lock, task["id"]) != task["id"]:
+                continue
+            if all(self._slot_open(x, task["id"]) for x in _exclusive(task)):
+                woken.add(task["id"])
+                why = f"{name(lock, task)} came free" + (" and is reserved for it" if lock in want else "")
+                if load_result(task["result"]).get("status") == "waiting":
+                    self._wake_waiting(task, why, now)
+                else:
+                    db.update_task(task["id"], not_before=now)
+                    log(self.p, f"task {task['id']}: {why}; dispatching")
+        return want
 
     def _dispatchable(self) -> bool:
         """Whether any queued task could start now (dependencies done, resources free)."""
@@ -10759,6 +10938,7 @@ def _detached_jobs(run_dir: Path) -> list[dict]:
 
 
 PAUSED_NOTE = "waits for a paused resource:"
+RESOURCE_BUSY_NOTE = "its resource stayed busy"   # an exclusive run that lost the race for its slot
 LOGGED_OUT_NOTE = "held: logged out"
 NET_HELD_NOTE = "held: network,"
 LOGIN_CHECK_PASSED = "its login check passed"
@@ -11469,6 +11649,8 @@ def hold_reason(hold: dict | None) -> str:
         return f"{res} paused"
     if kind == "busy":
         return f"{res} held by running task(s) " + (", ".join(f"#{t}" for t in hold.get("tasks") or []) or "?")
+    if kind == "reserved":
+        return f"{res} reserved for higher-priority task #{hold.get('task') or '?'}"
     hs = [h for h in hold.get("holders") or [] if isinstance(h, dict)]
 
     def _who(h: dict, state: str) -> str:

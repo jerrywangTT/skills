@@ -87,6 +87,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # 5 min apart), "1h" (2x input), or "off" (the agent's own default).
         "worker_cache_ttl": "5m",
         "exclusive_wait_s": 600,        # an exclusive run waiting for its resource gives up after this
+        "exclusive_reserve_s": 600,     # a higher-priority task's reservation of an exclusive resource lapses after
+                                        # keeping a free slot unused this long (0: no reservations)
         # A hold kept for the detached jobs of a done, failed or cancelled task raises a low alert
         # once it has held its resource this long (0 = never). Nothing is released automatically.
         "stale_hold_alert_s": 21600,
