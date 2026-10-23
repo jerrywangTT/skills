@@ -6,8 +6,8 @@ from __future__ import annotations
 
 
 def _slot_setup(env, monkeypatch, tmp_path, slots):
-    """A project with `slots` worker slots whose worker runs stay running until release() (the
-    stand-in agent waits for a file), and a daemon. Returns (p, d, release, settle)."""
+    """A project with `slots` worker slots whose worker runs stay running until drain() (the
+    stand-in agent waits for a file), and a daemon. Returns (p, d, drain, settle)."""
     from ttp.daemon import Daemon
     p = make(env)
     _no_events(p)
@@ -19,19 +19,21 @@ def _slot_setup(env, monkeypatch, tmp_path, slots):
     d.cfg = p.config()
     d.update_gates()
 
-    def release():
+    def drain(daemon):
+        """Release every run and reap it with `daemon` until no worker run is running. Safe in a
+        failed test's cleanup: it asserts nothing and its deadline ignores a patched time.time."""
         gate.touch()
+        deadline = time.monotonic() + 30
+        while _slot_tasks(p) and time.monotonic() < deadline:
+            daemon.reap_runs()
+            time.sleep(0.05)
 
     def settle(daemon):
         """Release every run and reap it with `daemon`, then hold new runs again."""
-        release()
-        deadline = time.time() + 30
-        while _slot_tasks(p) and time.time() < deadline:
-            daemon.reap_runs()
-            time.sleep(0.05)
+        drain(daemon)
         assert not _slot_tasks(p), "a stand-in run did not end"
         gate.unlink()
-    return p, d, release, settle
+    return p, d, drain, settle
 
 
 def _slot_tasks(p):
@@ -45,9 +47,9 @@ def _owe(p, tid, due):
                            milestones=[{"key": "m1", "due": due, "evidence_required": "a result"}])
 
 
-def test_dispatch_starts_obligation_owners_then_priority_1_first_and_never_past_max_parallel(env, monkeypatch,
-                                                                                            tmp_path):
-    p, d, release, settle = _slot_setup(env, monkeypatch, tmp_path, slots=2)
+def test_dispatch_starts_obligation_owners_then_priority_1_first_and_never_past_max_parallel(
+        env, monkeypatch, tmp_path, reap_tmp_processes):
+    p, d, drain, settle = _slot_setup(env, monkeypatch, tmp_path, slots=2)
     try:
         now = time.time()
         old_p3 = p.db.add_task("older routine work", "s", kind="work", tier="light", origin="user", priority=3)
@@ -68,12 +70,14 @@ def test_dispatch_starts_obligation_owners_then_priority_1_first_and_never_past_
         d.dispatch()
         assert _slot_tasks(p) == [plain_p1, old_p3], "then priority 1 before the older priority 3"
     finally:
-        release()
+        drain(d)
+        assert reap_tmp_processes(tmp_path) == [], "a stand-in run outlived the test"
 
 
-def test_pick_order_after_a_daemon_restart_comes_from_the_task_records(env, monkeypatch, tmp_path):
+def test_pick_order_after_a_daemon_restart_comes_from_the_task_records(env, monkeypatch, tmp_path,
+                                                                       reap_tmp_processes):
     from ttp.daemon import Daemon
-    p, d, release, settle = _slot_setup(env, monkeypatch, tmp_path, slots=1)
+    p, d, drain, settle = _slot_setup(env, monkeypatch, tmp_path, slots=1)
     try:
         busy = p.db.add_task("holds the only slot", "s", kind="work", tier="light", origin="user", priority=3)
         d.dispatch()
@@ -92,15 +96,17 @@ def test_pick_order_after_a_daemon_restart_comes_from_the_task_records(env, monk
         restarted.dispatch()
         assert _slot_tasks(p) == [later], "the restarted daemon kept a stale pick order"
     finally:
-        release()
+        drain(d)
+        assert reap_tmp_processes(tmp_path) == [], "a stand-in run outlived the test"
 
 
 def _slot_wait_events(p):
     return p.db.q("SELECT * FROM events WHERE kind='observation' AND fingerprint LIKE 'slot_wait:%' ORDER BY id")
 
 
-def test_slot_wait_fires_once_per_urgent_task_only_while_every_slot_is_taken(env, monkeypatch, tmp_path):
-    p, d, release, settle = _slot_setup(env, monkeypatch, tmp_path, slots=1)
+def test_slot_wait_fires_once_per_urgent_task_only_while_every_slot_is_taken(env, monkeypatch, tmp_path,
+                                                                             reap_tmp_processes):
+    p, d, drain, settle = _slot_setup(env, monkeypatch, tmp_path, slots=1)
     try:
         holder = p.db.add_task("routine work holding the slot", "s", kind="work", tier="light", origin="user",
                                priority=3)
@@ -139,11 +145,12 @@ def test_slot_wait_fires_once_per_urgent_task_only_while_every_slot_is_taken(env
         start = time.time()
         assert all(check(m) == [] for m in (0, 5, 10, 15, 20, 30)), "raised while a slot was free"
     finally:
-        release()
+        drain(d)
+        assert reap_tmp_processes(tmp_path) == [], "a stand-in run outlived the test"
 
 
-def test_slot_wait_is_off_at_zero(env, monkeypatch, tmp_path):
-    p, d, release, settle = _slot_setup(env, monkeypatch, tmp_path, slots=1)
+def test_slot_wait_is_off_at_zero(env, monkeypatch, tmp_path, reap_tmp_processes):
+    p, d, drain, settle = _slot_setup(env, monkeypatch, tmp_path, slots=1)
     try:
         p.db.add_task("routine", "s", kind="work", tier="light", origin="user", priority=3)
         d.dispatch()
@@ -156,14 +163,16 @@ def test_slot_wait_is_off_at_zero(env, monkeypatch, tmp_path):
             d.check_slot_wait()
         assert _slot_wait_events(p) == []
     finally:
-        release()
+        drain(d)
+        assert reap_tmp_processes(tmp_path) == [], "a stand-in run outlived the test"
 
 
-def test_a_task_waiting_on_an_ended_detached_driver_holds_no_worker_slot(env, monkeypatch, tmp_path):
+def test_a_task_waiting_on_an_ended_detached_driver_holds_no_worker_slot(env, monkeypatch, tmp_path,
+                                                                         reap_tmp_processes):
     """Only live model runs count against max_parallel: a task whose run handed off waiting on its
     detached driver, which then ended, is queued and frees its slot at once (no detach-record change
     needed)."""
-    p, d, release, settle = _slot_setup(env, monkeypatch, tmp_path, slots=1)
+    p, d, drain, settle = _slot_setup(env, monkeypatch, tmp_path, slots=1)
     try:
         rc = tmp_path / "drv.rc"
         rc.write_text("0\n")   # the driver ended
@@ -186,4 +195,5 @@ def test_a_task_waiting_on_an_ended_detached_driver_holds_no_worker_slot(env, mo
         d.dispatch()
         assert _slot_tasks(p) == [nxt], "the waiting task still held the only slot"
     finally:
-        release()
+        drain(d)
+        assert reap_tmp_processes(tmp_path) == [], "a stand-in run outlived the test"
