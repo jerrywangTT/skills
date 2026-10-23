@@ -128,6 +128,9 @@ def spans(recs: list[dict], here: str | None = None) -> list[dict]:
                 s.update(end=rc.stat().st_mtime, rc=_rc(rc.read_text()), state="ended")
             except OSError:
                 s["state"] = "running" if s.get("host") == here and _held(rc.with_suffix(".lock")) else "unknown"
+        elif s["kind"] == "lock" and s.get("job_rc"):   # a `ttp detach --lock` job's: alive while its job lock is
+            s["state"] = "running" if s.get("host") == here and _held(Path(s["job_rc"]).with_suffix(".lock")) \
+                else "unknown"   # held, never by a pid another process may reuse
         elif s["kind"] == "lock" and s.get("host") == here and s.get("pid") and _same_boot(s.get("boot")) \
                 and _alive(int(s["pid"])):
             s["state"] = "running"

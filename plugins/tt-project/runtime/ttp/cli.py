@@ -3762,7 +3762,8 @@ def cmd_lock(a) -> None:
         for aid, L in zip(ids, ls):
             activity.append(p.state, activity.base(p.name, ev="take", id=aid, resource=L["res"], mode=mode,
                                                    cmd=activity.head(cmd), start=time.time(), pid=os.getpid(),
-                                                   boot=boot_id(), **({"disruptive": True} if a.disruptive else {})))
+                                                   boot=boot_id(), **({"disruptive": True} if a.disruptive else {}),
+                                                   **({"job_rc": j} if (j := lk.job_fields().get("job_rc")) else {})))
         rc = 1
         try:
             rc = run()
@@ -4063,6 +4064,8 @@ def cmd_detach(a) -> None:
         if a.host:
             mirror = getattr(a, "mirror", None) or os.environ.get("TTP_RUN_DIR") or None
             sys.exit(_detach_check_remote(a.host, a.check, rows, after or 0, mirror))
+    if getattr(a, "reap", None):
+        sys.exit(_detach_reap(a.reap))
     if a.check is None:
         _start_options(a)
     if a.check is None and (getattr(a, "rows", None) is not None or getattr(a, "after", None) is not None):
@@ -4154,14 +4157,10 @@ def cmd_detach(a) -> None:
     if state is not None:
         activity.append(state, activity.base(Project(state.parent).name, ev="job", id=aid, job=a.name,
                                              rcfile=str(rc), cmd=activity.head(cmd), start=time.time()))
-    reg = rd / "detached.json"
-    try:
-        jobs = json.loads(reg.read_text())
-    except (OSError, ValueError):
-        jobs = []
-    jobs = jobs if isinstance(jobs, list) else []
-    jobs.append({"name": a.name, "rc": str(rc), "log": str(logf), "pid": pid, "started": time.time(),
-                 "boot": boot_id(), "queued": pid is None, "command": " ".join(cmd)[:300],
+    with detach.registry(rd) as jobs:
+        jobs.append({"name": a.name, "rc": str(rc), "log": str(logf), "pid": pid, "started": time.time(),
+                 "boot": boot_id(), "queued": pid is None, "status": "running" if pid else "queued",
+                 "command": " ".join(cmd)[:300],
                  **({"resumable": True} if getattr(a, "resumable", False) else {}),
                  **({"remote": remote} if remote else {}),
                  **({"locks": job_locks} if job_locks else {}),
@@ -4169,13 +4168,34 @@ def cmd_detach(a) -> None:
                                                getattr(a, "devices", None), getattr(a, "mem_gb", None),
                                                jobuse.daemon_env(rd.parent.parent / "daemon.pid")
                                                if rd.parent.name == "runs" else None)})
-    durable_write(reg, json.dumps(jobs, indent=1))
     how = (f"(pid {pid})" if pid else
            "(queued: this command's sandbox would end it, so the daemon starts it within seconds)")
     print(f"detached {a.name} {how}\nlog: {logf}\nrc:  {rc}\n"
           + (f"locks: {','.join(job_locks)} (taken all or nothing before the command starts, held until it "
              f"ends; a paused one ends the job with exit 75)\n" if job_locks else "")
           + f"hand off: status waiting, retry_when \"{lk.job_probe([rc], _own_ttp())}\"")
+
+
+def _detach_reap(what: str) -> int:
+    """`ttp detach --reap <name or .rc path>`: close the job's record now, as the daemon's sweep would
+    (detach.close): 0 once it is closed (again: a closed one stays as it was), 1 while its driver is alive
+    or queued, 2 when no record names it. A name is a job of $TTP_RUN_DIR."""
+    from . import detach
+    rc = Path(what) if what.endswith(".rc") or "/" in what else \
+        Path(os.environ.get("TTP_RUN_DIR") or die("--reap <name> needs $TTP_RUN_DIR; give the .rc path")) / f"{what}.rc"
+    rc = rc.resolve()
+    if not detach._entry(rc):
+        print(f"ttp detach --reap: no detached job is recorded at {rc}", file=sys.stderr)
+        return 2
+    e = detach.close(rc)
+    if e is None:
+        st, _ = detach.state(rc)
+        print(f"ttp detach --reap: {rc.stem} is still {st}; its record closes once it is over", file=sys.stderr)
+        return 1
+    ex = "?" if e.get("exit") is None else e["exit"]
+    print(f"{rc.stem}: {e['status']} rc={ex} at {time.strftime('%Y-%m-%d %H:%M:%S %Z', time.localtime(e['ended']))}"
+          + (f" ({e['why']})" if e.get("why") else ""))
+    return 0
 
 
 def _lock_job(names: list, cmd: list) -> list:
@@ -7691,6 +7711,9 @@ def main(argv: list[str] | None = None) -> None:
                    help="repeatable (or A,B): the job runs its command under one `ttp lock` of them all, so it takes "
                    "them all or nothing by ttp lock's rules before the command starts and holds them until it ends "
                    "(its .rc) or its processes are gone; a paused one exits 75 at once and starts nothing")
+    s.add_argument("--reap", metavar="NAME|RC",
+                   help="close the record of a job that is over now, as the daemon does each minute: ended "
+                   "with its exit code, or died when gone without one; refuses (exit 1) while it runs; idempotent")
     s.add_argument("--resumable", action="store_true",
                    help="the job is safe to rerun from the start: after a host reboot cuts it short, the daemon "
                    "starts it again while the task still waits on it, with no model run (up to "

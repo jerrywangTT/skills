@@ -356,7 +356,10 @@ prolonged whole-box outage.
   `coordinator.progress_check` (0 turns one off); a mute on source `daemon:progress` matching a key
   keeps it quiet. A driver's `result` report (`ttp progress report result --key <key> ...`) resets the
   clock of its key, of `task:<id>` or `resource:<name>` when that is its key, and of the task whose
-  run made it.
+  run made it. Known gap: a `ttp detach` driver that died without an .rc, or ended while the task's
+  probe still says not yet, shows as died or ended in its detach record (below) but raises no progress
+  event; the task's own probe and the probe-repeat `stall` key are what surface it. Log growth is never
+  treated as progress.
 - Promises: a coordinator reply or notify that commits to a deliverable or a time ("I'll report the
   sha by 15:00", "ETA 18:30") is always recorded as a promise. It holds the chat, the promised
   words, the due time (the time it names, in the home zone, else `coordinator.promise_default_h`, 6,
@@ -539,7 +542,12 @@ project with `ttp config <name> jev.enabled false`. Without a key, screening is 
   process tree (Linux /proc, macOS ps; device files from `device.nodes` on Linux), and a job using under
   a quarter of its cores, or none of a held device, for `waiting.job_use.window_s` raises one
   `job_underuse` event and brings its task's next check within `check_cap_s`. `ttp status` and the web
-  app show requested vs used per job ("unmeasured" where it cannot sample). `ttp detach --remote <ssh alias> [--dir <dir>] <name> -- <command>`
+  app show requested vs used per job ("unmeasured" where it cannot sample). Each local job's record in
+  the run's `detached.json` says `running` (or `queued`) until it is over, then `ended` with its exit
+  code and the .rc's time, or `died` (no exit code, with why) once its job lock is free with no .rc;
+  liveness comes from that lock, never a pid another process may reuse. The daemon closes records once
+  a minute; `ttp detach --reap <name|.rc>` closes one at once (0 closed or already closed, 1 still
+  running or queued, 2 no record names it). `ttp detach --remote <ssh alias> [--dir <dir>] <name> -- <command>`
   starts the driver on another host with setsid nohup (default folder `~/.ttp-detach/<run>`, with its
   .log, .rc, .pid, .boot and .start); its probe `ttp detach --check --host <alias> <dir>/<name>` exits
   0 once the .rc holds 0, 4 once it holds another exit code or the driver is gone (pid dead, or that

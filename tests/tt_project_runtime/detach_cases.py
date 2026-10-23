@@ -476,3 +476,98 @@ def test_detach_lock_on_a_paused_resource_exits_75_and_starts_nothing(env, tmp_p
     assert _queue_len(p, "rig-a") == 0 and not (tmp_path / "ran").exists()
     r = _ttp_run(p, "detach", "--remote", "box", "job", "--lock", "rig-a", "--", "true", env=_lock_job_env(env, p, run_dir))
     assert r.returncode != 0 and "--lock is for a local job" in r.stderr, r.stderr
+
+
+# A job's detached.json record closes once the job is over (detach.close, the daemon's close_records,
+# `ttp detach --reap`). Each was red before the record had a status (no close existed) and is green now.
+def _detach_job(p, run_dir, env, name, cmd, *lock):
+    r = _ttp_run(p, "detach", name, *[x for res in lock for x in ("--lock", res)], "--", *cmd,
+                 env=_lock_job_env(env, p, run_dir))
+    assert r.returncode == 0, r.stderr
+    return (run_dir / f"{name}.rc").resolve()
+
+
+def _record(rc):
+    return next(j for j in json.loads((rc.parent / "detached.json").read_text()) if j["rc"] == str(rc))
+
+
+def test_detach_record_of_a_job_that_wrote_its_rc_closes_as_ended_in_one_sweep(env, tmp_path):
+    from ttp import detach
+    p = make(env)
+    run_dir = p.runs / "7"
+    run_dir.mkdir(parents=True)
+    rc = _detach_job(p, run_dir, env, "job", ["sh", "-c", "exit 3"])
+    assert _record(rc)["status"] == "running"
+    assert _until_true(lambda: rc.exists() and detach.state(rc)[0] == "ended")
+    assert detach.close_records(p) == 1
+    e = _record(rc)
+    assert (e["status"], e["exit"], e["ended"]) == ("ended", 3, rc.stat().st_mtime)
+    assert detach.close_records(p, now=time.time() + 120) == 0 and _record(rc) == e   # closed once
+
+
+def test_detach_record_of_a_killed_driver_closes_as_died_with_no_exit_code(env, tmp_path):
+    from ttp import detach
+    p = make(env)
+    run_dir = p.runs / "7"
+    run_dir.mkdir(parents=True)
+    rc = _detach_job(p, run_dir, env, "job", _until(tmp_path / "never"))
+    assert _until_true(lambda: detach.started(rc).exists())
+    os.killpg(_record(rc)["pid"], signal.SIGKILL)
+    assert _until_true(lambda: detach.close(rc) is not None)
+    e = _record(rc)
+    assert (e["status"], e["exit"]) == ("died", None) and "killed" in e["why"] and not rc.exists()
+
+
+def test_detach_record_whose_pid_another_process_reuses_closes_and_a_live_one_stays_open(env, tmp_path):
+    from ttp import detach
+    p = make(env)
+    run_dir = p.runs / "7"
+    run_dir.mkdir(parents=True)
+    gone = _detach_job(p, run_dir, env, "gone", _until(tmp_path / "never"))
+    live = _detach_job(p, run_dir, env, "live", _until(tmp_path / "stop"))
+    assert _until_true(lambda: detach.started(gone).exists() and detach.started(live).exists())
+    os.killpg(_record(gone)["pid"], signal.SIGKILL)
+    assert _until_true(lambda: detach.locks.any_free([detach.locks.job_lock(gone)]))
+    with detach.registry(run_dir) as jobs:   # its pid now names a live process that is not the job
+        next(j for j in jobs if j["name"] == "gone")["pid"] = os.getpid()
+    assert detach.close_records(p) == 1
+    assert _record(gone)["status"] == "died" and _record(live)["status"] == "running"
+    (tmp_path / "stop").touch()
+    assert _until_true(lambda: detach.close(live) is not None) and _record(live)["status"] == "ended"
+
+
+def test_detach_reap_closes_an_ended_job_refuses_a_live_one_and_is_idempotent(env, tmp_path):
+    p = make(env)
+    run_dir = p.runs / "7"
+    run_dir.mkdir(parents=True)
+    rc = _detach_job(p, run_dir, env, "job", _until(tmp_path / "stop"))
+    e = _lock_job_env(env, p, run_dir)
+    r = _ttp_run(p, "detach", "--reap", "job", env=e)
+    assert r.returncode == 1 and "still running" in r.stderr and _record(rc)["status"] == "running"
+    (tmp_path / "stop").touch()
+    assert _until_true(rc.exists)
+    first = _ttp_run(p, "detach", "--reap", "job", env=e)
+    assert first.returncode == 0 and "job: ended rc=0" in first.stdout, first.stderr
+    closed = _record(rc)
+    again = _ttp_run(p, "detach", "--reap", str(rc), env=e)
+    assert (again.returncode, again.stdout) == (0, first.stdout) and _record(rc) == closed
+    assert _ttp_run(p, "detach", "--reap", "other", env=e).returncode == 2
+    assert "--reap" in _ttp_run(p, "detach", "--help").stdout
+
+
+def test_detach_lock_job_closed_as_died_leaves_no_lock_held_or_shown_held(env, tmp_path):
+    from ttp import activity, detach
+    p = make(env)
+    run_dir = p.runs / "7"
+    run_dir.mkdir(parents=True)
+    rc = _detach_job(p, run_dir, env, "job", _until(tmp_path / "never"), "rig-a,rig-b")
+    assert _until_true(lambda: _held_now(p, "rig-a") and _held_now(p, "rig-b"))
+    os.killpg(_record(rc)["pid"], signal.SIGKILL)   # its `ttp lock` dies too and logs no release
+    assert _until_true(lambda: detach.close(rc) is not None) and _record(rc)["status"] == "died"
+    assert not _held_now(p, "rig-a") and not _held_now(p, "rig-b")
+    recs = activity.entries(p.state)
+    takes = [r for r in recs if r.get("ev") == "take"]
+    assert {r["resource"] for r in takes} == {"rig-a", "rig-b"} and all(r["job_rc"] == str(rc) for r in takes)
+    for r in takes:   # the lock's pid reused by a live process never shows the lock as held
+        r["pid"] = os.getpid()
+    assert [s["state"] for s in activity.spans(recs, "testhost") if s["kind"] == "lock"] == ["unknown", "unknown"]

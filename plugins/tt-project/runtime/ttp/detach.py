@@ -269,21 +269,108 @@ def running_pid(rc: Path, this_boot) -> int:
 
 
 def _restamp(rc: Path, pid: int, boot: str) -> None:
-    """Point the run's registry entry of the job at its new process and boot (state reads the boot)."""
-    reg = rc.parent / "detached.json"
+    """Point the run's registry entry of the job at its new process and boot (state reads the boot);
+    a relaunched job's record is open again."""
     try:
-        jobs = json.loads(reg.read_text())
-    except (OSError, ValueError):
-        return
-    if not isinstance(jobs, list):
-        return
-    for j in jobs:
-        if isinstance(j, dict) and j.get("rc") == str(rc):
-            j.update(pid=pid, boot=boot, started=time.time(), queued=False)
-    try:
-        durable_write(reg, json.dumps(jobs, indent=1))
+        with registry(rc.parent) as jobs:
+            for j in jobs:
+                if isinstance(j, dict) and j.get("rc") == str(rc):
+                    j.update(pid=pid, boot=boot, started=time.time(), queued=False, status="running")
+                    for k in ("exit", "ended", "why"):
+                        j.pop(k, None)
     except OSError:
         pass
+
+
+# A run's detached.json records each local job `ttp detach` started (cli.cmd_detach): its start fields
+# and status "running" (or "queued"), and once it is over status "ended" with its exit code (exit, None
+# when the .rc holds no number) and end time (the .rc's), or "died" (exit None) with why and when it was
+# found gone. The daemon closes them each tick (close_records), `ttp detach --reap` closes one at once;
+# both by state(), which reads liveness from the job's lock, never its pid, so a pid reused by another
+# process never keeps a record open and a driver still alive (any of its processes) is never closed.
+# Every write goes through registry(), one flock per run, so a close and a new job's entry never race.
+REGISTRY = "detached.json"
+CLOSED = ("ended", "died")
+CLOSE_DAYS = 14   # the runs whose records the daemon's sweep looks at
+CLOSE_EVERY_S = 60
+
+
+@contextmanager
+def registry(run_dir: Path):
+    """The run's detached.json entries as a list to change in place, written back (durably) if changed."""
+    reg = Path(run_dir) / REGISTRY
+    with open(reg.with_name(REGISTRY + ".flock"), "a") as f:   # never <name>.lock: a job's own lock
+        fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+            jobs = json.loads(reg.read_text())
+        except (OSError, ValueError):
+            jobs = []
+        jobs = jobs if isinstance(jobs, list) else []
+        before = json.dumps(jobs)
+        yield jobs
+        if json.dumps(jobs) != before:
+            durable_write(reg, json.dumps(jobs, indent=1))
+
+
+def close(rc: Path, now: float | None = None) -> dict | None:
+    """Close the record of the job at this .rc once state() says it is over: "ended" once its .rc
+    exists, "died" once it is gone without one. The record (closed now or before: idempotent), or None
+    while the job runs or is queued, or when no record names it."""
+    rc = Path(rc)
+    e = _entry(rc)
+    if not e or e.get("status") in CLOSED:
+        return e or None
+    st, why = state(rc)
+    if st not in ("ended", "lost"):
+        return None
+    if st == "ended":
+        try:
+            end = rc.stat().st_mtime
+        except OSError:
+            end = time.time() if now is None else now
+        upd = {"status": "ended", "exit": int(why) if re.fullmatch(r"-?[0-9]+", why) else None, "ended": end}
+    else:
+        try:
+            end = lost(rc).stat().st_mtime
+        except OSError:
+            end = time.time() if now is None else now
+        upd = {"status": "died", "exit": None, "ended": end, "why": why}
+    out = None
+    with registry(rc.parent) as jobs:
+        for j in jobs:
+            if isinstance(j, dict) and j.get("rc") == str(rc):
+                if j.get("status") not in CLOSED:
+                    j.update(upd)
+                out = j
+    return out
+
+
+def close_records(p: Project, now: float | None = None) -> int:
+    """The daemon's sweep (tend, at most once a minute): close every open record of the runs of the last
+    CLOSE_DAYS days whose job is over. How many it closed."""
+    now = time.time() if now is None else now
+    mark = p.state / "detach-closed.at"
+    try:
+        if now - mark.stat().st_mtime < CLOSE_EVERY_S:
+            return 0
+    except OSError:
+        pass
+    mark.touch()
+    n = 0
+    for d in sorted(p.runs.glob("*/" + REGISTRY)) if p.runs.is_dir() else []:
+        try:
+            if now - d.stat().st_mtime > CLOSE_DAYS * 86400:
+                continue
+            jobs = json.loads(d.read_text())
+        except (OSError, ValueError):
+            continue
+        for j in jobs if isinstance(jobs, list) else []:
+            if isinstance(j, dict) and j.get("rc") and j.get("status") not in CLOSED:
+                try:
+                    n += bool(close(Path(j["rc"]), now))
+                except OSError:
+                    continue
+    return n
 
 
 _held = threading.local()
@@ -433,6 +520,7 @@ def tend(p: Project) -> None:
     from . import checkdirs
     checkdirs.recover(p.state, p.runs)
     sweep(p.state)
+    close_records(p)
     folder = p.state / QUEUE
     for q in sorted(folder.glob("*.json")) if folder.is_dir() else []:
         try:
