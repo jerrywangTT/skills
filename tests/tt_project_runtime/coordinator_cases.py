@@ -1799,6 +1799,13 @@ def test_a_restrictions_section_replaced_with_looser_words_names_the_tools_of_th
     assert coord.apply(p, [{**looser, "text": f"- {item}"}], turn=41, user_turn=True) == []
     out = tools()
     assert len(out) == 1 and "bin/fleet-guard.sh:2" in out[0] and "reset-gate" not in out[0], out
+    # An item kept but extended with an exception is loosened, though its old words still appear.
+    p.db.x("DELETE FROM events")
+    p.charter_path.write_text(base)
+    extended = f"- {item}\n- {keep[:-1]}, except on weekends."
+    assert coord.apply(p, [{**looser, "text": extended}], turn=41, user_turn=True) == []
+    out = tools()
+    assert len(out) == 1 and "bin/fleet-guard.sh:2" in out[0] and "reset-gate" not in out[0], out
     # (b) a replace that only restates its items names nothing.
     p.db.x("DELETE FROM events")
     p.charter_path.write_text(base)

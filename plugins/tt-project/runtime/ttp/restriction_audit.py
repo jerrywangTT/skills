@@ -46,13 +46,14 @@ def tool_hit(line: str, ids: set[str], words: set[str]) -> bool:
 
 def replaced_items(body: str, text: str) -> list[tuple[str, str]]:
     """The items of a Restrictions section a `replaces` retired that its new `text` loosens or drops,
-    as (old item, the new item it became or ""). An item `text` keeps word for word is left out. Any
-    other item is paired with the new item that shares the most of its rule words (_widens), and
-    judged as a quoted edit to it (_loosens); an item with no such new item was dropped."""
+    as (old item, the new item it became or ""). An item equal to a new item, compared loosely, is
+    left out; one only contained in a new item (extended with an exception) is not. Any other item
+    is paired with the new item that shares the most of its rule words (_widens), and judged as a
+    quoted edit to it (_loosens); an item with no such new item was dropped."""
     from .coordinator import _items, _loose, _loosens, _rule_words, _widens
     olds = [" ".join(body[s:e].split()) for s, e, _ in _items(body)]
     news = [" ".join(text[s:e].split()) for s, e, _ in _items(text)]
-    kept = _loose(text)
+    kept = {_loose(n) for n in news}
     out = []
     for old in olds:
         if not old or _loose(old) in kept:
