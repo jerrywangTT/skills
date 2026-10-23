@@ -16679,7 +16679,7 @@ def test_a_charter_and_memory_heavy_project_keeps_the_worker_prompt_under_its_ca
     mem_chars = sum(len(e["line"]) + 1 for e in p._memory_entries())
     assert len(charter) > 11_000 and mem_chars > 9_000, (len(charter), mem_chars)
     spec = "SPEC-MARKER: follow up on fact-03 and fact-07"
-    for kind, cap in (("code", 29_100), ("question", 24_000)):   # code: +100 for `ttp detach --lock`
+    for kind, cap in (("code", 29_250), ("question", 24_000)):   # code: +100 for `ttp detach --lock`, +150 for atomic script writes
         tid = p.db.add_task(f"{kind} task", spec, kind=kind, tier="light", origin="user")
         prompt = worker_prompt(p, p.db.task(tid), str(p.root), "ttp/t1-x" if kind == "code" else None)
         assert spec in prompt and str(tmp_path) in prompt
@@ -26280,7 +26280,6 @@ DURABLE_EXEMPT = {
     ("cli.py", '"upgrade.log", "a")'): "a log",
     ("cli.py", "SOURCE_FILE).write_text"): "part of a copied runtime tree; committed or re-installed by setup",
     ("cli.py", '".gitignore").write_text'): "committed to the harness right after",
-    ("cli.py", "shim.write_text"): "installed by `ttp setup`, which can be re-run",
     ("cli.py", "spec.write_text"): "the upgrade commit's scratch pathspec list, deleted right after; a lost one only redoes the commit",
     ("cli.py", "os.replace(p+'.tmp',p)"): "runs on another machine, inside a command string",
     ("machines.py", "os.replace(p+'.tmp',p)"): "runs on another machine, inside a command string",
@@ -26323,8 +26322,6 @@ DURABLE_EXEMPT = {
     ("notifier.py", "plist.write_bytes("): "inside the staged .new app, signed then renamed into place; a torn one is rebuilt",
     ("notifier.py", '"applet.icns").write_bytes('): "inside the staged .new app, signed then renamed into place",
     ("db.py", 'with log.open("a") as fh'): "logs/slow-tx.log, a diagnostic report line",
-    ("killscan.py", "path.write_text"): "a worker's throwaway shim scripts, re-written by each `ttp killscan --shim`",
-    ("svcscan.py", "path.write_text(body)"): "a worker's throwaway shim scripts, re-written by each `ttp svcscan --shim`",
     ("replica.py", "with open(dst,'wb') as f:"): "the standby receiver, a command string run there: it syncs each file, its folders and the parent itself before renaming <seq>.partial into place",
     ("replica.py", 'open(out, "wb") as g'): "the gzipped database copy in state/replica-stage, a scratch folder removed after each snapshot and never read after a crash",
     ("replica.py", 'open(state / "project.db", "wb")'): "restore writes into a new, empty project folder; one cut off leaves the folder non-empty, which a rerun refuses, saying to remove it",
@@ -28116,8 +28113,9 @@ def test_the_worker_system_prompt_carries_only_the_rules_its_task_needs_and_stay
     # grown to 20.5k chars for every task, shared clusters, device runners and remote drivers included).
     # 13.6k: +1 rule, the one line a looping driver reports its refusals with (`ttp progress report`).
     # 13.7k: +1 clause, `ttp detach --lock` holding a job's locks for its life.
+    # 13.86k: +1 rule, change a script by renaming a temp file over it (a running shell may read it).
     rules = {k: feature_blocks(src, worker_features(p, t)) for k, t in (("code", code), ("question", question))}
-    assert len(rules["code"]) <= 13_700, len(rules["code"])
+    assert len(rules["code"]) <= 13_860, len(rules["code"])
     assert len(rules["question"]) <= 10_000, len(rules["question"])
     # A question task cannot detach, so it skips the pointer to the long-running script rules.
     assert "references/long-running-scripts.md" in rules["code"]
@@ -28126,7 +28124,7 @@ def test_the_worker_system_prompt_carries_only_the_rules_its_task_needs_and_stay
     assert "A follow-up implying a device or machine experiment" not in src
     assert "A harness task changes only this project's own harness" not in src
     every = feature_blocks(src, {"harness", "prs", "wait", "device", "devq", "remote", "clusters"})
-    assert len(every) <= 18_100, len(every)  # room for the upstream-note scope rule
+    assert len(every) <= 18_260, len(every)  # room for the upstream-note scope and atomic script-write rules
     for t in (None, code, question):
         system = worker_system(p, t)
         assert "<!-- ttp:" not in system and "<!-- /ttp:" not in system
