@@ -8854,8 +8854,9 @@ def test_status_cuts_long_lines_at_words_and_keeps_diagnostics_for_verbose(env, 
     assert cli.clip("short") == "short" and cli.clip("aaa bbb ccc", 9) == "aaa bbb…"
 
 
-def test_unknown_project_name_suggests_close_registered_names(env, capsys):
+def test_unknown_project_name_suggests_close_registered_names(env, monkeypatch, capsys):
     make(env)
+    monkeypatch.setenv("HOME", str(env["tmp"] / "userhome"))   # never the user's own chat logs (a busy host cuts that search)
     from ttp import cli
     with pytest.raises(SystemExit):
         cli.main(["task", "demp", "list"])
