@@ -10943,6 +10943,9 @@ def test_never_force_refuses_every_forced_git_push_and_a_lease(env, monkeypatch,
         out = git_push(*args)
         assert out.returncode != 0 and "delivery.never_force" in out.stderr, (args, out.stderr)
         assert gitguard.forced(args), args
+    # Moving an existing tag needs force, so never_force refuses it too (documented, not widened).
+    for args in (["origin", "+refs/tags/v1:refs/tags/v1"], ["--force-with-lease", "origin", "refs/tags/x"]):
+        assert gitguard.forced(args), args
     for args in (["origin", own], ["-o", "+x", "origin", own], ["--no-force-with-lease", "origin", own],
                  ["--push-option", "-f", "origin", own]):
         assert gitguard.forced(args) == "", args

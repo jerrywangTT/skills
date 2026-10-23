@@ -1057,8 +1057,11 @@ project with `ttp config <name> jev.enabled false`. Without a key, screening is 
   naming this setting. `lease`: `--own` replaces the rebased branch under a lease, as below.
   `delivery.never_force` (default false), when true, refuses every forced push in a run: a raw
   `git push` with `--force`, `-f`, `--force-with-lease`, `--force-if-includes` or a `+refspec`, and
-  a lease push by `--own`; config validation rejects it together with `lease`. The coordinator may
-  set `new_branch` and `never_force` true itself, `lease` only on the user's word.
+  a lease push by `--own`; config validation rejects it together with `lease`. It also refuses
+  moving an existing tag (a forced tag push, with or without a lease), so a project that moves a
+  release-channel tag forward from a run keeps `never_force` off, or moves the tag outside a run.
+  The coordinator may set `new_branch` and `never_force` true itself, `lease` only on the user's
+  word.
 - `delivery.own_push` (`existing_only` when unset) says which remote branches besides the push branch
   `ttp push --own` may push to, and every push that publishes as with `--own` (a notes branch, a
   `pr_branch:` or `rebases:` task). The branch is the one the task was built on (its latest
