@@ -25,7 +25,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from . import locks
-from . import anchors, askrethink, broadcast, budgetkind, cachettl, chaincap, correction, course, credits, deploy, effort, ends, failover, forbidden, heal, hostcycle, jevuse, landed, machine_ledger, machines, mitigate, obligations, outagemsg, pauseends, prguard, progress, projpause, push, relay, responsibilities, reviewcap, reviewreuse, settinghold, settled, shared, sharedchecks, sweep, timefmt, tried, unblock, upstream, verified, watchdup, worktree
+from . import anchors, askrethink, broadcast, budgetkind, cachettl, chaincap, correction, course, credits, deploy, effort, ends, failover, forbidden, heal, hostcycle, jevuse, landed, machine_ledger, machines, mitigate, obligations, outagemsg, pauseends, prguard, progress, projpause, push, relay, responsibilities, restriction_audit, reviewcap, reviewreuse, settinghold, settled, shared, sharedchecks, sweep, timefmt, tried, unblock, upstream, verified, watchdup, worktree
 from . import overlap as file_overlap   # apply() has a local `overlap`
 from . import screen as scr
 from . import schedule as sched
@@ -1468,7 +1468,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
     restr_before: str | None = None
     rules_added: list[tuple[str, str]] = []
     restr_edited = False
-    loosened: list[tuple[str, str]] = []   # (old item, new text) of Restrictions items the user loosened
+    loosened: list[tuple[str, str, str]] = []   # (old item, new text, over) of Restrictions items loosened or retired
     replies: list[int] = []
     # Promises (obligations.record_promises): what this batch sent, the tasks it added or updated with
     # their reply_chat, and the obligations it recorded or attached owners to.
@@ -2082,6 +2082,13 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                         if overlap:
                             notes.append(overlap)
                     source = _users_own(db, messages or []) if user_turn else list((ok or {}).get("messages") or [])
+                    gone = ""   # the Restrictions section `replaces` retires, for restriction_audit
+                    if replaces:
+                        from .prompts import charter_sections
+                        secs = charter_sections(p.charter_path.read_text())
+                        i = _charter_replaced(secs, replaces, quiet=True)
+                        if i is not None and " ".join(secs[i][0][3:].split()).lower().startswith("restriction"):
+                            gone = "\n".join(secs[i][1])
                     try:
                         target, extra, retired = _charter_update(p, section, text, quote, replaces, key,
                                                                  user_turn or ok is not None, over, end, no_ok,
@@ -2105,8 +2112,13 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     if (quote and target.lower().startswith("restriction")
                             or extra.lower().startswith(" (replaces restriction")):
                         restr_edited = True
-                        if quote and (user_turn or ok is not None) and _loosens(quote, text):
-                            loosened.append((quote, text))
+                        # the user's word, or `over` retiring the item: its enforcing tools are stale
+                        why = "" if user_turn or ok is not None else over if len(over) >= OVER_MIN else None
+                        if why is not None and quote and _loosens(quote, text):
+                            loosened.append((quote, text, why))
+                        if why is not None and gone:
+                            into = text if target.lower().startswith("restriction") else ""
+                            loosened += [(o, n, why) for o, n in restriction_audit.replaced_items(gone, into)]
                     elif text and not quote and not a.get("both_hold"):
                         rules_added.append((target, text))
                     if retired:
@@ -2317,7 +2329,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
         _restriction_conflicts(p, restr_before, rules_added)
     if loosened:
         try:   # a hint for the next turn: it never undoes the charter edit
-            _restriction_tools(p, loosened, list(batch_tasks))
+            restriction_audit.restriction_tools(p, loosened, list(batch_tasks))
         except Exception as e:
             notes.append(f"restriction tools not checked: {type(e).__name__}: {str(e)[:200]}")
     try:   # a reply already went out: marking what it delivered never undoes or rejects it
@@ -3556,92 +3568,6 @@ def _loosens(quote: str, text: str) -> bool:
         if _may_lift(min(adds, key=len) if adds else x):
             return True
     return False
-
-
-# A term a tool would carry word for word: `code`, a path or dotted name, an UPPER_CASE name.
-_TOOL_TERM_RE = re.compile(r"`([^`\n]{3,60})`|(?<![\w/.-])([A-Za-z0-9-]*[A-Za-z0-9][_/.][A-Za-z0-9_/.-]*[A-Za-z0-9])"
-                           r"|\b([A-Z][A-Z0-9]*_[A-Z0-9_]+|[A-Z]{4,})\b")
-TOOL_SCAN_FILES = 2000   # files read per check at most (bin/ and hooks/ trees)
-TOOL_SCAN_BYTES = 262144   # a larger file is not a tool script
-
-
-def _tool_terms(old: str, new: str) -> tuple[set[str], set[str]]:
-    """The old item's distinctive terms for _restriction_tools: identifiers (_TOOL_TERM_RE) of its
-    changed sentences that the new text no longer has, and its rule words (_rule_words) the new text
-    dropped (all of the changed sentences' when it dropped fewer than two)."""
-    changed = " ".join(_changed_sentences(old, new)) or old
-    ids = {next(g for g in m.groups() if g) for m in _TOOL_TERM_RE.finditer(changed)}
-    ids = {t for t in ids if t not in new and not re.fullmatch(r"[\d./-]+", t)}
-    words = _rule_words(changed) - _rule_words(new)
-    return ids, (words if len(words) >= 2 else _rule_words(changed))
-
-
-def _tool_hit(line: str, ids: set[str], words: set[str]) -> bool:
-    """A line names an identifier of the old item, or two of its rule words (as word starts)."""
-    if any(t in line for t in ids):
-        return True
-    low = line.lower()
-    return sum(bool(re.search(rf"\b{re.escape(w)}", low)) for w in words) >= 2
-
-
-def _restriction_tools(p: Project, loosened: list[tuple[str, str]], batch: list[int]) -> list[str]:
-    """After the user's word loosened or removed Restrictions items (a quoted edit), name the project's
-    own tools that still carry the old wording: files under bin/ and hooks/ (project root and harness),
-    harness/schedules.json, and the command and heal check of each schedule, whose lines name an
-    identifier of the old item or two of its dropped rule words (_tool_terms). A file a task of this
-    batch names (its title or spec has the file's path or name) is left out. One queued
-    restriction_tools event per item with such files, for the next digest: model-free, it edits nothing.
-    Returns the event texts."""
-    files: list[tuple[str, str]] = []   # (label, text)
-    seen = 0
-    for base in (p.root, p.harness):
-        for sub in ("bin", "hooks"):
-            top = base / sub
-            if not top.is_dir():
-                continue
-            for f in sorted(top.rglob("*")):
-                if seen >= TOOL_SCAN_FILES:
-                    break
-                if not f.is_file() or any(x in f.parts for x in (".git", "__pycache__", "node_modules")):
-                    continue
-                seen += 1
-                try:
-                    if f.stat().st_size > TOOL_SCAN_BYTES:
-                        continue
-                    raw = f.read_bytes()
-                except OSError:
-                    continue
-                if b"\0" not in raw:
-                    files.append((str(f.relative_to(p.root)), raw.decode("utf-8", "replace")))
-    sched = p.harness / "schedules.json"
-    if sched.is_file() and sched.stat().st_size <= TOOL_SCAN_BYTES:
-        files.append((str(sched.relative_to(p.root)), sched.read_text(errors="replace")))
-    for r in p.db.q("SELECT name, payload FROM schedules"):
-        payload = json.loads(r["payload"] or "{}")
-        heal_block = payload.get("heal") or {}
-        cmds = [payload.get("command")] + [heal_block.get(k) for k in ("check", "fix", "suppress")]
-        files.append((f"schedule {r['name']}", "\n".join(str(c) for c in cmds if c)))
-    named = " ".join(f"{t['title']} {t['spec']}" for t in (p.db.task(i) for i in batch) if t)
-    out = []
-    for old, new in loosened:
-        ids, words = _tool_terms(old, new)
-        hits = []
-        for label, text in files:
-            line = next((n for n, x in enumerate(text.splitlines(), 1) if _tool_hit(x, ids, words)), 0)
-            if not line or label in named or (not label.startswith("schedule ") and Path(label).name in named):
-                continue
-            hits.append(label + (f":{line}" if not label.startswith("schedule ") else ""))
-        if not hits:
-            continue
-        x = (f"The user's word loosened the Restrictions item \"{clip(old, 200)}\", but these project tools "
-             f"still name its terms and no task of that batch names them: {', '.join(hits[:10])}"
-             + (f" and {len(hits) - 10} more" if len(hits) > 10 else "")
-             + ". Queue a priority-1 task updating every tool that enforces the old wording, or say in "
-               "`summary` why these do not enforce it.")
-        out.append(x)
-        p.db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
-               (time.time(), "harness", "restriction_tools", "normal", x, "queued"))
-    return out
 
 
 CHARTER_LINT_KEY = "charter_lint"   # kv: {"stat", "hash"} of the charter last linted, "seen" pair keys flagged

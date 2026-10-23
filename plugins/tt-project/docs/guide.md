@@ -1253,6 +1253,12 @@ Workers can read Slack links you paste, using your Slack connector if you have o
   tunnel already installed counts as a yes.
 - Workers run with your permissions, in their own worktree; restrictions in the charter are
   passed to every worker and enforced by the provider where it can (for example, no web tools).
+- When the user loosens or removes a Restrictions item (a quoted edit, or a `replaces` of a whole
+  Restrictions section, judged item by item), or `over` retires one, a `restriction_tools` event
+  names the project's tool files (bin/, hooks/, schedule commands and heal checks) that still carry
+  the old item's terms; it never edits them. The charter guard's refusal says a user's loosening
+  goes in as written, and offers the temporary-exception route only when the user's own words make
+  it temporary.
 - Text from logs, issues and chats is treated as data, not instructions.
 - Secrets are entered in a terminal (`ttp secret …`), never in chat, and never copied into a project.
   An OpenAI-compatible endpoint's API key: `ttp secret endpoint <alias> --url <base url>` checks it with

@@ -1755,9 +1755,64 @@ def test_a_users_loosening_of_a_restriction_names_the_tools_still_enforcing_the_
                        turn=31, user_turn=True) == []
     assert tools() == []
     p.charter_path.write_text(base)
-    coord.apply(p, [{**loosen, "over": "the serving fleet was retired on 2026-10-01, so the rule's case is gone"}],
-                turn=32, user_turn=False)
+    assert coord.apply(p, [loosen], turn=32, user_turn=False), "outside the user's word and with no `over`: refused"
     assert tools() == []
+    # `over` retiring the item: its enforcing tools are stale too, named with the end that passed.
+    over = "the serving fleet was retired on 2026-10-01, so the rule's case is gone"
+    p.charter_path.write_text(base)
+    assert coord.apply(p, [{**loosen, "text": "", "over": over}], turn=33, user_turn=False) == []
+    out = tools()
+    assert len(out) == 1 and out[0].startswith("`over` retired the Restrictions item") and over in out[0], out
+    assert "bin/reset-gate.sh:2" in out[0]
+
+
+def test_a_restrictions_section_replaced_with_looser_words_names_the_tools_of_the_loosened_items_only(env):
+    """A `replaces` of a whole Restrictions section is judged item by item (restriction_audit): an item
+    the new text loosens or drops names the tools still carrying it; one it keeps word for word names
+    none. A restatement names nothing, and neither does a replace outside the user's word with no
+    `over`; with `over` the retired items' tools are named."""
+    p = make(env)
+    from ttp import coordinator as coord, restriction_audit
+    assert not hasattr(coord, "_restriction_tools"), "the detector lives in restriction_audit"
+    assert restriction_audit.TOOL_SCAN_FILES and restriction_audit.restriction_tools
+    item = "Never run a chip reset that can reach a host serving live traffic."
+    keep = "Never edit the `fleet.yaml` service file."
+    head = "Restrictions (added 2026-10-05, turn 7)"
+    base = f"# demo\n\n## Restrictions\n- Never merge.\n\n## {head}\n- {item}\n- {keep}\n\n## Notes\nx\n"
+    (p.root / "bin").mkdir(exist_ok=True)
+    (p.root / "bin" / "reset-gate.sh").write_text("#!/bin/sh\n# skip the reset while a neighbour is serving\n")
+    (p.root / "bin" / "fleet-guard.sh").write_text("#!/bin/sh\n# refuse writes to fleet.yaml\n")
+
+    def tools():
+        return [r["text"] for r in p.db.q("SELECT text FROM events WHERE kind='restriction_tools'")]
+    looser = {"type": "charter_update", "section": "Restrictions", "replaces": head,
+              "text": f"- A chip reset may run even when it can reach a host serving live traffic.\n- {keep}"}
+    # (a) one item loosened, the other kept word for word: only the loosened item's tool is named.
+    p.charter_path.write_text(base)
+    assert coord.apply(p, [looser], turn=40, user_turn=True) == []
+    assert "A chip reset may run" in p.charter_path.read_text()
+    out = tools()
+    assert len(out) == 1 and "bin/reset-gate.sh:2" in out[0] and "fleet-guard" not in out[0], out
+    # A dropped item counts as loosened too.
+    p.db.x("DELETE FROM events")
+    p.charter_path.write_text(base)
+    assert coord.apply(p, [{**looser, "text": f"- {item}"}], turn=41, user_turn=True) == []
+    out = tools()
+    assert len(out) == 1 and "bin/fleet-guard.sh:2" in out[0] and "reset-gate" not in out[0], out
+    # (b) a replace that only restates its items names nothing.
+    p.db.x("DELETE FROM events")
+    p.charter_path.write_text(base)
+    assert coord.apply(p, [{**looser, "text": f"* {item}\n* {keep}"}], turn=42, user_turn=True) == []
+    assert tools() == []
+    # (c) outside the user's word, with no `over`: refused, the charter as it was, nothing named.
+    p.charter_path.write_text(base)
+    assert coord.apply(p, [looser], turn=43, user_turn=False)
+    assert p.charter_path.read_text() == base and tools() == []
+    # `over` retiring the section: the loosened item's tool is named, with the end that passed.
+    over = "the serving fleet was retired on 2026-10-01, so the rule's case is gone"
+    assert coord.apply(p, [{**looser, "over": over}], turn=44, user_turn=False) == []
+    out = tools()
+    assert len(out) == 1 and out[0].startswith("`over` retired") and "reset-gate.sh" in out[0], out
 
 
 def test_the_charter_guard_tells_a_users_loosening_to_go_in_as_written(env):
