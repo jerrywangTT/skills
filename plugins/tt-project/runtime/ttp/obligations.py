@@ -707,6 +707,21 @@ def owned_open(db, tid: int) -> list[str]:
     return [o["id"] for o in items(db) if _open(o) and str(tid) in o["owners"]]
 
 
+def owner_due(db) -> dict[int, float]:
+    """Task id -> the earliest due time of the open obligations it is a required owner of (owned_open's
+    owners): an unreceipted milestone's due, else a promise's, else math.inf. Dispatch starts these
+    tasks first, the earliest due first (db.ready_tasks)."""
+    out: dict[int, float] = {}
+    for o in items(db):
+        if not _open(o) or not o["owners"]:
+            continue
+        dues = [m["due"] for m in (o.get("milestones") or {}).values() if not m["receipt"]]
+        due = min(dues) if dues else float((o.get("promise") or {}).get("due") or math.inf)
+        for tid in o["owners"]:
+            out[int(tid)] = min(out.get(int(tid), math.inf), due)
+    return out
+
+
 def record_promises(p, sent: list[tuple[int, str | None, str]], tasks: dict[int, str | None],
                     obligations: list[str] = (), now: float | None = None) -> list[str]:
     """Record the commitments in this batch's sent messages (message id, chat, text). `tasks`: the batch's

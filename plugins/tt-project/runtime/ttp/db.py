@@ -881,11 +881,21 @@ END""")
         return counts
 
     def ready_tasks(self) -> list[dict]:
-        """Queued tasks whose dependencies are all finished, best priority first. A task deferred
-        with `start_when` is not ready until its probe passes (see deferral)."""
+        """Queued tasks whose dependencies are all finished, in dispatch's pick order: required owners
+        of an open obligation first (its earliest due milestone first, obligations.owner_due), then best
+        priority, then oldest. Read afresh on every call: no order outlives a dispatch pass or a daemon
+        restart. A task deferred with `start_when` is not ready until its probe passes (see deferral)."""
         now = time.time()
         rows = self.q("SELECT * FROM tasks WHERE status='queued' AND (not_before IS NULL OR not_before<=?) "
                       "ORDER BY priority, id", (now,))
+        if rows:
+            from . import obligations
+            try:
+                due = obligations.owner_due(self)
+            except Exception:   # unreadable obligations only lose the boost, never the queue
+                due = {}
+            if due:
+                rows.sort(key=lambda r: (r["id"] not in due, due.get(r["id"], 0.0)))   # stable: priority, id within
         unmet = self.unmet_dependencies(rows)
         return [r for r in rows if not unmet[r["id"]] and "when" not in deferral(r)]
 

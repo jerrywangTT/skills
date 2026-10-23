@@ -415,6 +415,15 @@ prolonged whole-box outage.
   offline provider, or the budget gate's slots are never counted: each hold has its own alert.
   Known gap: a hold that is itself wrong (a lock that never clears, a probe that can never pass) is
   not reported by this check; the lock, hold and wait checks cover it.
+- Pick order: on every dispatch pass, read afresh from the task records (nothing carries over a daemon
+  restart), dispatch tries the required owners of an open obligation first (earliest due milestone
+  first), then priority 1 first, then the oldest. Gates, locks, deferrals and `max_parallel` still
+  apply, and no running task is stopped. A task waiting on its own detached job holds no worker
+  slot: only live model runs count against `max_parallel`.
+- Urgent slot wait (model-free): an obligation owner or priority-1 task that dispatch holds only
+  because every worker slot is taken, for `coordinator.urgent_slot_wait_min` (15; 0 turns it off),
+  raises one observation (high for an obligation owner) naming it and the running tasks holding the
+  slots with their priorities. One per task until it runs again.
 - Idle capacity (model-free): a device resource of the project (its device lock, a `*-device` name its
   config or recent tasks use, or a machine tagged `device` that its charter's Resources names) that
   no open task, `ttp lock` slot, reservation or detached-job hold uses for `coordinator.idle_capacity_s`

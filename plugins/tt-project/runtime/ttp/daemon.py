@@ -1132,7 +1132,7 @@ class Daemon:
         core_held = self._run_step(lambda: self.net_held(core) and not self._net_may_probe(core), "net_held", default=False)
         cycle = self._run_step(lambda: self.host_cycle_held(now), "host_cycle_held", default=False)
         for step in (self.run_schedules, self.poll_slack, self.check_resource_trouble, self.read_upstream,
-                     self.wake_upstream_fixes, self.drain_note_outbox, self.forward_upstream, self.retry_rejected, self.check_stall, self.check_progress, self.check_idle_capacity, self.check_obligations, self.audit_pushes, self.retire_ended, self.archive_hidden_memory, self.route_machines, self.refresh_coverage, self.sweep_holds, self.sweep_reviews, self.sweep_unreviewed, self.check_unqueued_continues, self.check_stale_duplicates, self.tend_mitigations, self.failover_pinned, self.rethink_asks, self.blocker_sweep, self.maybe_coordinate, self.refresh_ref_waits, self.sample_jobs, self.watch_progress, self.probe_waiting, self.start_pushes, self.dispatch, self.check_unreachable, self.remind_logouts, self.relay_when_blocked, self.deliver_outbound):
+                     self.wake_upstream_fixes, self.drain_note_outbox, self.forward_upstream, self.retry_rejected, self.check_stall, self.check_slot_wait, self.check_progress, self.check_idle_capacity, self.check_obligations, self.audit_pushes, self.retire_ended, self.archive_hidden_memory, self.route_machines, self.refresh_coverage, self.sweep_holds, self.sweep_reviews, self.sweep_unreviewed, self.check_unqueued_continues, self.check_stale_duplicates, self.tend_mitigations, self.failover_pinned, self.rethink_asks, self.blocker_sweep, self.maybe_coordinate, self.refresh_ref_waits, self.sample_jobs, self.watch_progress, self.probe_waiting, self.start_pushes, self.dispatch, self.check_unreachable, self.remind_logouts, self.relay_when_blocked, self.deliver_outbound):
             if self.cfg_status == "unavailable" and step in (self.maybe_coordinate, self.dispatch):
                 continue   # no routing to start model work with (see _load_config)
             # While the host settles after a sleep only new work waits: a person who wrote is answered now.
@@ -5121,6 +5121,62 @@ class Daemon:
                  (now, "daemon", "observation", f"stall:{last_id}", "high", text[:4000], "queued"))
         log(self.p, f"stall: {len(stuck)} task(s) ready for {hours:g} h or more, no worker run since {when}")
 
+    def check_slot_wait(self, every_s: float = 60) -> None:
+        """Model-free urgent slot wait: a ready task that is a required owner of an open obligation, or has
+        priority 1, held only because every worker slot of its provider is taken (_start_hold's 'gate' with
+        ctx["full"]) at every check for coordinator.urgent_slot_wait_min (default 15, 0: off) raises one
+        observation naming it and the running tasks holding the slots with their priorities, so the
+        coordinator can free or reorder work before the user notices. High for an obligation owner,
+        normal for a plain priority 1. One per task per stay in the queue (keyed on its last run); a free
+        slot or any other hold restarts its clock. The clock is kept in memory, like check_stall's: after
+        a daemon restart, or checks further apart than STALL_GAP_S, it counts from then. Nothing is
+        preempted: dispatch already starts these tasks first when a slot frees (db.ready_tasks)."""
+        now = time.time()
+        last = getattr(self, "_slot_wait_checked", 0.0)
+        if now - last < every_s:
+            return
+        self._slot_wait_checked = now
+        mins = float(self.cfg["coordinator"].get("urgent_slot_wait_min", 15) or 0)
+        if mins <= 0 or self.cfg_status == "unavailable" or self.settling() or now - last > STALL_GAP_S:
+            self._slot_waits = {}
+            return
+        db = self.p.db
+        due = obligations.owner_due(db)
+        urgent = [t for t in db.ready_tasks() if t["id"] in due or (t["priority"] or 0) == 1]
+        core = self.cfg.get("core_provider", "claude")
+        ctx = {"now": now, "paused": db.paused_resources(), "committed": None,
+               "busy": {r["provider"]: r["n"] for r in db.q(
+                   "SELECT provider, COUNT(*) n FROM runs WHERE role!='coordinator' AND status='running' "
+                   "GROUP BY provider")},
+               "logged_out": {prov: self._logged_out(prov) for prov in {t["provider"] or core for t in urgent}}}
+        full = {t["id"]: t for t in urgent
+                if self._start_hold(t, t["provider"] or core, ctx) == "gate" and t["id"] in ctx.get("full", {})}
+        seen = getattr(self, "_slot_waits", {})
+        self._slot_waits = {tid: seen.get(tid, now) for tid in full}
+        for tid, t in full.items():
+            if now - self._slot_waits[tid] < mins * 60:
+                continue
+            ran = db.one("SELECT MAX(id) id FROM runs WHERE task=?", (tid,))
+            fp = f"slot_wait:{tid}:{(ran or {}).get('id') or 0}"
+            if db.one("SELECT id FROM events WHERE fingerprint=?", (fp,)):
+                continue
+            provider = t["provider"] or core
+            owns = obligations.owned_open(db, tid) if tid in due else []
+            why = f"p{t['priority']}" + (f", owns open obligation {', '.join(owns)}" if owns else "") + (
+                f", next due {timefmt.long(due[tid], self.p)}" if owns and due[tid] != float("inf") else "")
+            holders = db.q("SELECT r.id run, r.task, t.priority, t.title FROM runs r LEFT JOIN tasks t ON t.id=r.task "
+                           "WHERE r.role!='coordinator' AND r.status='running' AND r.provider IS ? "
+                           "ORDER BY t.priority DESC, r.started", (provider,))
+            lines = [f"#{h['task']} {(h['title'] or '')[:60]} (p{h['priority']}, run {h['run']})" if h["task"]
+                     else f"run {h['run']} (no task)" for h in holders]
+            text = (f"Slot wait: #{tid} {t['title'][:80]} ({why}) is ready but has waited "
+                    f"{(now - self._slot_waits[tid]) / 60:.0f} min for a {provider} worker slot: all "
+                    f"{ctx['full'][tid]} are taken. It starts first when one frees. To start it sooner, end or "
+                    f"pause lower-priority work holding a slot:\n" + "\n".join(f"- {x}" for x in lines[:STALL_LIST_MAX]))
+            db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status,task) VALUES(?,?,?,?,?,?,?,?)",
+                 (now, "daemon", "observation", fp, "high" if owns else "normal", text[:4000], "queued", tid))
+            log(self.p, f"slot wait: task {tid} ({why}) waited {mins:g} min or more for a {provider} worker slot")
+
     def _log_resource_wait(self, task: dict, held: dict | None) -> None:
         """Log once per wait that dispatch skips ready `task` because a resource it needs is held, with
         the hold it recorded (`held`, _resource_hold's; check_stall forgets the task once nothing holds it)."""
@@ -5899,13 +5955,16 @@ class Daemon:
         does not resolve), 'gate' (the budget gate or its provider's slots), 'optional', 'device'
         (device task slots), 'budget' (task budget spent), 'caps' (dollar caps) or 'resource' (busy,
         including `ttp lock` and device-lock aliases). With 'paused' or 'resource' it records what holds
-        the task in ctx["holds"][task id] (_resource_hold's data): the one record check_stall reads. The one copy of dispatch's checks, in its order,
+        the task in ctx["holds"][task id] (_resource_hold's data): the one record check_stall reads. With
+        'gate' because every worker slot is taken it records ctx["full"][task id] = max_parallel
+        (check_slot_wait reads it). The one copy of dispatch's checks, in its order,
         so check_stall counts exactly what dispatch would start. Nothing changes but with `reserve`
         (_resource_hold) and ctx's caches: ctx holds now, paused, logged_out (provider -> bool), busy
         (provider -> running), committed (dollars running work may still spend under the caps; None:
         not read yet); it sets gate (the task's budget gate, once that check is reached)."""
         now = ctx["now"]
         ctx.setdefault("holds", {}).pop(task["id"], None)
+        ctx.setdefault("full", {}).pop(task["id"], None)
         if self._disk_holds(task) or self._precheck_holds(task, now):
             return "held"
         if coord.task_resources(task) & ctx["paused"].keys():
@@ -5919,6 +5978,8 @@ class Daemon:
         gate = ctx["gate"] = self.gates.get(provider) or \
             bud.evaluate(self.p.db, self.cfg, provider, bud.plan_windows(self.p.db))
         if not gate.allow_new_work or ctx["busy"].get(provider, 0) >= gate.max_parallel:
+            if gate.allow_new_work:   # held only because every worker slot is taken (check_slot_wait)
+                ctx.setdefault("full", {})[task["id"]] = gate.max_parallel
             return "gate"
         if task["origin"] in ("schedule", "harness") and not gate.allow_optional:
             return "optional"
