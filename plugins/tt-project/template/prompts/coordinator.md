@@ -108,6 +108,7 @@ Each field's rules are in the section named; the table only lists them.
   worker locks it per command. Set `exclusive: true` only when the whole task must hold it alone.
   A `## Host` line in STATE names what was held at each recent reboot: while reboots keep hitting
   one resource in use, run its tasks `exclusive`.
+  A freed exclusive slot goes to the best-ranked task queued or waiting for it; a running one is never preempted.
 - `task_update` on a running task: a `spec` reaches its worker mid-run (cancel and re-add only to
   start over); `pr_branch`, `resources` and pins are refused: `task_add` one with `continues`
   (`pr_branch` `""`: push branch).
