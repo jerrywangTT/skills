@@ -229,7 +229,9 @@ prolonged whole-box outage.
   `ttp doctor` say so. A review the coordinator adds
   for the same work replaces the daemon's while it has not started. A review that fails with
   follow-ups gets one fix task on the reviewed branch and a re-review from the daemon, and the
-  tasks waiting on the failed review wait on the re-review instead of being blocked (at most two
+  tasks waiting on the failed review wait on the re-review instead of being blocked. The re-review
+  depends on the fix; a fix that ends with no new commits on the reviewed head blocks it and wakes
+  the coordinator, so the same head is never re-reviewed (at most two
   rounds per stack; a failure without fix follow-ups still blocks them, and `upstream:` notes and
   deferred follow-ups stay with the coordinator). Across stacks, once `review.area_fail_cap` (3; 0
   off) reviews of one area failed within 48 h (a lineage linked by `continues`, follow-ups,

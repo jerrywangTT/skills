@@ -11284,3 +11284,88 @@ def test_a_failed_review_still_gives_a_working_split_hop_its_findings(env):
     assert f"review_fix:{rev}" in _labels(p, hop["id"])
     (rr,) = p.db.q("SELECT * FROM tasks WHERE kind='review' AND id!=?", (rev,))
     assert json.loads(rr["depends_on"]) == [hop["id"]]
+
+
+def _fix_and_re_review(p, rev):
+    (fix,) = p.db.q("SELECT * FROM tasks WHERE title LIKE ?", (f"Fix review #{rev}:%",))
+    (rr,) = p.db.q("SELECT * FROM tasks WHERE kind='review' AND labels LIKE ?", (f'%"continues:{rev}"%',))
+    return fix["id"], rr["id"]
+
+
+@pytest.mark.parametrize("handoff", ["done", "needs_review"])
+def test_a_re_review_never_runs_when_its_fix_ends_with_no_new_commits(env, handoff):
+    """The re-review depends on its fix; a fix that hands off done (or needs_review) without adding a
+    commit to the head its review saw leaves nothing to re-review: the re-review is blocked, not run on
+    the same head, and the fix's hand-off wakes the coordinator saying so."""
+    p = make(env)
+    root, branch, rev, _ = _split_with_a_landing_hop(env, p)
+    _fail_review(env, p, rev, [{"title": "refuse an open review", "spec": "abandon refuses a task under review"}])
+    fid, rid = _fix_and_re_review(p, rev)
+    head = _git_out(p.root, "rev-parse", "--short=12", branch).strip()
+    assert f"fix_base:{head}" in _labels(p, rid)
+    _hop(env, p, fid, {}, {"status": handoff, "summary": "nothing needed fixing"})
+    rr = p.db.task(rid)
+    assert rr["status"] == "blocked" and "no new commits" in rr["blocked_reason"] and head in rr["blocked_reason"]
+    (ev,) = p.db.q("SELECT * FROM events WHERE task=? AND kind LIKE 'task_%' AND kind!='task_waiting'", (fid,))
+    assert ev["status"] == "queued" and f"Re-review #{rid} blocked" in ev["text"]
+
+
+def test_a_re_review_runs_once_its_fix_adds_commits(env):
+    p = make(env)
+    root, branch, rev, _ = _split_with_a_landing_hop(env, p)
+    _fail_review(env, p, rev, [{"title": "refuse an open review", "spec": "abandon refuses a task under review"}])
+    fid, rid = _fix_and_re_review(p, rev)
+    rr = p.db.task(rid)
+    assert p.db.unmet_dependencies([rr])[rid] == [fid], "the re-review can run before its fix"
+    _hop(env, p, fid, {"guard.py": 3}, {"status": "done", "summary": "refuses an open review"})
+    rr = p.db.task(rid)
+    assert rr["status"] == "queued" and p.db.unmet_dependencies([rr])[rid] == []
+
+
+def _review_events(p, rid):
+    from ttp import deadwait
+    return p.db.q("SELECT * FROM events WHERE task=? AND status='queued' AND kind IN (?,?,?)",
+                  (rid, "task_failed", "task_changes_needed", deadwait.NOFIX_EVENT))
+
+
+def test_a_failed_review_with_no_fix_follow_ups_gets_no_fix_or_re_review_and_one_event(env):
+    p = make(env)
+    _, _, _, (rev,) = _finish_code(env, p, "feature", {"a.py": 40})
+    ev = _fail_review(env, p, rev["id"], [])
+    assert not p.db.q("SELECT id FROM tasks WHERE title LIKE 'Fix review%' OR title LIKE 'Re-review%'")
+    (only,) = _review_events(p, rev["id"])
+    assert only["id"] == ev["id"] and "No automatic fix: it proposed no fix follow-ups" in only["text"]
+
+
+def test_a_third_failed_review_round_gets_no_fix_or_re_review_and_one_nofix_event(env):
+    from ttp.daemon import AUTO_FIX_ROUNDS
+    p = make(env)
+    p.set_config("review.area_fail_cap", 10)   # the round cap alone, not the area cap
+    _, _, _, (rev,) = _finish_code(env, p, "feature", {"a.py": 40})
+    rid = rev["id"]
+    for n in range(AUTO_FIX_ROUNDS):
+        _fail_review(env, p, rid, [{"title": f"bug {n}", "spec": f"fix bug {n}"}])
+        fid, rid = _fix_and_re_review(p, rid)
+        _hop(env, p, fid, {f"fix{n}.py": 3}, {"status": "done", "summary": f"fixed bug {n}"})
+    tasks = p.db.one("SELECT COUNT(*) n FROM tasks")["n"]
+    _fail_review(env, p, rid, [{"title": "bug again", "spec": "fix it again"}])
+    assert p.db.one("SELECT COUNT(*) n FROM tasks")["n"] == tasks, "a fix or re-review past the round cap"
+    from ttp import deadwait
+    nofix = [e for e in _review_events(p, rid) if e["kind"] == deadwait.NOFIX_EVENT]
+    assert len(nofix) == 1 and f"{AUTO_FIX_ROUNDS + 1} reviews of this stack failed" in nofix[0]["text"]
+
+
+def test_a_failed_review_at_the_review_area_cap_gets_no_fix_or_re_review_and_one_area_event(env):
+    from ttp import reviewcap
+    p = make(env)
+    p.set_config("review.area_fail_cap", 2)
+    fups = [{"title": "handle the edge case", "spec": "parse('') raises"}]
+    code_a, _, _, (rev_a,) = _finish_code(env, p, "feature", {"a.py": 40})
+    _fail_review(env, p, rev_a["id"], fups)
+    tasks = p.db.one("SELECT COUNT(*) n FROM tasks")["n"]
+    _, _, _, (rev_b,) = _finish_code(env, p, f"#{code_a} follow-up: feature", {"b.py": 40})
+    failed = _fail_review(env, p, rev_b["id"], fups)
+    assert p.db.one("SELECT COUNT(*) n FROM tasks")["n"] == tasks + 2, "a fix or re-review past the area cap"
+    assert not p.db.q("SELECT id FROM tasks WHERE labels LIKE ?", (f'%"continues:{rev_b["id"]}"%',))
+    area = p.db.q("SELECT * FROM events WHERE task=? AND kind=?", (rev_b["id"], reviewcap.REVIEW_AREA_EVENT))
+    assert len(area) == 1 and reviewcap.TRIGGER in failed["text"]

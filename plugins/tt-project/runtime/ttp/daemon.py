@@ -195,6 +195,7 @@ PRECHECK_HOLD_S, PRECHECK_KEEP_S = 3600, 7 * 86400
 # A failed review with fix specs gets its fix and re-review from the daemon this many rounds per stack;
 # the re-review repeats the failed review's spec (its push and after-push steps) up to this length.
 AUTO_FIX_ROUNDS, REVIEW_FIX_SPEC_CHARS = 2, 8000
+FIX_BASE_LABEL = "fix_base:"   # a re-review: fix_base:<the head its failed review saw>; its fix must add commits to it
 # The daemon's review spec embeds the code task's spec and hand-off, then this line; its own steps
 # follow it. A re-review reads the first review's `ttp push --own` step only there, as this sentence.
 REVIEW_CHECK_LINE = ("Check that it does what its spec asks, is correct, keeps the charter's restrictions, and "
@@ -3889,6 +3890,17 @@ class Daemon:
                      f"the chain's last hop gets the one review.")
         review = self._auto_review(dict(task, **upd), summary) \
             if new == "done" and task["kind"] == "code" and not split else None
+        # A fix of a failed review that adds no commit to the head that review saw leaves its re-review
+        # nothing new to check: the re-review is blocked, never run on the same head, and the coordinator
+        # decides.
+        stale = self._fix_without_commits(dict(task, **upd)) \
+            if new in ("done", "review") and task["kind"] == "code" else []
+        for r in stale:
+            why = (f"fix #{task['id']} ended with no new commits on {task['branch']} after the head "
+                   f"{r['base']} its review saw: nothing new to re-review")
+            db.update_task(r["id"], status="blocked", blocked_reason=why)
+            text += f"\nRe-review #{r['id']} blocked: {why}. Requeue a fix, or cancel the re-review."
+            log(self.p, f"task {task['id']}: re-review {r['id']} blocked, the fix added no commits")
         if review:
             known = None if review[1] else db.task(review[0])
             text += f"\nReview #{review[0]} " + ("queued by the daemon." if review[1] else
@@ -3956,7 +3968,7 @@ class Daemon:
         elif split:
             text += (f"\nNo continue hop finishes its split head: add one with continues #{task['id']} (it builds "
                      f"on this branch), or a review of it if the work is complete.")
-        routine = (review is not None and plain) or fix is not None or hop is not None
+        routine = ((review is not None and plain) or fix is not None or hop is not None) and not stale
         # The summary takes what the digest's cap leaves after the header, push note and daemon lines.
         room = min(1200, coord.EVENT_CHARS - len(head) - len(push_note) - len(text))
         text = f"{head}{_cut(summary, max(200, room), where)}{push_note}{text}"
@@ -10145,7 +10157,8 @@ class Daemon:
                                   f"The first review's spec (#{first['id']}):\n{first_spec}"]),
                               kind="review", tier=rtier, priority=review["priority"], origin="daemon",
                               budget_usd=float(cfg["budget"]["task_default_usd"].get(rtier, 8.0)),
-                              depends_on=[fid], labels=[f"auto_review:{fid}", f"continues:{review['id']}"]
+                              depends_on=[fid], labels=[f"auto_review:{fid}", f"continues:{review['id']}",
+                                                        f"{FIX_BASE_LABEL}{head}"]
                               + ([push.REVIEW_ONLY_LABEL] if only else []) + ([push.LAND_LABEL] if lands else [])
                               + ([f"pr_branch:{onto}"] if publish and onto else []),
                               **(pin_of(review) or pin_of(code)))
@@ -10180,6 +10193,27 @@ class Daemon:
                        if hop else f"queued fix #{fid}") + f" and re-review #{rid}"
                     + (f"; moved {moved} onto it" if moved else ""))
         return fid, rid, moved
+
+    def _fix_without_commits(self, task: dict) -> list[dict]:
+        """The queued re-reviews waiting on code task `task`, a fix of a failed review (review_fix:),
+        whose branch adds no commit to the head their failed review saw (FIX_BASE_LABEL), each with
+        that head as `base`. Empty when it added commits or that cannot be read."""
+        if '"review_fix:' not in (task.get("labels") or "") or not task.get("branch"):
+            return []
+        out = []
+        for r in self.p.db.q("SELECT * FROM tasks WHERE kind='review' AND status='queued' AND labels LIKE ?",
+                             (f'%"{FIX_BASE_LABEL}%',)):
+            base = next((lb[len(FIX_BASE_LABEL):] for lb in push._labels(r) if lb.startswith(FIX_BASE_LABEL)), "")
+            if task["id"] not in dependency_ids(r) or not base:
+                continue
+            try:
+                new = worktree._git(self.p.root, "rev-list", "--count", f"{base}..{task['branch']}", check=False)
+            except Exception as e:
+                log(self.p, f"task {task['id']}: its commits since {base} were not read: {e}")
+                continue
+            if new == "0":
+                out.append(dict(r, base=base))
+        return out
 
     def _open_hop(self, code: dict) -> dict | None:
         """The open code task, oldest first, that continues code task `code`'s branch (`continues:`, directly
