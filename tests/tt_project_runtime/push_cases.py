@@ -11369,3 +11369,105 @@ def test_a_failed_review_at_the_review_area_cap_gets_no_fix_or_re_review_and_one
     assert not p.db.q("SELECT id FROM tasks WHERE labels LIKE ?", (f'%"continues:{rev_b["id"]}"%',))
     area = p.db.q("SELECT * FROM events WHERE task=? AND kind=?", (rev_b["id"], reviewcap.REVIEW_AREA_EVENT))
     assert len(area) == 1 and reviewcap.TRIGGER in failed["text"]
+
+
+def _ttp_task(p, *args):
+    """`ttp task <p> <args>`: its exit code (0 when it returned)."""
+    from ttp import cli
+    try:
+        cli.main(["task", p.name, *args])
+    except SystemExit as e:
+        return e.code
+    return 0
+
+
+def test_abandon_refuses_a_landed_a_not_done_or_another_kind_of_task_and_needs_a_reason(env, monkeypatch, capsys):
+    """`ttp task abandon` takes only a done code or harness task whose work has not landed, with a
+    reason; it records why and when, keeps the branch, and `task show` prints it."""
+    from ttp import landed
+    p, repo, other, landed_tid, path, branch, head = _landed_setup(env, monkeypatch)
+    assert landed.check(p, repo, tid=landed_tid, fetch=False)[0] == 0
+    running, rpath, _ = _code_task(p, "still running", status="running")
+    review = p.db.add_task("Review #1", "r", kind="review", status="done")
+    tid, tpath, tbranch = _code_task(p, "dropped approach")
+    _commit(tpath, "dropped.txt", "dropped\n")
+    for args, words in (([str(landed_tid), "dropped"], "has landed"), ([str(running), "dropped"], "is running, not done"),
+                        ([str(review), "dropped"], "is a review task"), ([str(tid), "  "], "needs a reason"),
+                        (["x", "dropped"], "needs a task id")):
+        capsys.readouterr()
+        assert _ttp_task(p, "abandon", *args) not in (0, None), args
+        assert words in capsys.readouterr().err, args
+    assert p.db.q("SELECT * FROM task_abandoned") == []
+    assert _ttp_task(p, "abandon", str(tid), "approach dropped; a stricter design landed instead") == 0
+    assert f"task #{tid}: abandoned (approach dropped; a stricter design landed instead); its branch {tbranch} is kept" \
+        in capsys.readouterr().out
+    assert landed.abandoned(p.db, tid)[0] == "approach dropped; a stricter design landed instead"
+    assert _git_out(repo, "rev-parse", "--verify", f"refs/heads/{tbranch}")
+    assert _ttp_task(p, "abandon", str(tid), "again") not in (0, None)
+    assert "already abandoned" in capsys.readouterr().err
+    assert _ttp_task(p, "show", str(tid)) == 0
+    assert "abandoned " in capsys.readouterr().out
+    assert _ttp_task(p, "show", str(tid), "--json") == 0
+    assert json.loads(capsys.readouterr().out)["abandoned"]["why"].startswith("approach dropped")
+
+
+def test_an_abandoned_task_leaves_the_local_only_check_and_its_status_line(env, capsys):
+    p = make(env)
+    from ttp import daemon as dm
+    from ttp.cli import status_text
+    from ttp.web import health
+    remote = env["tmp"] / "remote.git"
+    subprocess.run(["git", "clone", "-q", "--bare", str(env["repo"]), str(remote)], check=True)
+    subprocess.run(["git", "-C", str(env["repo"]), "remote", "add", "origin", str(remote)], check=True)
+    tid, path, branch = _code_task(p, "dropped work")
+    _commit_file(path, "a")
+    d = _local_only_daemon(p)
+    _check_local_only(d)
+    assert [e["task"] for e in _local_only_events(p)] == [tid]
+    assert "1 done task with work only on this machine" in status_text(p)
+    assert _ttp_task(p, "abandon", str(tid), "approach dropped") == 0
+    assert "only on this machine" not in status_text(p), "the line drops it at once, before the next check"
+    assert not health(p, p.db)["local_only"]
+    d._local_only_due = 0
+    _check_local_only(d)
+    assert p.db.kv(dm.KV_LOCAL_ONLY) is None and len(_local_only_events(p)) == 1
+
+
+def test_the_push_audit_leaves_out_an_abandoned_task(env, monkeypatch, tmp_path):
+    from ttp import pushclaim
+    p, d, tid, head = _no_remote_claim_setup(env, monkeypatch, tmp_path, False)
+    p.db.update_task(tid, status="done", result=json.dumps({"status": "done", "summary": "parser fixed"}))
+    assert [g["task"] for g in pushclaim.audit(p)["gaps"]] == [tid]
+    assert _ttp_task(p, "abandon", str(tid), "approach dropped") == 0
+    a = pushclaim.audit(p)
+    assert a["gaps"] == [] and a["tasks"] == 0, a
+
+
+def test_a_landed_wait_on_an_abandoned_task_is_raised_as_a_broken_probe_naming_why(env, monkeypatch):
+    """`landed:#<id>` on an abandoned task never passes: the probe says it is abandoned and why, the
+    waiter gets one deferral_probe_broken event naming that, and the dead-wait check raises nothing."""
+    from ttp import coordinator as coord
+    from ttp import daemon as dmod
+    from ttp import deadwait, landed
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    monkeypatch.setattr(dmod, "PROBE_EVERY_S", 0)
+    tid, path, branch = _code_task(p, "feature")
+    _commit(path, "feature.txt", "feature\n")
+    assert coord.apply(p, [{"type": "task_add", "title": "after it", "spec": "s",
+                            "start_when": f"landed:#{tid}"}]) == []
+    after = _added(p, "after it")
+    cfg = {"waiting": {"landed_wait_dead_s": 0}}
+    deadwait.check(p.db, cfg, {tid: [p.db.task(after)]}, time.time())
+    dead = p.db.q("SELECT id FROM events WHERE kind=? AND status='queued'", (deadwait.DEAD_EVENT,))
+    assert len(dead) == 1, "before: nothing open can land it"
+    assert _ttp_task(p, "abandon", str(tid), "approach dropped for a stricter design") == 0
+    rc, words = landed.check(p, repo, tid=tid)
+    assert rc == landed.CANNOT and "abandoned" in words and "approach dropped for a stricter design" in words
+    d = dmod.Daemon(p.base)
+    _settle_deferred(d, after)
+    _settle_deferred(d, after)
+    assert not _ready(p, after)
+    broken = _events(p, after, "deferral_probe_broken")
+    assert len(broken) == 1 and "approach dropped for a stricter design" in broken[0]["text"], broken
+    deadwait.check(p.db, cfg, {tid: [p.db.task(after)]}, time.time())
+    assert not p.db.q("SELECT id FROM events WHERE kind=? AND status='queued'", (deadwait.DEAD_EVENT,))

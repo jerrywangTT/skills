@@ -549,10 +549,11 @@ def audit(p, days: float = AUDIT_DAYS, now: float | None = None, max_refs: int =
     push, every one confirmed]}. Read-only, apart from fetching the
     remote's tracking refs. Past `max_refs` distinct refs the rest count as unknown. `cache`: the
     remote's answers so far (with a Budget, an audit that ran out of time resumes from them)."""
-    from .db import load_result
+    from .db import NOT_ABANDONED_SQL, load_result
     now = time.time() if now is None else now
     db = p.db
-    rows = db.q("SELECT id, title, result, branch FROM tasks WHERE status='done' AND updated>=? ORDER BY id",
+    rows = db.q(f"SELECT id, title, result, branch FROM tasks WHERE status='done' AND updated>=? AND {NOT_ABANDONED_SQL} "
+                "ORDER BY id",
                 (now - days * 86400,))
     counts = {CONFIRMED: 0, MISSING: 0, UNKNOWN: 0}
     gaps: list[dict] = []

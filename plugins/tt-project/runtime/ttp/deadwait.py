@@ -96,7 +96,7 @@ def check(db, cfg: dict, held_by: dict[int, list[dict]], now: float) -> None:
     new: dict = {}
     for x, tasks in sorted(held_by.items()):
         held = {t["id"] for t in tasks}
-        if path(db, x, held):
+        if path(db, x, held) or landed.abandoned(db, x):   # abandoned: its probe is raised as broken
             continue
         prev = state.get(str(x)) or {}
         got = {"since": prev.get("since") or now, "event": prev.get("event")}

@@ -29,6 +29,8 @@ def reason(db, when: str, rc, out: str = "") -> str:
     the producer's state, else the probe's last output line, else what its exit code means."""
     refs = landed.task_refs(when)
     if refs and refs[0].isdigit() and (t := db.task(int(refs[0]))):
+        if gone := landed.abandoned(db, t["id"]):
+            return f"producer #{t['id']} abandoned ({gone[0][:80]})"
         return f"producer #{t['id']} {_STATES.get(t['status'], t['status'])}"
     last = next((ln.strip() for ln in reversed((out or "").splitlines()) if ln.strip()), "")
     if last:

@@ -618,6 +618,37 @@ def superseded(db, tids) -> dict[int, list[tuple[str, str]]]:
     return out
 
 
+def abandoned(db, tid: int) -> tuple[str, float] | None:
+    """(why, when) of `ttp task abandon` for task `tid`, None when it was not abandoned."""
+    r = db.one("SELECT why, ts FROM task_abandoned WHERE task=?", (int(tid),))
+    return (r["why"], r["ts"]) if r else None
+
+
+def abandon(p, tid: int, why: str) -> str:
+    """Record that done code or harness task `tid`'s work will never land (its approach was dropped),
+    with `why` and the time; its branch is kept. The local-only check and its status line, the push
+    audit and the landed-wait checks then leave it out, and `landed:#<id>` answers CANNOT naming `why`,
+    so a task waiting on it is raised as a broken probe. ValueError for no reason, a task that is not
+    done, another kind, one already abandoned, or one whose landing is recorded or on the push branch."""
+    why, task = " ".join((why or "").split()), p.db.task(tid)
+    if not task:
+        raise ValueError(f"no task #{tid}")
+    if not why:
+        raise ValueError(f'abandon needs a reason: ttp task {p.name} abandon {tid} "<why>"')
+    if task.get("kind") not in ("code", "harness"):
+        raise ValueError(f"not abandoned: task #{tid} is a {task.get('kind')} task, not code or harness")
+    if task.get("status") != "done":
+        raise ValueError(f"not abandoned: task #{tid} is {task.get('status')}, not done (cancel an open task)")
+    if prev := abandoned(p.db, tid):
+        raise ValueError(f"task #{tid} is already abandoned ({prev[0]})")
+    shas, src = recorded(p.db, tid)
+    rc, words = (0, f"{src}, {shas[0][:10]}") if shas else check(p, p.root, tid=tid, fetch=False)
+    if rc == 0:
+        raise ValueError(f"not abandoned: task #{tid} has landed ({words})")
+    p.db.x("INSERT INTO task_abandoned(task, why, ts) VALUES(?,?,?)", (tid, why, time.time()))
+    return f"task #{tid}: abandoned ({why}); its branch {task.get('branch') or '(none)'} is kept"
+
+
 def _start(repo: Path, branch: str) -> str:
     """The commit `branch` was created at (its oldest reflog entry), "" when git kept no reflog."""
     log = _git(repo, "reflog", "show", "--format=%H", f"refs/heads/{branch}").stdout.split()
@@ -636,6 +667,8 @@ def check(p, repo: Path, sha: str | None = None, tid: int | None = None, onto: s
     if tid is not None:
         if not p.db.task(tid):   # it would never land: a probe on it must say so, not wait forever
             return CANNOT, f"no task #{tid} in this project"
+        if gone := abandoned(p.db, tid):
+            return CANNOT, f"#{tid} was abandoned, its work will never land ({gone[0]}): re-point what waits on it"
         shas, src = task_shas(p, tid)
         if not shas:
             return NOT_YET, src

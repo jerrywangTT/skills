@@ -23,7 +23,7 @@ from . import startgate, sweepskip, timefmt, trend, upstream
 from .daemon import (AUTH_PROBE_S, HEARTBEAT_STALE_S, KV_LOCAL_ONLY, KV_WORKTREES_DIRTY, LOGGED_OUT_NOTE, NET_HELD_NOTE,
                      SLACK_ERROR_KEY, WAIT_KEYS, heartbeat, idle_wake)
 from .alerts import cleared  # noqa: F401  (readers import it from here)
-from .db import (DB, SEVERITY_RANK, chat_floor, continues_id, deferral, dependency_ids, dump_result, host_line,
+from .db import (DB, NOT_ABANDONED_SQL, SEVERITY_RANK, chat_floor, continues_id, deferral, dependency_ids, dump_result, host_line,
                  load_result, task_outcome)
 from .project import Project, durable_write
 from .providers import get_provider
@@ -516,8 +516,8 @@ def local_only_line(db: DB) -> str:
     flagged = db.kv(KV_LOCAL_ONLY) or {}
     if not flagged:
         return ""
-    done = {str(r["id"]) for r in db.q("SELECT id FROM tasks WHERE status='done' AND id IN (%s)"
-                                       % ",".join("?" * len(flagged)), [int(k) for k in flagged])}
+    done = {str(r["id"]) for r in db.q(f"SELECT id FROM tasks WHERE status='done' AND {NOT_ABANDONED_SQL} AND id IN "
+                                       f"({','.join('?' * len(flagged))})", [int(k) for k in flagged])}
     items = [(k, flagged[k]) for k in sorted(flagged, key=int) if k in done]
     if not items:
         return ""

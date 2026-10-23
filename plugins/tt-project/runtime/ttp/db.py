@@ -130,6 +130,9 @@ CREATE INDEX IF NOT EXISTS task_landings_task ON task_landings(task);
 CREATE TABLE IF NOT EXISTS task_superseded (
   task INTEGER NOT NULL, head TEXT NOT NULL, sha TEXT NOT NULL, ts REAL NOT NULL, PRIMARY KEY(task, head, sha));
 
+-- A done code or harness task whose work will never land, with why and when (`ttp task abandon`, landed.py).
+CREATE TABLE IF NOT EXISTS task_abandoned (task INTEGER PRIMARY KEY, why TEXT NOT NULL, ts REAL NOT NULL);
+
 -- One row per Jev call: its use, decision, cost, estimated cost avoided, whether it changed the rules'
 -- decision (NULL: not known) and later outcome (jevuse.py).
 CREATE TABLE IF NOT EXISTS jev_calls (
@@ -169,6 +172,7 @@ CREATE INDEX IF NOT EXISTS review_stats_ts ON review_stats(ts);
 """
 
 TERMINAL_TASK_STATES = ("done", "failed", "cancelled")
+NOT_ABANDONED_SQL = "id NOT IN (SELECT task FROM task_abandoned)"   # landed.abandon: left out of landing checks
 WORKSPACE_TRIES_KEY = "workspace_tries"   # kv: task id -> failed workspace attempts in a row (Daemon._workspace_failed)
 # A review that asked for changes is a review that worked. It is stored 'failed', so the change it
 # reviewed stays gated (its fix and re-review follow), and its hand-off status says changes_needed:

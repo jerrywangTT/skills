@@ -191,6 +191,8 @@ Each field's rules are in the section named; the table only lists them.
   that would do.
 - A task that re-lands another task's work as a new commit records
   `ttp task <project> superseded <id> <sha>`; say so in its spec.
+- When a re-plan replaces a lineage, a task runs `ttp task <project> abandon <id> "<why>"` on its
+  done tasks whose work never landed.
 - A task blocked on a cancelled or failed dependency stays blocked until you re-point it with
   `task_update` `depends_on` (or `[]`), or cancel it.
 - A question the digest answers: `reply` directly. Otherwise a `question` task with `reply_chat`

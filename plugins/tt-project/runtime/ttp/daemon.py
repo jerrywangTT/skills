@@ -125,7 +125,7 @@ from . import screen as scr
 from . import shared
 from . import shorttmp
 from . import worktree
-from .db import (CHANGES_NEEDED, HARNESS_MERGED_KEY, PAUSE_BOOT_KEY, SEVERITY_RANK, TERMINAL_TASK_STATES, WORKSPACE_TRIES_KEY, BranchIndex, continues_id, deferral,
+from .db import (CHANGES_NEEDED, HARNESS_MERGED_KEY, NOT_ABANDONED_SQL, PAUSE_BOOT_KEY, SEVERITY_RANK, TERMINAL_TASK_STATES, WORKSPACE_TRIES_KEY, BranchIndex, continues_id, deferral,
                  dependency_ids, pin_of, dump_result, load_result, review_subject, reviewed_ids, task_outcome, unplanned_abrupt,
                  without_deferral)
 from .project import rebase_replace
@@ -6441,7 +6441,7 @@ class Daemon:
             db.set_kv(KV_LOCAL_ONLY_FROM, since)
         told = db.kv(KV_LOCAL_ONLY) or {}
         tasks = db.q(f"SELECT id, title, branch, updated FROM tasks WHERE {worktree.OWN_WORKTREE_SQL} AND status='done' "
-                     "AND branch IS NOT NULL AND branch!='' AND updated>=?",
+                     f"AND branch IS NOT NULL AND branch!='' AND updated>=? AND {NOT_ABANDONED_SQL}",
                      (max(since, now - LOCAL_ONLY_DAYS * 86400),))
         reviews = []
         if tasks:
@@ -7455,7 +7455,8 @@ class Daemon:
                                  f"a detached job its start_when waits on failed or left no exit code (exit {rc} of "
                                  f"`ttp detach --check`, not a broken probe): {d.get('when', '')[:300]}")
         elif rc != 0:
-            why = rc if isinstance(rc, str) else f"exit {rc}"
+            said = (out or "").strip().splitlines()   # its last line says why (landed: an abandoned producer)
+            why = (rc if isinstance(rc, str) else f"exit {rc}") + (f": {said[-1][:300]}" if said else "")
             self._deferral_event(task, d.get("since") or task["created"], "deferral_probe_broken",
                                  f"its start_when probe is broken ({why}; only 0 = start, 1 or 75 = not yet and "
                                  f"ssh's own 255 = host unreachable are valid): {d.get('when', '')[:300]}")
