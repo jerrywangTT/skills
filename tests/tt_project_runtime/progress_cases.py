@@ -796,3 +796,43 @@ def test_check_progress_passes_only_this_projects_machine_changes(env, monkeypat
     monkeypatch.setattr(machine_ledger, "changes", broken)
     d.check_progress()
     assert got["changes"] is None
+
+
+_HOLDS = ["test -e state/user-example || exit 1",                                  # (a) a user pause
+          "test -e state/user-example || test -e state/other-ok || exit 1",        # (b) or another marker file
+          "[ -f state/user-example ] && test -e state/user-other"]                 # user markers only
+_LIVE = ["test -e state/user-example && ssh somehost true || exit 1",              # (c) and a live check
+         "test -e state/user-example || ssh somehost test -e ready || exit 1",     # or a live check
+         "test -e state/user-example && test -e state/other-ok || exit 1",         # and a marker the project writes
+         "test -e state/out-ready || exit 1"]                                      # a plain live probe
+
+
+@pytest.mark.parametrize("probe", _HOLDS + _LIVE)
+def test_a_user_pause_probe_raises_no_probe_stall_and_the_sweep_and_wait_stale_agree(env, probe):
+    """A start_when or retry_when that waits only on user markers (or an `||` of one with other marker
+    files) is a user pause: the progress check raises no probe stall for it, however often it says not
+    yet. The blocker sweep, wait_stale and the progress check classify every probe the same way, through
+    userpause.is_probe; anything else stays a live probe the stall check watches."""
+    from ttp import coordinator as coord, progress, sweep, userpause
+    from ttp.daemon import Daemon
+    p = make(env)
+    d, hold = Daemon(p.base), probe in _HOLDS
+    assert userpause.is_probe(probe, p.config()) == hold
+    now = time.time()
+    tid = p.db.add_task("starts on a marker", "s", kind="work", tier="light", origin="user",
+                        labels=coord.defer_labels(None, probe))
+    for i in range(21):                              # 21 times not yet in an hour and more
+        d._start_verdict(p.db.task(tid), 1, now - 4000 + i * 180)
+    got = progress.check(p.db, p.config(), p.state, now)
+    assert [(e["kind"], e["keys"]) for e in got] == ([] if hold else [("stall", [f"probe:#{tid}"])]), got
+    # The waiting check past its hold cap: a wait_stale event only for a live probe.
+    wid = _due_waiting_task(p, probe, since_ago=7 * 24 * 3600)
+    _settle_probe(d, wid)
+    p.db.update_task(wid, not_before=time.time() - 1)
+    d.probe_waiting()
+    stale = p.db.q("SELECT id FROM events WHERE task=? AND kind='wait_stale'", (wid,))
+    assert bool(stale) != hold, stale
+    # The blocker sweep carries the deferred task as a user pause, or not; its user-pause reader agrees
+    # on the waiting one.
+    kinds = {i["task"]: i["kind"] for i in sweep.items(p.db, now + 30 * 3600, p.config()) if i.get("task")}
+    assert (kinds.get(tid) == "user-pause", bool(userpause.probe_of(p.db.task(wid), p.config()))) == (hold, hold)

@@ -4,9 +4,12 @@
 
 A user pause is a probe that only tests for a marker file the user's word creates (by default one named
 `user-*`, e.g. `test -e state/user-resume-tuning || exit 1`; coordinator.user_pause_marker, a regex
-searched in the tested path, changes it). No model turn can make it pass, and the daemon already wakes
-or requeues the task once it does. The blocker sweep carries such a hold without an outcome and the
-waiting check leaves it out of wait_stale. A time-only deferral (a `start_after` with no `start_when`)
+searched in the tested path, changes it): file tests of user markers joined by `||` or `&&`, or an `||`
+of a user marker with other plain file tests (the user's word still ends it), optionally ending in
+`|| exit 1`. A marker AND-ed or OR-ed with anything else (ssh, a command, a pipe) is a live probe. No
+model turn can make a user pause pass, and the daemon already wakes or requeues the task once it does.
+is_probe is the one classifier: the blocker sweep carries such a hold without an outcome, the waiting
+check leaves it out of wait_stale and the progress check raises no probe stall for it. A time-only deferral (a `start_after` with no `start_when`)
 also ends on its own; the sweep carries it the same way. Both stay listed for the user.
 """
 from __future__ import annotations
@@ -19,7 +22,10 @@ from . import anchors
 from .db import deferral, load_result
 
 DEFAULT_MARKER = r"(?:^|/)user-[\w.-]+$"
-_PROBE = re.compile(r"^\s*(?:test|\[)\s+-[ef]\s+(?P<path>\S+)(?:\s+\])?\s*(?:\|\|\s*exit\s+1\s*)?;?\s*$")
+_PATH = r"(?:[^\s;|&`()<>$]|\$(?=[\w{]))+"   # a plain path: a variable may expand, nothing runs
+_TERM = re.compile(rf"\s*(?:test\s+-[ef]\s+(?P<p1>{_PATH})|\[\s+-[ef]\s+(?P<p2>{_PATH})\s+\])\s*")
+_OP = re.compile(r"(\|\||&&)")
+_TAIL = re.compile(r"\s*\|\|\s*exit\s+1\s*;?\s*$|\s*;?\s*$")
 
 
 def settings(where) -> dict:
@@ -45,9 +51,17 @@ def marker(cfg: dict | None) -> re.Pattern:
 
 
 def is_probe(probe: object, cfg: dict | None = None) -> bool:
-    """Whether `probe` only tests for a user marker file."""
-    m = _PROBE.match(str(probe or ""))
-    return bool(m and marker(cfg).search(m.group("path").strip("'\"")))
+    """Whether `probe` is a user pause: plain file tests only, every one a user marker (any of `||`
+    and `&&` between them), or an `||` chain with at least one user marker, optionally ending in
+    `|| exit 1`."""
+    text = _TAIL.sub("", str(probe or ""), count=1)
+    parts = _OP.split(text)
+    terms = [_TERM.fullmatch(t) for t in parts[0::2]]
+    if not text.strip() or not all(terms):
+        return False
+    rx = marker(cfg)
+    user = [bool(rx.search((m.group("p1") or m.group("p2")).strip("'\""))) for m in terms]
+    return all(user) or (any(user) and set(parts[1::2]) <= {"||"})
 
 
 def probe_of(task: dict, cfg: dict | None = None) -> str | None:

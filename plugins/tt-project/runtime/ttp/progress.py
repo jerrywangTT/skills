@@ -49,7 +49,8 @@ Repeat detectors, each one keyed `stall` event with the count, first and last se
 
 - probe: a waiting task's retry_when or a deferred task's start_when still says not yet after
   `probe_n` (10) verdicts and `probe_h` (1) hours (waits on the task's own job, a push, CI, another
-  task landing or a time are expected to be long and left out). It is flagged "waits on what it
+  task landing or a time are expected to be long and left out, and so is a user pause,
+  userpause.is_probe: only the user's word ends it). It is flagged "waits on what it
   fixes" when the probe waits on a resource that is down or paused and the task is that resource's
   fix, or a task holding the resource waits on this one;
 - runs: a task's (or one schedule's) worker runs failing `fail_n` (3) times in a row the same way;
@@ -77,6 +78,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
+from . import userpause
 from .db import DB, TERMINAL_TASK_STATES, deferral, load_result
 from .project import durable_append
 
@@ -486,7 +488,8 @@ def _self_ref(db: DB, t: dict, probe: str, rc: Any, paused: dict, trouble: dict)
     return ""
 
 
-def probe_stalls(db: DB, s: dict, st: dict, now: float, current_probe: Callable[[dict], str | None]) -> list[dict]:
+def probe_stalls(db: DB, s: dict, st: dict, now: float, current_probe: Callable[[dict], str | None],
+                 cfg: dict | None = None) -> list[dict]:
     out = []
     paused, trouble = db.paused_resources(), db.kv("resource_trouble") or {}
     for k, rec in list(st["probes"].items()):
@@ -496,6 +499,8 @@ def probe_stalls(db: DB, s: dict, st: dict, now: float, current_probe: Callable[
             continue
         if t["status"] == "waiting" and load_result(t["result"]).get("wait_kind") == "self":
             continue   # its own job or window: the wait checks cover a job that hangs
+        if userpause.is_probe(rec["probe"], cfg):
+            continue   # a user pause: only the user's word ends it, so saying not yet is no stall
         if not s["probe_n"] or OWN_WAIT_RE.search(rec["probe"]) or int(rec["n"]) < s["probe_n"] \
                 or now - float(rec["first"]) < s["probe_h"] * 3600:
             continue
@@ -641,7 +646,7 @@ def check(db: DB, cfg: dict | None, state_dir: Path | str | None, now: float | N
     st = load(db)
     recs = entries(Path(state_dir)) if state_dir else []
     _take_results(st, recs, now)
-    conds = (no_progress(db, cfg, s, st, now, streaks(recs)) + probe_stalls(db, s, st, now, current_probe)
+    conds = (no_progress(db, cfg, s, st, now, streaks(recs)) + probe_stalls(db, s, st, now, current_probe, cfg)
              + run_stalls(db, s, now) + schedule_stalls(db, s, st, now))
     kinds, gone = CHECK_KINDS, set()
     if changes is None:
