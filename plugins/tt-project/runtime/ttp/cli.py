@@ -7797,7 +7797,7 @@ def main(argv: list[str] | None = None) -> None:
                                     "set-when re-points a task not yet started; superseded records a done task's "
                                     "work as landed under another commit (also a code task in review whose work "
                                     "landed, or a harness task in review whose commit is merged into the harness: "
-                                    "it is then closed as done); abandon records that a done code or harness task's "
+                                    "it is then closed as done); abandon records that a done code task's "
                                     "work will never land (its branch is kept), so local-only, push-audit and landed "
                                     "checks leave it out")
     s.add_argument("name", help="the project")

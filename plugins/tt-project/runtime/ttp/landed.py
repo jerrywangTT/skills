@@ -28,7 +28,7 @@ import time
 from pathlib import Path
 
 from . import push
-from .db import review_subject
+from .db import TERMINAL_TASK_STATES, dependency_ids, review_subject
 
 LANDED_PROBE = re.compile(r"\s*landed:\s*#?(\d+)\s*")
 ANCESTOR_PROBE = re.compile(r"\s*git\s+merge-base\s+--is-ancestor\s+([0-9a-f]{7,64})\s+([\w./@{}^~-]+)\s*")
@@ -369,6 +369,9 @@ def record_superseded(p, tid: int, sha: str, ref: str | None = None, repo: str |
     if status == "review":
         full = p.db.one("SELECT sha FROM task_superseded WHERE task=? ORDER BY ts DESC LIMIT 1", (tid,))["sha"]
         words += _close_review(p, task, full)
+    if abandoned(p.db, tid):   # its work landed after all
+        p.db.x("DELETE FROM task_abandoned WHERE task=?", (tid,))
+        words += "; its abandon record is cleared"
     return words
 
 
@@ -625,26 +628,45 @@ def abandoned(db, tid: int) -> tuple[str, float] | None:
 
 
 def abandon(p, tid: int, why: str) -> str:
-    """Record that done code or harness task `tid`'s work will never land (its approach was dropped),
-    with `why` and the time; its branch is kept. The local-only check and its status line, the push
-    audit and the landed-wait checks then leave it out, and `landed:#<id>` answers CANNOT naming `why`,
-    so a task waiting on it is raised as a broken probe. ValueError for no reason, a task that is not
-    done, another kind, one already abandoned, or one whose landing is recorded or on the push branch."""
+    """Record that done code task `tid`'s work will never land (its approach was dropped), with `why`
+    and the time; its branch is kept. The local-only check and its status line, the push audit and the
+    landed-wait checks then leave it out, and `landed:#<id>` answers CANNOT naming `why`, so a task
+    waiting on it is raised as a broken probe. ValueError for no reason, a task that is not done,
+    another kind (a harness task's work lands by merging into the harness, not on the push branch), one
+    already abandoned, one whose landing is recorded or on the push branch, and one whose work can still
+    land: an open task that carries it on (its review, a fix or continuation: carriers, or an open review
+    that depends on it or names its branch, as the daemon's auto-review finds one) or a push queue
+    entry of one of them or its branch still waiting to push."""
     why, task = " ".join((why or "").split()), p.db.task(tid)
     if not task:
         raise ValueError(f"no task #{tid}")
     if not why:
         raise ValueError(f'abandon needs a reason: ttp task {p.name} abandon {tid} "<why>"')
-    if task.get("kind") not in ("code", "harness"):
-        raise ValueError(f"not abandoned: task #{tid} is a {task.get('kind')} task, not code or harness")
+    if task.get("kind") != "code":
+        raise ValueError(f"not abandoned: task #{tid} is a {task.get('kind')} task, not code")
     if task.get("status") != "done":
         raise ValueError(f"not abandoned: task #{tid} is {task.get('status')}, not done (cancel an open task)")
     if prev := abandoned(p.db, tid):
         raise ValueError(f"task #{tid} is already abandoned ({prev[0]})")
-    shas, src = recorded(p.db, tid)
-    rc, words = (0, f"{src}, {shas[0][:10]}") if shas else check(p, p.root, tid=tid, fetch=False)
+    carry = carriers(p.db, tid)
+    shas, src = recorded(p.db, tid, carry)
+    rc, words = (0, f"{src}, {shas[0][:10]}") if shas else check(p, p.root, tid=tid)
     if rc == 0:
         raise ValueError(f"not abandoned: task #{tid} has landed ({words})")
+    from .worktree import named_refs
+    ids, branches = sorted(carry), sorted({v[0] for v in carry.values() if v[0]})
+    marks, branch = ",".join("?" * len(ids)), task.get("branch")
+    for q in p.db.q(f"SELECT id, task, status FROM push_queue WHERE status IN ('approved','held','batched') AND "
+                    f"(task IN ({marks}) OR branch IN ({','.join('?' * len(branches)) or 'NULL'})) ORDER BY id",
+                    (*ids, *branches)):
+        raise ValueError(f"not abandoned: task #{tid} is queued to push (entry #{q['id']} of task #{q['task']}, "
+                         f"{q['status']}): cancel that first")
+    for t in p.db.q(f"SELECT * FROM tasks WHERE id!=? AND status NOT IN ({','.join('?' * len(TERMINAL_TASK_STATES))}) "
+                    f"AND (id IN ({marks}) OR kind='review') ORDER BY id", (tid, *TERMINAL_TASK_STATES, *ids)):
+        # an open review that covers it as the daemon's auto-review reads it: by dependency or a named branch
+        if t["id"] in carry or tid in dependency_ids(t) or (branch and branch in named_refs(p, t)):
+            raise ValueError(f"not abandoned: task #{tid}'s work can still land: {t['kind']} task #{t['id']} "
+                             f"that carries it is {t['status']}: cancel that first")
     p.db.x("INSERT INTO task_abandoned(task, why, ts) VALUES(?,?,?)", (tid, why, time.time()))
     return f"task #{tid}: abandoned ({why}); its branch {task.get('branch') or '(none)'} is kept"
 
@@ -667,9 +689,12 @@ def check(p, repo: Path, sha: str | None = None, tid: int | None = None, onto: s
     if tid is not None:
         if not p.db.task(tid):   # it would never land: a probe on it must say so, not wait forever
             return CANNOT, f"no task #{tid} in this project"
-        if gone := abandoned(p.db, tid):
-            return CANNOT, f"#{tid} was abandoned, its work will never land ({gone[0]}): re-point what waits on it"
-        shas, src = task_shas(p, tid)
+        if gone := abandoned(p.db, tid):   # a landing recorded since (a later carrier pushed it) still wins
+            shas, src = recorded(p.db, tid)
+            if not shas:
+                return CANNOT, f"#{tid} was abandoned, its work will never land ({gone[0]}): re-point what waits on it"
+        else:
+            shas, src = task_shas(p, tid)
         if not shas:
             return NOT_YET, src
         what = f"#{tid} ({src})"

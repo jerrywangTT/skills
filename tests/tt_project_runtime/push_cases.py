@@ -11382,17 +11382,19 @@ def _ttp_task(p, *args):
 
 
 def test_abandon_refuses_a_landed_a_not_done_or_another_kind_of_task_and_needs_a_reason(env, monkeypatch, capsys):
-    """`ttp task abandon` takes only a done code or harness task whose work has not landed, with a
+    """`ttp task abandon` takes only a done code task whose work has not landed, with a
     reason; it records why and when, keeps the branch, and `task show` prints it."""
     from ttp import landed
     p, repo, other, landed_tid, path, branch, head = _landed_setup(env, monkeypatch)
     assert landed.check(p, repo, tid=landed_tid, fetch=False)[0] == 0
     running, rpath, _ = _code_task(p, "still running", status="running")
     review = p.db.add_task("Review #1", "r", kind="review", status="done")
+    harness = p.db.add_task("harness change", "h", kind="harness", status="done")   # review #3624 finding 2
     tid, tpath, tbranch = _code_task(p, "dropped approach")
     _commit(tpath, "dropped.txt", "dropped\n")
     for args, words in (([str(landed_tid), "dropped"], "has landed"), ([str(running), "dropped"], "is running, not done"),
-                        ([str(review), "dropped"], "is a review task"), ([str(tid), "  "], "needs a reason"),
+                        ([str(review), "dropped"], "is a review task"),
+                        ([str(harness), "dropped"], "is a harness task, not code"), ([str(tid), "  "], "needs a reason"),
                         (["x", "dropped"], "needs a task id")):
         capsys.readouterr()
         assert _ttp_task(p, "abandon", *args) not in (0, None), args
@@ -11471,3 +11473,69 @@ def test_a_landed_wait_on_an_abandoned_task_is_raised_as_a_broken_probe_naming_w
     assert len(broken) == 1 and "approach dropped for a stricter design" in broken[0]["text"], broken
     deadwait.check(p.db, cfg, {tid: [p.db.task(after)]}, time.time())
     assert not p.db.q("SELECT id FROM events WHERE kind=? AND status='queued'", (deadwait.DEAD_EVENT,))
+
+
+def test_abandon_refuses_a_task_whose_review_is_open_or_whose_work_waits_in_the_push_queue(env, monkeypatch, capsys):
+    """Review #3624 finding 1: a done code task whose daemon-queued review is still open, or whose
+    branch a review approved into the push queue, can still land: abandon refuses it, naming the review
+    or the queue entry, and records nothing until that is cancelled."""
+    from ttp import landed
+    from ttp.daemon import Daemon
+    s = _pq(env, monkeypatch)
+    monkeypatch.setattr(Daemon, "_precheck", lambda self, task, head: None)
+    d = Daemon(s.p.base)
+    assert d._auto_review(s.p.db.task(s.code), "made the change") == (s.review, False), \
+        "the coordinator's review that depends on it covers it"
+    capsys.readouterr()
+    assert _ttp_task(s.p, "abandon", str(s.code), "approach dropped") not in (0, None)
+    assert f"review task #{s.review} that carries it is queued: cancel that first" in capsys.readouterr().err
+    assert _ttp_task(s.p, "cancel", str(s.review)) == 0
+    rid, added = d._auto_review(s.p.db.task(s.code), "made the change")
+    assert added and s.p.db.task(rid)["title"].startswith(f"Review #{s.code}")
+    capsys.readouterr()
+    assert _ttp_task(s.p, "abandon", str(s.code), "approach dropped") not in (0, None)
+    assert f"review task #{rid} that carries it is queued: cancel that first" in capsys.readouterr().err
+    _pq_hand_off(env, s, task=rid)
+    [q] = s.p.db.q("SELECT id, status FROM push_queue")
+    assert q["status"] == "approved"
+    capsys.readouterr()
+    assert _ttp_task(s.p, "abandon", str(s.code), "approach dropped") not in (0, None)
+    assert f"is queued to push (entry #{q['id']} of task #{rid}, approved): cancel that first" \
+        in capsys.readouterr().err
+    assert s.p.db.q("SELECT * FROM task_abandoned") == [] and landed.abandoned(s.p.db, s.code) is None
+
+
+def test_a_landing_recorded_after_abandon_wins_over_it(env, monkeypatch, capsys):
+    """Review #3624 finding 1, the other way round: work abandoned and then landed after all (pushed by
+    the queue for a review the coordinator queued later, or recorded `superseded`) reads as landed,
+    never CANNOT, and `superseded` clears the abandon record."""
+    from ttp import landed
+    s = _pq(env, monkeypatch)
+    assert _ttp_task(s.p, "cancel", str(s.review)) == 0
+    assert _ttp_task(s.p, "abandon", str(s.code), "approach dropped") == 0
+    assert landed.check(s.p, s.repo, tid=s.code)[0] == landed.CANNOT
+    later = s.p.db.add_task("review the feature again", f"review {s.branch}", kind="review", tier="standard",
+                            origin="coordinator")
+    _pq_hand_off(env, s, task=later)
+    sha = _git_out(s.origin, "rev-parse", "proj")
+    _pq_pushing(s, sha)
+    _pq_batch(s)
+    _pq_tend(s)
+    assert s.p.db.one("SELECT landed_sha FROM push_queue")["landed_sha"] == sha
+    rc, words = landed.check(s.p, s.repo, tid=s.code)
+    assert rc == 0, words
+    # superseded: the abandoned work lands as a rebased copy and is recorded so.
+    p, repo, other = s.p, s.repo, s.other
+    tid, path, branch = _code_task(p, "dropped, then landed")
+    _commit(path, "late.txt", "late\n")
+    assert _ttp_task(p, "abandon", str(tid), "approach dropped") == 0
+    _git_out(other, "pull", "-q", "origin", "proj")
+    _commit(other, "theirs.txt", "theirs\n")
+    _git_out(other, "fetch", "-q", str(path), branch)
+    _git_out(other, "cherry-pick", "FETCH_HEAD")
+    _git_out(other, "push", "-q", "origin", "HEAD:proj")
+    _git_out(repo, "fetch", "-q", "origin")
+    capsys.readouterr()
+    assert _ttp_task(p, "superseded", str(tid), _git_out(other, "rev-parse", "HEAD")) == 0
+    assert "its abandon record is cleared" in capsys.readouterr().out
+    assert landed.abandoned(p.db, tid) is None and landed.check(p, repo, tid=tid)[0] == 0
