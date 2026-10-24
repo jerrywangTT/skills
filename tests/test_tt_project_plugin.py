@@ -547,11 +547,11 @@ def test_code_workers_try_to_break_their_change_before_the_hand_off():
     """The code-kind prompt carries one compact self-check step aimed at the failure classes reviews
     keep finding; its detail lives in a tt-project-harness reference, and the hand-off names it."""
     code = " ".join((PLUGIN / "template" / "prompts" / "kind-code.md").read_text(encoding="utf-8").split())
-    for part in ("Before the hand-off, try to break it (tt-project-harness `references/self-check.md`)",
+    for part in ("Before the hand-off, try to break it (tt-project-harness self-check.md)",
                  "tick each spec step", "a guard or parser: test 3+ bypasses",
                  "exit codes: an unexpected one, an interrupted run",
                  "no unbounded wait or I/O in a db transaction", "over ~200 lines: say why not split",
-                 "Add a one-line `self_check` to result.json (and `on_pass`): what you ticked and tried"):
+                 "Hand off a `self_check` line (also in `on_pass`): what you ticked and tried"):
         assert part in code, part
     ref = " ".join((SKILLS / "tt-project-harness" / "references" / "self-check.md").read_text(encoding="utf-8").split())
     for part in ("tick each one", "at least three bypass forms", "one exit code the code does not expect",

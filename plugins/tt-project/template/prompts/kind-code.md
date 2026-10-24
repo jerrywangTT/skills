@@ -17,14 +17,14 @@
   left after them, put that final hand-off (`done` or `needs_review`) in `on_pass`: a pass on
   the same head records it without a model run; a failure wakes the task at its tier with the output.
 - While you iterate, run only the tests your change affects (a file, `pytest -k`, `file::test`),
-  never the full suite: each fix changes the tree, wasting a full run per fix. Run `ttp checks`
+  never the full suite: each fix would cost a full run. Run `ttp checks`
   once at the end, committed, before the hand-off. A direct full-suite run is refused.
   Below the project root run pytest as `PYTHONPATH=$PWD python3 -m pytest --rootdir=. --confcutdir=.`.
 - Keep the diff minimal and on-topic. No drive-by rewrites.
-- Before the hand-off, try to break it (tt-project-harness `references/self-check.md`): tick each spec
-  step; a guard or parser: test 3+ bypasses; exit codes: an unexpected one, an interrupted run;
-  no unbounded wait or I/O in a db transaction; over ~200 lines: say why not split. Add a one-line
-  `self_check` to result.json (and `on_pass`): what you ticked and tried.
+- Before the hand-off, try to break it (tt-project-harness self-check.md): tick each spec step;
+  a guard or parser: test 3+ bypasses; exit codes: an unexpected one, an interrupted run; no
+  unbounded wait or I/O in a db transaction; over ~200 lines: say why not split. Hand off a
+  `self_check` line (also in `on_pass`): what you ticked and tried.
 - A change your spec keeps off the push branch (a `no_push:` line, or a plain ban on this change,
   not text about such bans): put `"no_push": "<why>"` in result.json, so its review is review only.
 <!-- ttp:if upstream_ingest -->
@@ -39,8 +39,9 @@
 - Only when the delivery policy line says "code tasks may land on <branch> with ttp push=True"
   AND your spec asks you to land on that branch. Otherwise never push to a shared branch (`ttp push`
   and `git push` refuse the push branch): commit, test and hand off; the review lands it.
-- Land only with `ttp push`, run in your worktree after committing and testing. It refuses a spec
-  with no landing step: if yours has one in other words, add `--land`.
+- Land only with `ttp push`, run in your worktree after committing and testing. NEVER use
+  `git push` to a shared branch. It refuses a spec with no landing step: if yours has one in other
+  words, add `--land`.
 - Run `ttp push --detach`: it pushes in the background, prints `marker:` and `retry_when:`. Hand off
   `waiting` with that `retry_when`, `next_step` "report the push", `retry_after_s` 900 and no `wake_tier`.
   NEVER put plain `ttp push` in the background yourself.
