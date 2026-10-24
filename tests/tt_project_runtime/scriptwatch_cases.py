@@ -64,11 +64,12 @@ def test_scriptwatch_still_fails_a_real_failure_and_a_second_failure(tmp_path):
     assert len(count.read_text().splitlines()) == 2
 
 
-def test_scriptwatch_watches_named_scripts_their_neighbours_and_scripts_on_path(tmp_path):
+def test_scriptwatch_watches_named_scripts_the_neighbours_they_name_and_scripts_on_path(tmp_path):
     from ttp import scriptwatch
     bin_ = tmp_path / "bin"
     bin_.mkdir()
-    for name, text in (("check", "#!/bin/sh\n"), ("helper", "#!/bin/sh\n"), ("lib.sh", "x=1\n"), ("data.txt", "x\n")):
+    check = '#!/bin/sh\n. "$(dirname "$0")/lib.sh"\nhelper --x data.txt\n'
+    for name, text in (("check", check), ("helper", "#!/bin/sh\n"), ("lib.sh", "x=1\n"), ("data.txt", "x\n")):
         (bin_ / name).write_text(text)
         (bin_ / name).chmod(0o755)
     (tmp_path / "test_a.py").write_text("def test_a(): pass\n")
@@ -82,6 +83,52 @@ def test_scriptwatch_watches_named_scripts_their_neighbours_and_scripts_on_path(
     os.replace(tmp, bin_ / "helper")   # replaced by rename counts as well
     assert scriptwatch.changed(seen) == [str(bin_ / "helper")]
 
+
+
+def test_scriptwatch_follows_named_neighbours_transitively_and_skips_unrelated_ones(tmp_path):
+    # An edit to a script nothing watched names (another job's script in the same folder) must not count
+    # as a mid-run change; a script reached through a chain of names must.
+    from ttp import scriptwatch
+    bin_ = tmp_path / "bin"
+    bin_.mkdir()
+    for name, text in (("check", '#!/bin/bash\nsource "$here/hop1.sh"\nrun-helper\n'),
+                       ("hop1.sh", "bash ./hop2.sh\n"),           # check -> hop1 -> hop2: two hops
+                       ("hop2.sh", "#!/bin/sh\n. ./hop1.sh\n"),   # and back to hop1: a cycle
+                       ("run-helper", "#!/usr/bin/env python3\nimport mod\n"),
+                       ("mod.py", "#!/usr/bin/env python3\n"),     # imported by module name
+                       ("unrelated.sh", "echo other job\n"),
+                       ("hop", "#!/bin/sh\n"),                    # a prefix of hop1.sh is no name of it
+                       ("helper", "#!/bin/sh\n")):               # nor is a part of run-helper
+        (bin_ / name).write_text(text)
+    got = {p.name for p in scriptwatch.scripts("bin/check", tmp_path, {"PATH": ""})}
+    assert got == {"check", "hop1.sh", "hop2.sh", "run-helper", "mod.py"}
+    (bin_ / "loop.sh").write_text("for f in ./lib-*.sh; do . \"$f\"; done\ncase $1 in *) ;; esac\n")
+    (bin_ / "lib-a.sh").write_text("x=1\n")
+    assert {p.name for p in scriptwatch.scripts("bash bin/loop.sh", tmp_path, {"PATH": ""})} == {"loop.sh", "lib-a.sh"}
+    big = bin_ / "big.sh"   # a script too long to read in full is taken to name every neighbour
+    big.write_text("#" * (scriptwatch.MAX_READ + 1) + "\n")
+    assert "unrelated.sh" in {p.name for p in scriptwatch.scripts("bash bin/big.sh", tmp_path, {"PATH": ""})}
+
+
+def test_scriptwatch_reruns_for_an_edited_dependency_but_not_for_an_unrelated_neighbour(tmp_path):
+    from ttp import scriptwatch
+    bin_ = tmp_path / "bin"
+    bin_.mkdir()
+    (bin_ / "check.sh").write_text('. "$(dirname "$0")/lib.sh"\n')
+    for name in ("lib.sh", "deep.sh", "other.sh"):
+        (bin_ / name).write_text("bash ./deep.sh\n" if name == "lib.sh" else "x=1\n")
+    for edit, runs in (("other.sh", 1), ("deep.sh", 2)):
+        count = []
+        def run():
+            count.append(1)
+            if len(count) == 1:
+                with open(bin_ / edit, "a") as f:
+                    f.write("y=2\n")
+            return 1
+        said = []
+        assert scriptwatch.rerun(run, bool, "bash bin/check.sh", tmp_path, {"PATH": ""}, said.append) == 1
+        assert len(count) == runs
+        assert said == ([f"{scriptwatch.LABEL}: bin/deep.sh"] if runs == 2 else [])
 
 def test_ttp_checks_reruns_a_check_whose_script_was_rewritten_mid_run_and_labels_it(env, tmp_path, monkeypatch, capsys):
     from ttp import cli, scriptwatch
