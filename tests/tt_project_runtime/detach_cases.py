@@ -562,6 +562,9 @@ def test_detach_lock_job_closed_as_died_leaves_no_lock_held_or_shown_held(env, t
     run_dir.mkdir(parents=True)
     rc = _detach_job(p, run_dir, env, "job", _until(tmp_path / "never"), "rig-a,rig-b")
     assert _until_true(lambda: _held_now(p, "rig-a") and _held_now(p, "rig-b"))
+    # `ttp lock` logs its takes just after it gets the locks: kill it only once they are logged.
+    assert _until_true(lambda: {r["resource"] for r in activity.entries(p.state) if r.get("ev") == "take"}
+                       == {"rig-a", "rig-b"})
     os.killpg(_record(rc)["pid"], signal.SIGKILL)   # its `ttp lock` dies too and logs no release
     assert _until_true(lambda: detach.close(rc) is not None) and _record(rc)["status"] == "died"
     assert not _held_now(p, "rig-a") and not _held_now(p, "rig-b")

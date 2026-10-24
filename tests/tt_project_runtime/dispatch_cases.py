@@ -328,6 +328,9 @@ def test_a_reservation_that_keeps_a_free_slot_unused_lapses_after_exclusive_rese
     p, d, drain, go = _board_setup(env, monkeypatch, tmp_path, board=1)
     flag, marks = tmp_path / "unlock", tmp_path / "marks"
     holder = None
+    clock = [time.time()]   # the reservation pass's clock: a slow host never lapses the reservation early
+    real_pass = d._slot_reservations
+    monkeypatch.setattr(d, "_slot_reservations", lambda now: real_pass(clock[0]))
     try:
         p.set_config("budget.exclusive_reserve_s", 1)
         _board_slots(p, d, 1, cable=1)
@@ -340,7 +343,7 @@ def test_a_reservation_that_keeps_a_free_slot_unused_lapses_after_exclusive_rese
         d.dispatch()
         assert _slot_tasks(p) == [], "C started on a board reserved for P1"
         assert locks.reserved_by(d._reserve_path("board")) == f"task #{p1}"
-        time.sleep(1.2)
+        clock[0] += 1.2
         d.dispatch()
         assert _slot_tasks(p) == [c], "the reservation never lapsed"
         assert locks.reserved_by(d._reserve_path("board")) != f"task #{p1}"

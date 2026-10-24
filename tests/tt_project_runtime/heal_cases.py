@@ -2327,6 +2327,8 @@ def test_coordinator_pause_with_until_still_ends_on_health(env, probe):
         for dt in (0, 900, 1800):
             heal.run(d, "svc", _heal_spec(p), now + dt)
             d._pause_ends.tick(now + dt)
+            for proc, _, _ in list(d._pause_ends._procs.values()):
+                proc.wait(60)   # it ends in real time before the fake clock jumps past its timeout
     finally:
         d._pause_ends.stop()
     assert ("board" in p.db.paused_resources()) == bool(probe)
