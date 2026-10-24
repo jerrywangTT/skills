@@ -58,6 +58,19 @@ def test_kill_guard_refuses_pattern_kills_and_allows_pkill_scoped_to_own_childre
         assert _kill_refusal(cmd, t) is None, cmd
 
 
+def test_kill_guard_signal_zero_probes_pass_and_real_signals_are_refused(kill_tree):
+    t = kill_tree
+    o = t.outside
+    for cmd in (f"kill -0 {o}", f"kill -s 0 {o}", f"kill -n 0 {o}", f"kill -SIG0 {o}", f"kill --signal 0 {o}",
+                f"kill --signal=0 {o}", f"sudo kill -0 {o}", f"timeout 5 kill -0 {o}", f"bash -c 'kill -0 {o}'",
+                "pkill -0 sleep", "pkill -SIG0 sleep", "pgrep sleep", "pgrep -f sleep"):
+        assert _kill_refusal(cmd, t) is None, cmd
+    for sig in ("-9", "-KILL", "-SIGKILL", "-s KILL", "-s 9", "-n 9", "--signal KILL", "--signal=KILL", "-TERM", ""):
+        for wrap in ("{}", "sudo {}", "env X=1 {}", "timeout 5 {}", "bash -c '{}'", "true; {}", "true && {}", "echo | {}"):
+            cmd = wrap.format(f"kill {sig} {o}".replace("  ", " "))
+            assert _kill_refusal(cmd, t) is not None, cmd
+
+
 def test_kill_guard_allows_kill_of_own_tree_only(kill_tree):
     t = kill_tree
     for cmd in (f"kill {t.child}", f"kill -9 {t.child}", f"kill -s TERM {t.child}", f"kill -- -{t.group}",

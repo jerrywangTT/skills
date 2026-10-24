@@ -296,6 +296,8 @@ class _Guard:
         scope, i = [], 0
         if args and re.fullmatch(r"-(?:\d+|(?:SIG)?[A-Z]{3}[A-Z0-9+-]*)", args[0]):   # -9, -TERM: a signal
             i = 1
+            if re.fullmatch(r"-(?:SIG)?0+", args[0], re.I):   # signal 0 sends nothing: a liveness probe
+                return
         while i < len(args):
             a = args[i]
             if a == "--":
@@ -345,7 +347,7 @@ class _Guard:
                 sig = sig[1:]
         if rest[:1] == ["--"]:
             rest = rest[1:]
-        if sig is not None and re.fullmatch(r"(?:SIG)?0", sig, re.I):
+        if sig is not None and re.fullmatch(r"(?:SIG)?0", sig, re.I):   # signal 0 sends nothing: a liveness probe
             return
         if stdin:
             raise Refused("kill run by xargs (or find, parallel) takes its pids from input the hook cannot see "
