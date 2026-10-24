@@ -517,7 +517,8 @@ def tend(p: Project) -> None:
     ago or that cannot start. The .lost goes before the queue entry, so a probe never sees neither."""
     # Completion normally removes scratch; SIGKILL, a launcher crash or a reboot cannot.
     # The inherited lifetime lock protects live checks across daemon restarts and pid namespaces.
-    from . import checkdirs
+    from . import checkdirs, checkreap
+    checkreap.sweep(p.state)   # first, so the scratch whose lock a leftover held can go below
     checkdirs.recover(p.state, p.runs)
     sweep(p.state)
     close_records(p)

@@ -2533,6 +2533,7 @@ def cmd_checks(a) -> None:
         # ignored, untracked or uncommitted files the recorded tree lacks; a remote one copies `head`
         # itself (remotecheck), one with "cwd": "authoring" runs here and is labelled so.
         clean = None
+        reap_tok, reap_rec, stop_handlers = "", None, {}
         try:
             if not (hit or handover) and any(not _in_place(c) for c in todo):
                 try:
@@ -2550,6 +2551,19 @@ def cmd_checks(a) -> None:
                     clean_note = f"it did not run: no clean checkout of {head[:12]} to run it in: {e}"
                     out.write(f"ttp checks: {clean_note}\n")
                     passed, rc = False, 1
+            if not (hit or handover) and passed and todo:
+                # Each check carries this run's token, so what it leaves running ends with it (checkreap).
+                from . import checkreap
+                reap_tok, _REAPED["procs"] = checkreap.token(), 0
+                if p:
+                    if any(swept := checkreap.sweep(p.state)):
+                        out.write(f"{checkreap.said(*swept)} of earlier check runs\n")
+                    try:
+                        reap_rec = checkreap.Record(p.state, reap_tok, str(clean.dir) if clean else "", top)
+                    except OSError:
+                        reap_rec = None
+                if not getattr(a, "own_group", False):
+                    stop_handlers = _foreground_stop()
             for c in [] if hit or handover or not passed else todo:
                 executed.append(c)
                 cwd = top if _in_place(c) else str(clean.path)
@@ -2562,7 +2576,7 @@ def cmd_checks(a) -> None:
                 # A detached run gives each check a group of its own, so a stop ends it with ttp checks.
                 group = bool(getattr(a, "own_group", False))
                 env = {**push.check_env("checks", run_dir=getattr(a, "check_run_dir", None)), **child_env,
-                       "PWD": cwd}
+                       "PWD": cwd, **({checkreap.MARKER: reap_tok} if reap_tok else {})}
                 def said(line: str) -> None:   # a script it runs was rewritten as it ran: once more
                     nonlocal check_start
                     print(f"ttp checks: {line}", flush=True)
@@ -2571,7 +2585,8 @@ def cmd_checks(a) -> None:
                     check_start = out.tell()
                 began = time.monotonic()
                 rc = scriptwatch.rerun(
-                    lambda: _run_check(_low_priority(push.check_argv(c, cwd, env)), group, cwd=cwd, stdout=out,
+                    lambda: _run_check(_low_priority(push.check_argv(c, cwd, env)), group, record=reap_rec, cwd=cwd,
+                                       stdout=out,
                                        stderr=subprocess.STDOUT, env=env,
                                        pass_fds=(a.tmp_fd,) if group and getattr(a, "tmp_fd", None) is not None else ()),
                     bool, None if push.remote_host(c) else str(c), cwd, env, said)
@@ -2588,8 +2603,14 @@ def cmd_checks(a) -> None:
                     break
                 out.write(_check_took(c, rc, began))
         finally:
-            if clean is not None:
+            if reap_tok:
+                _checks_reaped(out, reap_tok, reap_rec, clean, rc)
+            elif clean is not None:
                 clean.close()
+            for sig, h in stop_handlers.items():
+                signal.signal(sig, h)
+            if stop_handlers:
+                _CHECK_STOP["stopped"] = None
         if slot and not passed:
             slot.close()
         # A check host ssh could not reach (or that could not take the tree) is the environment, as a
@@ -2992,24 +3013,35 @@ def _check_took(c, rc: int, began: float) -> str:
     return f"ttp checks: {c} took {time.monotonic() - began:.1f} s (exit {rc})\n"
 
 
-def _run_check(argv: list, group: bool, **kw) -> int:
+def _run_check(argv: list, group: bool, record=None, **kw) -> int:
     """Run one check command to its exit code. In its own group (`group`) a stop always ends it:
-    a stop during Popen would otherwise leave the started command running."""
+    a stop during Popen would otherwise leave the started command running. Once its exit code is
+    known, and when it is stopped or fails, every process it left (checkreap: tied by the run's
+    token in its environment, or by its group and a working directory in its tree) is ended too;
+    the check log says how many. `record` (checkreap.Record) learns the check's group."""
     proc = None
     _CHECK_STOP.update(defer=True, pending=None)
     try:
         if _CHECK_STOP["stopped"]:   # stopped checks start no further command
             raise SystemExit(_CHECK_STOP["stopped"])
         proc = subprocess.Popen(argv, start_new_session=group, **kw)
+        if group and record is not None:
+            record.group(proc.pid)
         _CHECK_STOP["defer"] = False
         if _CHECK_STOP["pending"]:
             raise SystemExit(_CHECK_STOP["pending"])
-        return proc.wait()
+        rc = proc.wait()
+        _reap_check(proc, group, kw)
+        return rc
     except BaseException:
         _CHECK_STOP["defer"] = True
         try:
             if group and proc is not None:
                 _end_check(proc)
+            elif proc is not None and proc.poll() is None:
+                _end_check(proc, group=False)
+            if proc is not None:
+                _reap_check(proc, group, kw)
         finally:
             _CHECK_STOP["defer"] = False
         if _CHECK_STOP["pending"]:
@@ -3019,17 +3051,85 @@ def _run_check(argv: list, group: bool, **kw) -> int:
         _CHECK_STOP["defer"] = False
 
 
-def _end_check(proc: subprocess.Popen) -> None:
-    """End a check run in its own group: TERM, then KILL if it is still there after 5 s."""
+def _end_check(proc: subprocess.Popen, group: bool = True) -> None:
+    """End a check run in its own group (or, not in one, the command itself): TERM, then KILL if it
+    is still there after 5 s."""
     for sig, wait in ((signal.SIGTERM, 5), (signal.SIGKILL, 5)):
         try:
-            os.killpg(proc.pid, sig)
+            os.killpg(proc.pid, sig) if group else proc.send_signal(sig)
         except OSError:
             break
         try:
             proc.wait(timeout=wait)
             break
         except subprocess.TimeoutExpired:
+            pass
+
+
+_REAPED = {"procs": 0}   # leftover processes this run's checks left, ended as each check ended
+
+
+def _foreground_stop() -> dict:
+    """A foreground run's SIGTERM or SIGHUP ends its running check and what that left, as a
+    detached run's does (_checks_stop); the handlers it replaced, to restore. Only where the
+    default handler is in place, from the main thread."""
+    import threading
+    if threading.current_thread() is not threading.main_thread():
+        return {}
+    old = {}
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        if signal.getsignal(sig) is signal.SIG_DFL:
+            old[sig] = signal.signal(sig, _checks_stop)
+    if old:
+        _CHECK_STOP["stopped"] = None
+    return old
+
+
+def _checks_reaped(out, tok: str, record, clean, rc) -> None:
+    """The end of a run's checks, however it ends: record their exit code (exit.json), end what is
+    still tied to the run, remove the clean tree, say what was reaped, then drop the record unless
+    a process would not end (the sweep tries again later)."""
+    from . import checkreap
+    _CHECK_STOP["defer"] = True
+    found, left = 0, 1
+    try:
+        if record is not None:
+            record.exit(rc)
+        found, left = checkreap.reap(tok, record.data["pgids"] if record is not None else (),
+                                     str(clean.dir) if clean is not None else "")
+    except OSError:
+        pass
+    finally:
+        try:
+            if clean is not None:
+                clean.close()
+            if procs := _REAPED["procs"] + found:
+                out.write(f"{checkreap.said(procs, 1 if clean is not None else 0)}"
+                          + (f"; {left} would not end" if left else "") + "\n")
+            if record is not None and not left:
+                record.forget()
+        except (OSError, ValueError):
+            pass
+        _CHECK_STOP["defer"] = False
+        if _CHECK_STOP["pending"]:
+            raise SystemExit(_CHECK_STOP["pending"])
+
+
+def _reap_check(proc: subprocess.Popen, group: bool, kw: dict) -> None:
+    """End what the finished check `proc` left running (checkreap) and say so in its log."""
+    from . import checkreap
+    tok = (kw.get("env") or {}).get(checkreap.MARKER, "")
+    if not tok:
+        return
+    found, left = checkreap.reap(tok, (proc.pid,) if group else (), str(kw.get("cwd") or ""))
+    _REAPED["procs"] += found
+    out = kw.get("stdout")
+    if found and hasattr(out, "write"):
+        try:
+            out.write(f"ttp checks: ended {found} process{'es' if found != 1 else ''} the check left running"
+                      + (f"; {left} would not end" if left else "") + "\n")
+            out.flush()
+        except (OSError, ValueError):
             pass
 
 
