@@ -191,10 +191,14 @@ def checker(hold: dict, here: str | None = None) -> str:
 
 
 def line(hold: dict, where=None, now: float | None = None) -> str:
-    """One line for status, the digest and `ttp machines list`."""
+    """One line for status, the digest and `ttp machines list`; `where` a Project also shows when a
+    user hold's end condition passed (pauseends.passed_at, recorded by the project that checks it)."""
     from . import ends, pauseends
     who = "for the user" if hold.get("by") == "user" else f"by its {hold.get('by') or 'coordinator'}"
-    end = pauseends.describe(entry(hold), where)
+    v = entry(hold)
+    db = getattr(where, "db", None)
+    passed = pauseends.passed_at(db, f"{pauseends.FLEET_PREFIX}{hold.get('alias')}", v) if db is not None else None
+    end = pauseends.describe(v, where, passed, now)
     return (f"{hold.get('alias')} held machine-wide (hold {hold.get('id')}) by {hold.get('project') or '?'} {who} "
             f"since {ends.shown(float(hold.get('since') or 0), where)}"
             + (f": {hold['reason']}" if hold.get("reason") else "") + (f"; {end}" if end else "")

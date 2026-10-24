@@ -7090,6 +7090,26 @@ def test_a_user_pause_end_when_is_a_signal_status_says_so_and_the_coordinator_is
     assert settle(now + 5 * pauseends.PROBE_EVERY_S) == [] and not p.db.kv(pauseends.PASSED_KEY)
 
 
+def test_a_broken_end_when_probe_on_a_user_pause_is_never_shown_or_told_as_passed(env):
+    p = make(env)
+    from ttp import coordinator as coord, pauseends
+    from ttp.cli import status_text
+    coord.pause_resource(p, "rig", True, reason="the user's", by="user", end={"end_when": "exit 2"})
+    pe = pauseends.PauseEnds(p)
+    now = time.time()
+    assert _settle_end_probes(pe, now) == ["rig"]
+    assert _settle_end_probes(pe, now + pauseends.PROBE_EVERY_S + 5) == [], "told once"
+    assert p.db.paused_resources()["rig"]["by"] == "user"
+    (ev,) = p.db.q("SELECT text, severity FROM events WHERE kind IN ('observation', 'pause_end_due')")
+    assert ev["severity"] == "low" and "can no longer be checked" in ev["text"] and "is broken" in ev["text"]
+    assert " passed (" not in ev["text"] and "Tell the user once that it passed" not in ev["text"]
+    assert "The pause stays" in ev["text"] and "never say it passed or is being lifted" in ev["text"]
+    assert pauseends.passed_at(p.db, "rig", p.db.paused_resources()["rig"]) is None
+    assert not p.db.kv(pauseends.PASSED_KEY)
+    for text in (status_text(p), coord.digest(p, {}, [], [])):
+        assert "end condition passed" not in text and "ends only on the user's word" in text
+
+
 def test_a_user_pause_until_that_passed_shows_as_a_signal_not_an_end(env):
     p = make(env)
     from ttp import coordinator as coord, ends, pauseends
@@ -14175,6 +14195,34 @@ def test_a_fleet_hold_end_is_checked_by_the_setter_or_else_the_recovery_owner(en
     fleethold.set_hold("box1", "", "user", "demo", {"until": time.time() - 1})
     assert pauseends.PauseEnds(b).tick() == ["machine:box1"]
     assert "The pause stays: an end condition only signals" in b.db.q("SELECT text FROM events ORDER BY id DESC LIMIT 1")[0]["text"]
+
+
+def test_a_fleet_user_hold_shows_when_its_end_when_passed_and_a_broken_probe_never_does(env, tmp_path, monkeypatch):
+    from ttp import ends, fleethold, pauseends
+    from ttp import machine_ledger as ml
+    from ttp.cli import status_text
+    a, _, _ = _fleet(env, tmp_path)
+    monkeypatch.setattr(ml, "can_act", lambda name, here=None: (True, ""))
+    now = time.time()
+    fleethold.set_hold("box1", "", "user", "demo", {"end_when": "exit 2"})
+    pe = pauseends.PauseEnds(a)
+    assert _settle_end_probes(pe, now) == ["machine:box1"]
+    ev = a.db.q("SELECT text FROM events ORDER BY id DESC LIMIT 1")[0]["text"]
+    assert "can no longer be checked" in ev and "Tell the user once that it passed" not in ev
+    assert "end condition passed" not in status_text(a) and "ends only on the user's word" in status_text(a)
+    fleethold.lift("box1", True, "test")
+    fleethold.set_hold("box1", "", "user", "demo", {"end_when": "true"})
+    pe = pauseends.PauseEnds(a)
+    assert _settle_end_probes(pe, now + 3 * pauseends.PROBE_EVERY_S) == ["machine:box1"]
+    hold = fleethold.active()["box1"]
+    at = pauseends.passed_at(a.db, "machine:box1", fleethold.entry(hold))
+    assert at is not None
+    shown = f"end condition passed at {ends.shown(at, a)}; lifting needs the user's word"
+    assert shown in fleethold.line(hold, a) and shown in status_text(a)
+    # A new hold (another identity) does not show the old pass.
+    fleethold.lift("box1", True, "test")
+    fleethold.set_hold("box1", "", "user", "demo", {"end_when": "true"})
+    assert "end condition passed" not in fleethold.line(fleethold.active()["box1"], a)
 
 
 def test_a_fleet_hold_quiets_the_machine_like_a_user_pause(env):

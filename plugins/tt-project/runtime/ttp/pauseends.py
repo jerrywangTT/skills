@@ -17,7 +17,8 @@ daemon queues one `pause_end_due` event and the coordinator lifts the pause or e
 reason. A note from the `report_from` project re-prompts it the same way. A pause the user set is
 lifted only on their word: its end is a signal, never an end. Once it passes the pause stays, the
 time is kept (PASSED_KEY; describe shows it) and the coordinator gets one low observation: tell the
-user once, never say it is lifting. A pause recorded without
+user once, never say it is lifting. A broken probe, or a failed job it waits on, is told as an end
+that can no longer be checked, never as passed. A pause recorded without
 an end (from before ends were required) gets DEFAULT_S and one info message saying so.
 
 Only the project that set a shared pause (shared.py) checks it, so one owner is prompted."""
@@ -168,28 +169,34 @@ def owned(p: Project, db=None) -> dict[str, dict]:
     return out
 
 
-def _user_said(what: str, why: str, passed: bool, lift: str) -> str:
+def _user_said(what: str, why: str, state: str, lift: str) -> str:
     """The observation for the user's pause or hold `what`: it stays; their word alone lifts it."""
-    return ((f"The end condition of the user's {what} passed ({why}). The pause stays: an end condition only "
-             f"signals, it never lifts a user's pause. Tell the user once that it passed; never say it is being "
-             f"lifted. Lift it only in a turn that carries the user's word ({lift}); do not ask about it."
-             if passed else
-             f"The user's {what} waits on a report: {why}. The pause stays; only the user's word lifts it "
-             f"({lift}): never say it is being lifted, and do not ask about it."))
+    if state == "passed":
+        return (f"The end condition of the user's {what} passed ({why}). The pause stays: an end condition only "
+                f"signals, it never lifts a user's pause. Tell the user once that it passed; never say it is being "
+                f"lifted. Lift it only in a turn that carries the user's word ({lift}); do not ask about it.")
+    if state == "broken":
+        return (f"The end condition of the user's {what} can no longer be checked: {why}. It did not pass. The "
+                f"pause stays; only the user's word lifts it ({lift}). Tell the user once that its end condition "
+                f"can no longer be checked; never say it passed or is being lifted, and do not ask about it.")
+    return (f"The user's {what} waits on a report: {why}. The pause stays; only the user's word lifts it "
+            f"({lift}): never say it is being lifted, and do not ask about it.")
 
 
-def _queue(db, name: str, v: dict, why: str, now: float, passed: bool = True) -> None:
-    """Queue the end of pause `name`: a `pause_end_due` event, or for the user's pause one observation
-    (its end condition passed, kept in PASSED_KEY; `passed` False: a report it waits on arrived)."""
-    if v.get("by") == "user" and passed:
+def _queue(db, name: str, v: dict, why: str, now: float, state: str = "passed") -> None:
+    """Queue the end of pause `name`: a `pause_end_due` event, or for the user's pause one observation.
+    `state`: "passed" (its end condition passed, kept in PASSED_KEY), "broken" (its probe is broken or
+    the job it waits on failed: it cannot be checked, never shown as passed) or "report" (a report it
+    waits on arrived)."""
+    if v.get("by") == "user" and state == "passed":
         db.set_kv(PASSED_KEY, {**(db.kv(PASSED_KEY) or {}), name: {"sig": _sig(v), "at": now}})
     if v.get("fleet"):
-        _queue_fleet(db, v, why, now, passed)
+        _queue_fleet(db, v, why, now, state)
         return
     if v.get("by") == "user":
         db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
              (now, "daemon", "observation", "low",
-              _user_said(f"pause of `{name}`", why, passed, "`resource_pause` paused false")
+              _user_said(f"pause of `{name}`", why, state, "`resource_pause` paused false")
               + " It stays listed under Paused resources.", "queued"))
         return
     db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
@@ -199,12 +206,12 @@ def _queue(db, name: str, v: dict, why: str, now: float, passed: bool = True) ->
           f"`resource_pause` paused true, a new `until` or `end_when`, and a `reason` saying why.", "queued"))
 
 
-def _queue_fleet(db, v: dict, why: str, now: float, passed: bool = True) -> None:
+def _queue_fleet(db, v: dict, why: str, now: float, state: str = "passed") -> None:
     alias, hid = v.get("machine"), v.get("fleet")
     if v.get("by") == "user":
         db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
              (now, "daemon", "observation", "low",
-              _user_said(f"machine-wide hold of `{alias}` (hold {hid})", why, passed,
+              _user_said(f"machine-wide hold of `{alias}` (hold {hid})", why, state,
                          f"`resource_pause` machine {alias}, paused false"), "queued"))
         return
     db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
@@ -225,7 +232,7 @@ def note_arrived(p: Project, from_project: str | None, now: float | None = None)
     for name, v in sorted(owned(p).items()):
         if v.get("report_from") == from_project:
             _queue(p.db, name, v, f"a note from project {from_project}, whose report it waits on, arrived "
-                                  f"(the upstream_note event); read it", now, passed=False)
+                                  f"(the upstream_note event); read it", now, state="report")
             n += 1
     return n
 
@@ -291,20 +298,22 @@ class PauseEnds:
             probe, rc = v.get("end_when"), verdicts.get(name, (None, "", ""))
             if isinstance(probe, dict):
                 probe = None   # health results come from heal.run, never a shell probe; `until` still ends it
-            why = ""
+            why, state = "", "passed"
             if v.get("until") and float(v["until"]) <= now:
                 why = f"its end time {ends.shown(float(v['until']), self.p)} passed"
             elif probe and rc[1] == probe and rc[0] == 0:
                 why = f"its end_when probe `{probe}` passed"
             elif probe and rc[1] == probe and detach.failed_check(probe, rc[0]):
+                state = "broken"
                 why = (f"the detached job its end_when probe `{probe}` waits on ended but failed or left no "
                        f"exit code ({detach.failed_why(probe, rc[0], self.p.root)})")
             elif probe and rc[1] == probe and rc[0] is not None and rc[0] not in ends.NOT_YET_RCS:
+                state = "broken"
                 why = (f"its end_when probe `{probe}` is broken "
                        f"({rc[0] if isinstance(rc[0], str) else f'exit {rc[0]}'}): it would never end"
                        + (f". Its stderr: {rc[2]}" if rc[2] else ""))
             if why and sent.get(name) != _sig(v):
-                _queue(db, name, v, why, now)
+                _queue(db, name, v, why, now, state)
                 sent[name] = _sig(v)
                 due.append(name)
             elif probe and not why and name not in self._procs and now - self._probed.get(name, 0) >= PROBE_EVERY_S:
