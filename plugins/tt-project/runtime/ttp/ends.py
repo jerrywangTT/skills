@@ -67,6 +67,115 @@ def check_sh(probe: str, what: str) -> None:
                          f"arrays) or wrap it in bash -c '...'")
 
 
+TRIVIAL_WORDS = ("true", ":", "/bin/true", "/usr/bin/true")
+_REDIRECT_RE = re.compile(r"^\d*(?:>>|>&|<&|>\||<>|>|<)")
+_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+
+
+def _quote_end(s: str, i: int) -> int:
+    """The index just past the quote opened at s[i] (', " or `), or len(s) when it never closes."""
+    q, j = s[i], i + 1
+    while j < len(s):
+        if s[j] == "\\" and q != "'":
+            j += 2
+            continue
+        if s[j] == q:
+            return j + 1
+        j += 1
+    return len(s)
+
+
+def _top_level(probe: str) -> list[tuple[str, str]]:
+    """`probe` split at its top-level list and pipeline operators, outside quotes, subshells, $(...)
+    and { ...; } groups, without comments: [(the operator before it: "", ";", "&&", "||" or "|", a command)].
+    `;`, `&` and newlines all read as ";"."""
+    parts, op, buf, depth, i, n = [], "", [], 0, 0, len(probe)
+    while i < n:
+        ch, prev = probe[i], probe[i - 1] if i else " "
+        word_start = prev in " \t\n;&|()"
+        if ch == "\\":
+            buf.append(probe[i:i + 2])
+            i += 2
+            continue
+        if ch in "'\"`":
+            j = _quote_end(probe, i)
+            buf.append(probe[i:j])
+            i = j
+            continue
+        if ch == "#" and word_start:
+            while i < n and probe[i] != "\n":
+                i += 1
+            continue
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth = max(depth - 1, 0)
+        elif ch in "{}" and word_start and (i + 1 == n or probe[i + 1] in " \t\n;&|)"):
+            depth = depth + 1 if ch == "{" else max(depth - 1, 0)
+        elif depth == 0 and ch in ";&|\n" and prev not in "<>":
+            two = probe[i:i + 2]
+            sep = two if two in ("&&", "||") else "|" if ch == "|" else ";"
+            i += 2 if two in ("&&", "||", ";;") else 1
+            parts.append((op, "".join(buf).strip()))
+            op, buf = sep, []
+            continue
+        buf.append(ch)
+        i += 1
+    parts.append((op, "".join(buf).strip()))
+    return [(o, c) for o, c in parts if c]
+
+
+def _trivial_command(cmd: str) -> bool:
+    """Whether one simple command or group always exits 0: `true`, `:` or `exit 0` (with assignments or
+    redirections), or a ( ... ) / { ...; } group whose list always does."""
+    cmd = cmd.strip()
+    if cmd.startswith("(") and cmd.endswith(")"):
+        return always_succeeds(cmd[1:-1])
+    if cmd.startswith("{") and cmd.endswith("}"):
+        return always_succeeds(cmd[1:-1])
+    words, skip = [], False
+    for w in cmd.split():
+        if skip:
+            skip = False
+        elif _REDIRECT_RE.match(w):
+            skip = not _REDIRECT_RE.sub("", w)   # `> file`: the target is the next word
+        elif not words and _ASSIGN_RE.match(w):
+            continue
+        else:
+            words.append(w)
+    return words in ([w] for w in TRIVIAL_WORDS) or words == ["exit", "0"]
+
+
+def always_succeeds(probe: str) -> bool:
+    """Whether shell probe `probe` exits 0 whatever it tests: it is only `true`, `:` or `exit 0`, or its last
+    list ends in one of them after `||`, `;`, `&` or `|` (`test -e x || true`, `check; exit 0`). Such a
+    probe says "over" at once, so an end, hold or undo waiting on it fires while its cause is still there.
+    A real test (`test -e x || exit 1`, `cmd && true`, `(a || true) && b`) is not flagged."""
+    parts = _top_level(probe or "")
+    if not parts:
+        return False
+    start = max((k for k, (op, _) in enumerate(parts) if op == ";"), default=0)
+    pipelines: list[list[str]] = []   # [operator before it, its last command] of the last and-or list
+    for op, cmd in parts[start:]:
+        if op == "|" and pipelines:   # a pipeline exits with its last command's code
+            pipelines[-1][1] = cmd
+        else:
+            pipelines.append([op, cmd])
+    always = _trivial_command(pipelines[0][1])
+    for op, cmd in pipelines[1:]:
+        ok = _trivial_command(cmd)
+        always = (always and ok) if op == "&&" else (always or ok)
+    return always
+
+
+def check_not_trivial(probe: str, what: str) -> None:
+    """Refuse a probe that always exits 0 (always_succeeds): it would end what waits on it at once."""
+    if always_succeeds(probe):
+        raise ValueError(f"{what} always exits 0 (it is or ends in `true`, `:` or `exit 0`, e.g. after `|| true`), "
+                         f"so it would say \"over\" at once while the cause is still there; make it a real test "
+                         f"that ends with `|| exit 1`, e.g. `test -e /path/to/marker || exit 1`")
+
+
 def stamp(ts: float) -> str:
     """The stored form (charter lines, front matter); `shown` is the one people read."""
     return time.strftime("%Y-%m-%dT%H:%MZ", time.gmtime(ts))

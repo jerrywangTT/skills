@@ -3401,3 +3401,99 @@ def test_activity_since_reads_a_zone_less_time_in_the_home_zone(env, utc_box):
     p = make(env)
     p.set_config("home_timezone", "America/Los_Angeles")
     assert activity.parse_since("2027-01-14 22:00", now, where=p) == now - 7200
+
+
+TRIVIAL_PROBES = ["true", ":", "exit 0", "test -e x || true", "test -e x || :", "test -e x || exit 0",
+                  "test -e x; true", "test -e x; :", "test -e x; exit 0", " test -e x  ||   true ;\n",
+                  "test -e x||true;", "test -e x\ntrue\n", "a && b || true", "grep -q a f 2>&1 || true",
+                  "a | true", "(test -e x || true)", "{ test -e x || true; }", "test -e x & true",
+                  "test -e x || true # comment", "true >/dev/null 2>&1", "X=1 true", "a || (exit 0)", "/bin/true"]
+REAL_PROBES = ["test -e x || exit 1", "cmd && true", "grep -q a f", "(a || true) && b", "echo 'a || true'",
+               "test \"$(a || true)\" = x", "a && b | true", "a || true && false", "test -e x && exit 0; exit 1",
+               "exit", "exit 1", "true; false", "test -e x # || true", "if a; then true; fi", "cmd 2>&1",
+               "cmd >&2 || exit 1", "sh -c 'exit 0'", "echo $(true)", "! true", "test -e x || { echo no; exit 1; }",
+               "case a in a) true;; esac", "a || true | false", "test -e x | grep -q y", ""]
+
+
+@pytest.mark.parametrize("probe", TRIVIAL_PROBES)
+def test_always_succeeds_flags_a_probe_that_cannot_fail(probe):
+    from ttp import ends
+    assert ends.always_succeeds(probe), probe
+    with pytest.raises(ValueError, match=r"always exits 0.*\|\| exit 1"):
+        ends.check_not_trivial(probe, "--until-probe")
+
+
+@pytest.mark.parametrize("probe", REAL_PROBES)
+def test_always_succeeds_leaves_a_real_test_alone(probe):
+    from ttp import ends
+    assert not ends.always_succeeds(probe), probe
+    ends.check_not_trivial(probe, "--until-probe")
+
+
+def test_machine_change_add_and_edit_refuse_an_until_probe_that_always_exits_0(env, capsys):
+    """An until-probe ending in `|| true` (and the like) would make the change look over at once, so its
+    undo is due while the cause is still there: add and edit refuse it on one line and write nothing."""
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    from ttp.cli import main
+    p = make(env)
+    mm.add("box-a", tags="device")
+    for probe in ("test -e /tmp/held || true", "check-hold; exit 0", "true"):
+        with pytest.raises(SystemExit):
+            main(["machines", "change", "add", "box-a", "held", "--undo", "release", "--until-probe", probe,
+                  "--by", p.name])
+        err = capsys.readouterr().err
+        assert "always exits 0" in err and "|| exit 1" in err and len(err.strip().splitlines()) == 1, err
+        assert ml.changes() == [], "nothing written"
+    with pytest.raises(ValueError, match="always exits 0"):
+        ml.add_change("box-a", "held", "release", p.name, until_probe="test -e x || :")
+    main(["machines", "change", "add", "box-a", "held", "--undo", "release", "--until-probe",
+          "test -e /tmp/held || exit 1", "--by", p.name])
+    before = ml.changes()
+    for probe in ("test -e /tmp/held || exit 0", ":"):
+        with pytest.raises(SystemExit):
+            main(["machines", "change", "edit", "1", "--until-probe", probe, "--by", p.name])
+        err = capsys.readouterr().err
+        assert "always exits 0" in err and "|| exit 1" in err and len(err.strip().splitlines()) == 1, err
+        assert ml.changes() == before, "the entry is unchanged"
+    with pytest.raises(ValueError, match="always exits 0"):
+        ml.edit_change(1, p.name, until_probe="x; true")
+
+
+def test_machine_change_with_a_stored_trivial_until_probe_is_never_ended_by_it_and_is_reported(env):
+    """An entry stored before add refused such probes (or written by an older version) never turns
+    overdue because its probe passed, even with a pass recorded: Probes does not run it and queues one
+    broken-probe event, its listing line warns, and the progress watcher raises no due undo. Its time
+    still ends it."""
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    from ttp import progress
+    p = make(env)
+    mm.add("box-a", tags="device")
+    now = time.time()
+    c = ml.add_change("box-a", "held a kit", "rm -r kit", p.name, until_probe="test -e /tmp/kit || exit 1",
+                      expires="2d", now=now)
+    with ml._locked():
+        doc = ml._read(ml.LEDGER, {"next": 1, "changes": []})
+        doc["changes"][0].update(probe="test -e /tmp/kit || true", probe_passed=now, probe_out="")
+        ml._write(ml.LEDGER, doc)
+    [stored] = ml.changes()
+    later = now + ml.PROBE_GRACE_S + 1
+    assert ml.trivial_probe(stored) and ml.overdue(stored, later) == ""
+    assert not [x for x in ml.route(later, able=lambda n: (True, "")) if x["kind"] == "machine_change_overdue"]
+    logs = []
+    probes = ml.Probes(p, log=logs.append)
+    for at in (later, later + 1000):
+        probes._probed.clear()
+        probes.tick(at)
+        assert c["id"] not in probes._procs, "never run"
+    evs = p.db.q("SELECT text FROM events WHERE kind=?", (ml.PROBE_BROKEN_KIND,))
+    assert len(evs) == 1 and "always exits 0" in evs[0]["text"] and "|| exit 1" in evs[0]["text"], evs
+    assert not ml.changes()[0].get("closed")
+    assert "always exits 0" in ml.change_line(ml.changes()[0], later)
+    t = p.db.add_task("holds the kit", "x")
+    p.db.update_task(t, status="waiting")
+    got, _ = progress.change_probes(p.db, {"change_probe_m": 15}, {"raised": {}},
+                                    [dict(ml.changes()[0], task=t)], later + 3600)
+    assert got == [], "no due undo from its pass"
+    assert ml.overdue(ml.changes()[0], now + 2 * 86400 + 1).startswith("expired"), "its time still ends it"

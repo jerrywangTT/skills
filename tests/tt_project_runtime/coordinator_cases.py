@@ -1187,7 +1187,7 @@ def test_a_whole_machine_ledger_view_is_capped_to_open_changes_and_a_count(env):
     _resources(p, "- box-c")
     n = coord.LEDGER_WHOLE_CHANGES
     for i in range(n + 5):
-        ml.add_change("box-c", f"theirs {i} " + "y" * 250, "undo it", "proj-a", expires="6h", until_probe="true")
+        ml.add_change("box-c", f"theirs {i} " + "y" * 250, "undo it", "proj-a", expires="6h", until_probe="test -d /")
     ml.add_change("box-c", "my own change", "undo it", p.name, expires="6h")
     for i in range(3):
         ml.add_change("box-c", f"quiet {i}", "undo it", "proj-b", expires="6h")
@@ -13648,7 +13648,7 @@ def test_a_machine_change_until_task_ends_with_its_task_and_a_continuation_re_ex
     build = p.db.add_task("build", "s", kind="work", tier="light", origin="user")
     use = p.db.add_task("use the staged tree", "s", kind="work", tier="light", origin="user")
     with pytest.raises(ValueError, match="give one end"):
-        ml.add_change("box-a", "staged tree", "rm -r tree", p.name, until_probe="true", until_task=use)
+        ml.add_change("box-a", "staged tree", "rm -r tree", p.name, until_probe="test -d /", until_task=use)
     c = ml.add_change("box-a", "staged build tree", "rm -r tree", p.name, task=build, until_task=use, now=now)
     assert c["until_task"] == use and c["expires"] == pytest.approx(now + ml.PROBE_END_S)
     assert f"until task #{use} ends, at the latest" in ml.change_line(c, now)
@@ -14392,7 +14392,7 @@ def test_a_sandboxed_worker_queues_machine_changes_for_its_daemon_when_the_share
         cli.main(add + ["--expires", "2h"])
         out = capsys.readouterr().out
         assert out.startswith("queued machine change on box-a: staged tree") and "read-only here" in out
-    cli.main(["machines", "change", "add", "box-a", "drop-in", "--undo", "rm drop-in", "--until-probe", "true"])
+    cli.main(["machines", "change", "add", "box-a", "drop-in", "--undo", "rm drop-in", "--until-probe", "test -d /"])
     capsys.readouterr()
     assert ml.changes() == [] and len(ml.pending(p.state)) == 2
     cli.main(["machines", "change", "list"])
@@ -14412,7 +14412,7 @@ def test_a_sandboxed_worker_queues_machine_changes_for_its_daemon_when_the_share
     staged, drop = ml.changes()
     assert (staged["what"], staged["undo"], staged["by"], staged["task"]) == ("staged tree", "rm -r tree", p.name, task)
     assert staged["expires"] == pytest.approx(now + 7200, abs=60) and staged["request"]
-    assert drop["probe"] == "true" and drop["undo"] == "rm drop-in"
+    assert drop["probe"] == "test -d /" and drop["undo"] == "rm drop-in"
     # A retry once recorded, or a request left behind by a daemon killed after the write, adds nothing.
     monkeypatch.setattr(ml, "_locked", read_only)
     cli.main(add + ["--expires", "2h"])

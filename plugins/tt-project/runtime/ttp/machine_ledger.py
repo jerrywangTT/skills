@@ -38,7 +38,8 @@ Change ledger. Every live change to a shared machine (a drop-in, a disabled reco
 recorded with `ttp machines change add <alias> "<what>" --undo "<cmd>" (--expires <t> | --until-probe
 "<cmd>" | --until-task <id>)`, or an until-probe with an --expires (it ends at whichever comes first): who made it (the project), why (the text), how to undo it and when it ends. Each co-tenant's
 digest lists the open entries for machines in its Resources, one line each. An entry is overdue when it
-expires, its until-probe passes (exit 0: what it waited for is over, so the undo is due) or its until-task
+expires, its until-probe passes (exit 0: what it waited for is over, so the undo is due; add and edit refuse
+a probe that always exits 0, ends.always_succeeds, and Probes reports an older one instead of running it) or its until-task
 (a task of the project that made it, such as the follow-up that uses a staged build tree) is done, failed,
 cancelled or gone; a probe-only or task-only entry also expires after PROBE_END_S, and a continuation task
 re-extends it with `ttp machines change edit <id> --until-task <its own id>`. The daily review lists the
@@ -207,6 +208,7 @@ def add_change(alias: str, what: str, undo: str, by: str, expires: Any = None, u
         raise ValueError(END_HINT)
     if probe:
         ends.check_sh(probe, "--until-probe")
+        ends.check_not_trivial(probe, "--until-probe")
     end = float(expires) if isinstance(expires, (int, float)) else \
         ends.parse_expires(expires, now, where=where) if expires else now + PROBE_END_S   # a number: an epoch time
     fields = {"alias": alias, "what": what, "undo": undo, "by": by, "task": task, "added": now, "expires": end,
@@ -564,6 +566,7 @@ def edit_change(cid: int, by: str, what: str | None = None, undo: str | None = N
         if not probe:
             raise ValueError("the --until-probe command cannot be empty")
         ends.check_sh(probe, "--until-probe")
+        ends.check_not_trivial(probe, "--until-probe")
         new.update(probe=probe, until_task=None, expires=now + PROBE_END_S if not expires else
                    float(expires) if isinstance(expires, (int, float)) else ends.parse_expires(expires, now, where=where))
     elif until_task:
@@ -609,9 +612,11 @@ def overdue(c: dict, now: float | None = None, where=None) -> str:
     now = time.time() if now is None else now
     if c.get("closed") or c.get("kind") == POWER_CYCLE:   # a power cycle has nothing to undo: it closes itself
         return ""
-    if c.get("probe_job_failed"):
+    if trivial_probe(c):   # a pass of a probe that always exits 0 says nothing: its end is only its time
+        pass
+    elif c.get("probe_job_failed"):
         return f"the detached job its until-probe waits on ended but failed ({c['probe_job_failed'] if isinstance(c['probe_job_failed'], str) else 'probe exit ' + str(c['probe_job_failed'])})"
-    if c.get("probe_passed"):
+    elif c.get("probe_passed"):
         return "its until-probe passed"
     if c.get("task_ended"):
         return str(c.get("task_end_why") or f"its until-task #{c.get('until_task')} ended")
@@ -640,6 +645,12 @@ def _clip(text: Any, n: int) -> str:
     return s if len(s) <= n else s[:max(n - 1, 0)].rstrip(" ,;:") + "…"
 
 
+def trivial_probe(c: dict) -> bool:
+    """Whether open entry `c` waits on an until-probe that always exits 0 (ends.always_succeeds). One stored
+    before add and edit refused them never ends the entry: Probes reports it instead of running it."""
+    return bool(c.get("probe")) and not c.get("closed") and ends.always_succeeds(c["probe"])
+
+
 def change_line(c: dict, now: float | None = None, where=None, clip: int | None = None) -> str:
     """Entry `c` on one line. `clip`: at most about that many characters (the coordinator digest): the
     reason is cut first, then a long undo, probe or overdue cause, so the id, alias, author, the start of
@@ -652,6 +663,8 @@ def change_line(c: dict, now: float | None = None, where=None, clip: int | None 
     by = c.get("by", "?") + (f" #{c['task']}" if c.get("task") else "")
     end += f"; expects {', '.join(c['expects'])}" if c.get("expects") else ""
     end += "; a test" if c.get("test") else ""
+    end += (f"; its until-probe always exits 0, so it never ends this: fix it with `ttp machines change edit "
+            f"{c['id']} --until-probe '<test> || exit 1'`") if trivial_probe(c) else ""
     end += f"; backdated to {ends.shown(c['since'], where)}" if isinstance(c.get("since"), (int, float)) else ""
     head, tail = f"#{c['id']} {c['alias']}: ", (f" (by {by}; undo: `{part(c['undo'])}`; {end})"
                                                 + (f" OVERDUE: {part(late)}" if late else ""))
@@ -1325,6 +1338,7 @@ def change_overdue(cid: int, now: float | None = None) -> bool:
 # probes -------------------------------------------------------------------------------------------
 
 PROBE_BROKEN_KIND = "change_probe_broken"   # the event a broken until-probe queues for the coordinator
+TRIVIAL_CODE = "always exits 0"   # how a stored until-probe that always exits 0 is reported broken
 
 
 class Probes:
@@ -1386,6 +1400,10 @@ class Probes:
                     or now - self._probed.get(cid, 0) < ends.PROBE_EVERY_S:
                 continue
             self._probed[cid] = now
+            if trivial_probe(c):   # stored before add and edit refused it: never run, so it never ends the entry
+                self._broken(cid, c["probe"], TRIVIAL_CODE, "it is or ends in `true`, `:` or `exit 0`, so its pass "
+                             "would say nothing; end the test with `|| exit 1` instead", now)
+                continue
             try:
                 self._procs[cid] = (ends.spawn_probe(self.p, c["probe"], self._errs, stdout=True), now, c["probe"])
             except OSError as e:

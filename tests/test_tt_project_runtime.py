@@ -38539,7 +38539,7 @@ def test_machine_change_ledger_add_list_overdue_and_close(env, capsys):
           "enable-power-cycle", "--expires", "2h", "--by", "demo"])
     assert "recorded #1 box-a: disabled auto power cycle for a soak (by demo; undo: `enable-power-cycle`" \
         in capsys.readouterr().out
-    probe = ml.add_change("box-a", "paused the queue", "resume-queue", "demo", until_probe="exit 0", now=now)
+    probe = ml.add_change("box-a", "paused the queue", "resume-queue", "demo", until_probe="test -d /", now=now)
     assert probe["expires"] == pytest.approx(now + ml.PROBE_END_S)
     main(["machines", "change", "list"])
     out = capsys.readouterr().out
@@ -38638,7 +38638,7 @@ def test_a_machine_change_keeps_an_until_probe_and_an_expires_given_together(env
     assert c["probe"] == "false" and c["expires"] == pytest.approx(now + 3600, abs=60)
     assert "until-probe `false`, at the latest" in capsys.readouterr().out
     assert not ml.overdue(c, now) and ml.overdue(c, now + 3700).startswith("expired"), "its time comes first"
-    ml.add_change("box-a", "drained", "undrain", p.name, expires="1d", until_probe="true", now=now)
+    ml.add_change("box-a", "drained", "undrain", p.name, expires="1d", until_probe="test -d /", now=now)
     probes = ml.Probes(p, log=lambda s: None)
     for n in range(ml.PROBE_PASSES):
         _change_probe_round(probes, 2, now + ml.PROBE_GRACE_S + n * 600)
@@ -38663,7 +38663,7 @@ def test_giving_a_machine_change_its_until_probe_again_judges_it_afresh(env):
     p = make(env)
     mm.add("box-a", tags="device")
     now = time.time()
-    ml.add_change("box-a", "paused", "resume", p.name, until_probe="true", now=now)
+    ml.add_change("box-a", "paused", "resume", p.name, until_probe="test -d /", now=now)
     probes = ml.Probes(p, log=lambda s: None)
     for n in range(ml.PROBE_PASSES):
         _change_probe_round(probes, 1, now + ml.PROBE_GRACE_S + n * 600)
@@ -38677,8 +38677,8 @@ def test_giving_a_machine_change_its_until_probe_again_judges_it_afresh(env):
     t = now + 2000
     probes.tick(t)   # a pass in flight while the probe is set again
     assert 1 in probes._procs
-    c = ml.edit_change(1, p.name, until_probe="true", now=t + 1)
-    assert c["probe"] == "true" and c["expires"] == pytest.approx(now + ml.PROBE_END_S)
+    c = ml.edit_change(1, p.name, until_probe="test -d /", now=t + 1)
+    assert c["probe"] == "test -d /" and c["expires"] == pytest.approx(now + ml.PROBE_END_S)
     assert "probe_passed" not in c and "page" not in c and c["page_from"] == t + 1
     assert c["edits"][-1]["was"] == {"probe_passed": pytest.approx(now + ml.PROBE_GRACE_S + 600)}
     probes._procs[1][0].wait(30)
@@ -38691,7 +38691,7 @@ def test_giving_a_machine_change_its_until_probe_again_judges_it_afresh(env):
     assert "probe_passed" not in ml.changes()[0], "one fresh pass is not enough"
     _change_probe_round(probes, 1, t + 1 + ml.PROBE_GRACE_S + 600)
     assert ml.overdue(ml.changes()[0], t + 1 + ml.PROBE_GRACE_S + 601) == "its until-probe passed"
-    c = ml.edit_change(1, p.name, until_probe="true", now=t + 2000)
+    c = ml.edit_change(1, p.name, until_probe="test -d /", now=t + 2000)
     assert "probe_passed" not in c, "the same probe again clears a pass with no page too"
 
 
@@ -38718,7 +38718,7 @@ def test_an_edited_machine_change_overdue_again_pages_afresh_and_a_stale_probe_p
     assert d._machine_page(second[0], now + 3700)
     assert alpha.db.one("SELECT COUNT(*) n FROM events WHERE kind='machine_change_overdue'")["n"] == 2
     # A probe still running from before an edit to another probe: its pass is not the new probe's.
-    ml.edit_change(1, "alpha", until_probe="true", now=now + 3700)
+    ml.edit_change(1, "alpha", until_probe="test -d /", now=now + 3700)
     probes = ml.Probes(alpha, log=lambda s: None)
     _change_probe_round(probes, 1, now + 3700 + ml.PROBE_GRACE_S)   # the first of two passes
     probes._probed.clear()
@@ -46806,7 +46806,7 @@ def test_machine_change_until_probe_exit_codes(env, code, passed, reported):
     p = make(env)
     mm.add("box-a", tags="device")
     now = time.time()
-    c = ml.add_change("box-a", "paused", "resume", p.name, until_probe=f"exit {code}", now=now)
+    c = ml.add_change("box-a", "paused", "resume", p.name, until_probe=f"sh -c 'exit {code}'", now=now)
     logs = []
     probes = ml.Probes(p, log=logs.append)
     for n in range(ml.PROBE_PASSES):
@@ -46857,7 +46857,7 @@ def test_machine_change_until_probe_true_at_add_time_does_not_page_during_its_gr
     p = make(env)
     mm.add("box-a", tags="device")
     now = time.time()
-    c = ml.add_change("box-a", "paused", "resume", p.name, until_probe="true", now=now)
+    c = ml.add_change("box-a", "paused", "resume", p.name, until_probe="test -d /", now=now)
     probes = ml.Probes(p, log=lambda s: None)
     for at in (now, now + 60, now + ml.PROBE_GRACE_S - 1):
         probes._probed.clear()

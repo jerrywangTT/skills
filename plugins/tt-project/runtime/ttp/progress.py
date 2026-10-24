@@ -716,6 +716,7 @@ def change_probes(db: DB, s: dict, st: dict, changes: list[dict], now: float) ->
     queued or waiting: the change is due its undo, and its owner sleeps. The ledger pages the
     coordinator that the change is overdue but wakes no task. Also returns the raised keys whose
     condition ended: the change closed or its task no longer waits."""
+    from . import ends
     out, gone, open_ids = [], set(), set()
     for c in changes:
         open_ids.add(str(c.get("id")))
@@ -729,7 +730,7 @@ def change_probes(db: DB, s: dict, st: dict, changes: list[dict], now: float) ->
         if t["status"] not in ("queued", "waiting"):
             gone.add(f"change-probe:{c.get('id')}")
             continue
-        passed = c.get("probe_passed")
+        passed = c.get("probe_passed") if not ends.always_succeeds(c.get("probe") or "") else None
         if not s["change_probe_m"] or not passed or now - float(passed) < s["change_probe_m"] * 60:
             continue
         out.append({"kind": "change-probe", "key": str(c.get("id")), "task": tid, "n": 1, "since": float(passed),
