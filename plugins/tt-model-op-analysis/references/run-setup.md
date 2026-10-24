@@ -51,10 +51,14 @@ whole configuration in one message.
    Measurements rerun this same test.
 7. If a run with this identity (model, implementation, entry test, source, commit) already exists,
    say so and continue it; never trace it again.
-8. Write `run.json` with the run's identity (section 3) and `entry_test_ci`, the CI coverage that
-   discovery found for the chosen test on the source profile. Leave out `kind`: the static phase
-   sets it.
-9. Entry test preflight (below), for a Blackhole or Wormhole source.
+8. Search the open tt-metal issues that report the entry test failing, in any build or on any
+   profile: `gh issue list --repo tenstorrent/tt-metal --state open --search "<model> in:title,body"`,
+   then the test file name and the implementation path; read each hit and keep only those that say
+   this test fails, hangs or misses its PCC. Without GitHub access, ask the user to name them.
+9. Write `run.json` with the run's identity (section 3), `entry_test_ci`, the CI coverage that
+   discovery found for the chosen test on the source profile, `entry_test_issues` from step 8 and
+   your entry in `analysed_by`. Leave out `kind`: the static phase sets it.
+10. Entry test preflight (below), for a Blackhole or Wormhole source.
 
 Destinations are asked after static analysis (static-phase.md, "Adding a destination"), never
 during setup.
@@ -179,12 +183,12 @@ The preflight is the capture run of measured-source.md (steps 1 to 4, `source:gr
 `source:cache` in one run; the cache is built even without the elfray engine and read later), so it
 costs no extra run. One job through `tt-device-mcp`. Then:
 
-- **Passed.** `python3 <plugin-root>/scripts/graph_report.py <capture file> <run dir> --inferences <n> --date <YYYY-MM-DD> --entry-pass "<pass line>"`
+- **Passed.** `python3 <plugin-root>/scripts/graph_report.py <capture file> <run dir> --inferences <n> --date <YYYY-MM-DD> --build <type> --entry-pass "<pass line>"`
   records the pass in `entry_test_passes` and the capture in `graph_capture`; with no
   `op_table.csv` yet it decides no row. Run `cache_report.py` (measured-source.md, step 9) when the
   engine is available. Continue with the static phase.
 - **Failed.** Show the failure line and ask: another entry test (step 6), another commit (step 4),
-  or the static phase anyway. For the last, record the failure with `graph_report.py ... --entry-fail "<failure line>"`
+  or the static phase anyway. For the last, record the failure with `graph_report.py ... --build <type> --entry-fail "<failure line>"`
   when the capture file was written, otherwise with
   `python3 <plugin-root>/scripts/measurements.py mark <run dir> source:graph failed --note "<failure line>"`.
   For another test or commit, delete this `run.json` and the capture and cache with the user's
@@ -239,11 +243,22 @@ profiles only, named). For a Quasar source `n/a`, with the evidence that its ent
 never run.
 
 Static analysis adds `configurable_grid` and `configurable_layers` (static-phase.md, step 6).
-`entry_test_failure` (`{"by", "date", "result"}`) records a failed local run of the entry test
+`entry_test_issues`, written at setup: `{"checked": "YYYY-MM-DD", "open": [{"url", "title", "effect"}]}`,
+the open tt-metal issues that report the entry test failing (setup order, step 8); `effect` says how
+and where it fails ("a TT_ASSERT in conv weight preparation fails in assertion-enabled builds").
+`open` is empty when the search found none. While one is listed the sheet shows the end-to-end test
+as ⚠️ even after a local pass; remove an issue once it is closed, and update `checked`.
+
+`analysed_by`: one entry per agent session that changed the run, `{"agent", "model", "work",
+"date"}`, for example `{"agent": "Claude Code", "model": "claude-opus-5-5", "work": "static trace,
+quasar-bf16 destination", "date": "2026-10-21"}` or `{"agent": "Codex", ...}`. Append, never rewrite
+another agent's entry. The Info tab lists them under "Analysed by".
+
+`entry_test_failure` (`{"by", "date", "result", "build"}`) records a failed local run of the entry test
 (`--entry-fail` of `merge_measured.py` or `graph_report.py`); a later recorded pass removes it.
 
 `entry_test_passes`, for a Blackhole or Wormhole source: where the entry test is shown to pass,
-either `{"ci": "<workflow file>: <job>"}` or `{"by": "...", "date": "...", "result": "<pcc line>"}`
+either `{"ci": "<workflow file>: <job>"}` or `{"by": "...", "date": "...", "result": "<pcc line>", "build": "<type>"}`
 for a run the user reports or a passing Tracy run (`merge_measured.py --entry-pass` writes
 `"by": "source:tracy on a local <source> device"` and keeps a `ci` entry). It backs the `✅` rule in
 `target-status.md`.

@@ -27,7 +27,7 @@ def test_plugin_skills_and_phase_references():
 def test_manifest_versions_match():
     claude = json.loads((PLUGIN / ".claude-plugin" / "plugin.json").read_text())
     codex = json.loads((PLUGIN / ".codex-plugin" / "plugin.json").read_text())
-    assert claude["version"] == codex["version"] == "0.10.0"
+    assert claude["version"] == codex["version"] == "0.11.0"
 
 
 def test_shared_setup_is_step_by_step():
@@ -134,6 +134,9 @@ def make_static_run(tmp_path: pathlib.Path, op_rows: list[dict], trace_rows: lis
                                               "stage_blocks": ["encoder", "s1", "s2"],
                                               "configurable_grid": {"value": "yes", "evidence": "m.py:1 grid from device"},
                                               "configurable_layers": {"value": "n/a", "evidence": "no layer stack"},
+                                              "entry_test_issues": {"checked": "2026-10-01", "open": []},
+                                              "analysed_by": [{"agent": "Claude Code", "model": "m",
+                                                               "work": "static trace", "date": "2026-10-01"}],
                                               "entry_test_ci": {"value": "no", "evidence": "no workflow runs it on P150"}}))
     write_rows(run / "op_table.csv", op_rows)
     write_rows(run / "call_trace.csv", trace_rows)
@@ -1138,7 +1141,7 @@ def test_sheet_spec_view_keeps_meaning(tmp_path):
     assert "Call site (file:line)" in ops[0]
     info = tab(spec, "Info")
     assert ["Dispatch evidence", "picks X if (a || b) at x.cpp:1"] in info
-    assert ["End-to-end test", "✅ passed: pass (user, 2026-10-01)"] in info
+    assert ["End-to-end test", "✅ passed locally: pass (user, 2026-10-01; build not recorded)"] in info
     row = dict(zip(ops[0], ops[1]))
     assert row["Quasar, BF16 projection: evidence and gap"] == "TTsim run: t.py::a hang\nfork x"
 
@@ -1271,7 +1274,7 @@ def test_merge_entry_pass_decides_source_statuses_again(tmp_path):
             op_row(5, 1, op_code="C", **{"p150:status": "❌", "p150:evidence": "TT_FATAL at x.cpp:1"})]
     run = make_static_run(tmp_path, rows, [trace_row(1, 5, 1)])
     m = measured_seq(tmp_path / "m.csv", ["A", "M", "C"])
-    r = run_merge(str(run), str(m), "--entry-pass", "PCC 0.99", "--date", "2026-10-13")
+    r = run_merge(str(run), str(m), "--entry-pass", "PCC 0.99", "--date", "2026-10-13", "--build", "Release")
     assert r.returncode == 0, r.stdout
     assert "row 5: p150 status is ❌ but the passing entry test launched C" in r.stdout
     got = {x["id"]: (x["p150:status"], x["p150:evidence"]) for x in read(run / "op_table.csv")}
@@ -1282,7 +1285,8 @@ def test_merge_entry_pass_decides_source_statuses_again(tmp_path):
     assert got["4"][0] == "⚠️" and "launched no B" in got["4"][1]
     assert got["5"] == ("❌", "TT_FATAL at x.cpp:1")
     passes = json.loads((run / "run.json").read_text())["entry_test_passes"]
-    assert passes == {"by": "source:tracy on a local p150 device", "date": "2026-10-13", "result": "PCC 0.99"}
+    assert passes == {"by": "source:tracy on a local p150 device", "date": "2026-10-13", "result": "PCC 0.99",
+                      "build": "Release"}
     support_from_rows(run)
     v = validate(run)
     assert v.returncode == 0 and "WARNING" not in v.stdout, v.stdout
@@ -1294,7 +1298,7 @@ def test_merge_entry_pass_keeps_ci_record(tmp_path):
     del data["entry_test_ci"]
     data["entry_test_passes"] = {"ci": "perf.yaml: p150"}
     (run / "run.json").write_text(json.dumps(data))
-    run_merge(str(run), str(measured_seq(tmp_path / "m.csv", ["A"])), "--entry-pass", "PCC 0.99")
+    run_merge(str(run), str(measured_seq(tmp_path / "m.csv", ["A"])), "--entry-pass", "PCC 0.99", "--build", "Release")
     assert json.loads((run / "run.json").read_text())["entry_test_passes"]["ci"] == "perf.yaml: p150"
     assert "in CI (perf.yaml: p150) and on a local P150" in read(run / "op_table.csv")[0]["p150:evidence"]
 
@@ -2236,7 +2240,7 @@ def test_graph_entry_pass_decides_source_statuses(tmp_path):
             op_row(2, 1, op_code="Op2DeviceOperation", **{"p150:status": "⚠️", "p150:evidence": "no passing run"})]
     run = make_static_run(tmp_path, rows, [trace_row(1, 1, 2)])
     capture = graph_capture(tmp_path / "g.json", [("ttnn.op1", "ttnn::prim::op1", "Op1DeviceOperation", "x::Op1Factory")])
-    r = run_script("graph_report.py", str(capture), str(run), "--inferences", "1", "--entry-pass", "PCC 0.99",
+    r = run_script("graph_report.py", str(capture), str(run), "--inferences", "1", "--entry-pass", "PCC 0.99", "--build", "Release",
                    "--date", "2026-10-22")
     assert r.returncode == 0, r.stdout + r.stderr
     ops = read(run / "op_table.csv")
@@ -2291,7 +2295,7 @@ def test_info_bring_up_checks(tmp_path):
                                       "counts_as_host_op": "yes", "reason": "in forward"}], HOST_FIELDS)
     spec = sheet(run)
     info = info_rows(spec)
-    assert info["End-to-end test"] == "✅ passed: PCC 0.99 (source:tracy on a local p150 device, 2026-10-20)"
+    assert info["End-to-end test"] == "✅ passed locally: PCC 0.99 (source:tracy on a local p150 device, 2026-10-20; build not recorded)"
     host = info["Host fallback"].lstrip("'")
     assert host.startswith("⚠️ 5 of 100 ops on the host (5.0%), 4.20% of the time (Tracy live")
     assert info["Test hardware"] == "P150: arch blackhole, compute grid 13x10"
@@ -2402,16 +2406,16 @@ def test_graph_report_records_peak_dram_and_entry_failure(tmp_path):
     doc["graph"].append({"counter": len(doc["graph"]), "node_type": "buffer_allocate", "connections": [],
                          "params": {"type": "L1", "device_id": "0", "address": "7", "size": str(900 * mib)}})
     capture.write_text(json.dumps(doc))
-    r = run_script("graph_report.py", str(capture), str(run), "--inferences", "1", "--entry-fail", "PCC 0.5",
+    r = run_script("graph_report.py", str(capture), str(run), "--inferences", "1", "--entry-fail", "PCC 0.5", "--build", "Release",
                    "--date", "2026-10-22")
     assert r.returncode == 0, r.stdout + r.stderr
     data = json.loads((run / "run.json").read_text())
     assert data["graph_capture"]["peak_dram_mib"] == 500.0
     assert data["entry_test_failure"] == {"by": "source:graph on a local p150 device", "date": "2026-10-22",
-                                          "result": "PCC 0.5"}
+                                          "result": "PCC 0.5", "build": "Release"}
     assert read(run / "op_table.csv")[0]["p150:status"] == "✅"
     assert run_script("graph_report.py", str(capture), str(run), "--inferences", "1", "--entry-fail", "x",
-                      "--entry-pass", "y").returncode == 2
+                      "--build", "Release", "--entry-pass", "y").returncode == 2
 
 
 def test_status_legend_moves_to_count_notes(tmp_path):
@@ -2496,7 +2500,7 @@ def test_untraced_rows_keep_grid_blockers_unknown_and_ci_pass_stays_visible(tmp_
     (run / "run.json").write_text(json.dumps(data))
     info = info_rows(sheet(run))
     assert info["Blockers to a smaller grid"].startswith("⚠️ none in the static trace; 1 measured-only rows")
-    assert info["End-to-end test"] == "❌ failed: bad (source:graph on a local p150 device, 2026-10-22); CI: w.yml: job"
+    assert info["End-to-end test"] == "❌ failed: bad (source:graph on a local p150 device, 2026-10-22; build not recorded); CI: w.yml: job"
 
 
 def test_failure_after_a_local_pass_is_flagged(tmp_path):
@@ -2505,7 +2509,7 @@ def test_failure_after_a_local_pass_is_flagged(tmp_path):
     data["entry_test_passes"] = {"by": "source:tracy on a local p150 device", "date": "2026-10-20", "result": "ok"}
     (run / "run.json").write_text(json.dumps(data))
     capture = graph_capture(tmp_path / "g.json", [("ttnn.op1", "ttnn::prim::op1", "Op1DeviceOperation", "x::Op1Factory")])
-    r = run_script("graph_report.py", str(capture), str(run), "--inferences", "1", "--entry-fail", "bad",
+    r = run_script("graph_report.py", str(capture), str(run), "--inferences", "1", "--entry-fail", "bad", "--build", "Release",
                    "--date", "2026-10-21")
     assert r.returncode == 0 and "superseded run" in r.stdout
     assert "superseded run" in validate(run).stdout
@@ -2654,7 +2658,7 @@ def test_validator_wants_entry_test_ci(tmp_path):
 
 @pytest.mark.parametrize("ci, shown", [
     ({"value": "yes", "evidence": ".github/workflows/perf.yaml: p150"}, "✅ yes on P150: .github/workflows/perf.yaml: p150"),
-    ({"value": "no", "evidence": "only on n150"}, "⚠️ no on P150: only on n150"),
+    ({"value": "no", "evidence": "only on n150"}, "⚠️ no on P150, so any pass below is from a local run: only on n150"),
     ({"value": "n/a", "evidence": "never run"}, "n/a on P150: never run"),
     (None, "⏳ not checked"),
     ("yes", "⏳ not checked"),
@@ -2691,7 +2695,7 @@ def test_graph_decide_uses_recorded_capture_and_ci(tmp_path):
     (run / "op_table.csv").rename(run / "op_table.keep")
     capture = graph_capture(tmp_path / "g.json", [("ttnn.op1", "ttnn::prim::op1", "Op1DeviceOperation", "x::Op1Factory")])
     # Preflight: before the static phase there is no op_table.csv, so the pass decides nothing yet.
-    r = run_script("graph_report.py", str(capture), str(run), "--inferences", "1", "--entry-pass", "PCC 0.99",
+    r = run_script("graph_report.py", str(capture), str(run), "--inferences", "1", "--entry-pass", "PCC 0.99", "--build", "Release",
                    "--date", "2026-10-22")
     assert r.returncode == 0, r.stdout + r.stderr
     assert not (run / "op_table.csv").exists()
@@ -2721,3 +2725,46 @@ def test_preflight_is_documented_and_ttsim_runs_kernel_ops_only():
     assert "never an entry test or any whole-model test" in flow
     for path in [PLUGIN / "README.md", *(PLUGIN / "references").glob("*.md"), *SCRIPTS.glob("*.py")]:
         assert "ttsim-e2e" not in path.read_text(encoding="utf-8"), path.name
+
+
+def test_entry_pass_records_build_and_open_issue_downgrades_it(tmp_path):
+    run = make_static_run(tmp_path, [op_row(1, 1, op_code="Op1DeviceOperation")], [trace_row(1, 1, 1)])
+    capture = graph_capture(tmp_path / "g.json", [("ttnn.op1", "ttnn::prim::op1", "Op1DeviceOperation", "x::Op1Factory")])
+    args = [str(capture), str(run), "--inferences", "1", "--entry-pass", "PCC 0.99", "--date", "2026-10-23"]
+    assert "need --build" in run_script("graph_report.py", *args).stdout
+    assert run_script("graph_report.py", *args, "--build", "Release").returncode == 0
+    assert json.loads((run / "run.json").read_text())["entry_test_passes"]["build"] == "Release"
+    info = info_rows(sheet(run))
+    assert info["End-to-end test"].startswith("✅ passed locally: PCC 0.99")
+    assert info["End-to-end test"].endswith("Release build, TT_ASSERT off)")
+    assert info["Entry test issues"] == "✅ none open (searched 2026-10-01)"
+    data = json.loads((run / "run.json").read_text())
+    data["entry_test_issues"] = {"checked": "2026-10-24", "open": [
+        {"url": "https://github.com/tenstorrent/tt-metal/issues/61620", "title": "conv bias/weight dtype mismatch",
+         "effect": "TT_ASSERT fails at startup in assertion-enabled builds"}]}
+    (run / "run.json").write_text(json.dumps(data))
+    info = info_rows(sheet(run))
+    assert info["End-to-end test"].startswith("⚠️ passed locally: PCC 0.99")
+    assert "open #61620 reports it failing" in info["End-to-end test"]
+    assert info["Entry test issues"].startswith("⚠️ 1 open (searched 2026-10-24): #61620 conv bias/weight dtype")
+
+
+def test_analysed_by_on_info_and_validated(tmp_path):
+    run = make_static_run(tmp_path, [op_row(1, 1)], [trace_row(1, 1, 1)])
+    support_from_rows(run)
+    data = json.loads((run / "run.json").read_text())
+    data["analysed_by"].append({"agent": "Codex", "model": "gpt-x", "work": "source:graph", "date": "2026-10-23"})
+    (run / "run.json").write_text(json.dumps(data))
+    assert info_rows(sheet(run))["Analysed by"] == ("Claude Code (m): static trace, 2026-10-01; "
+                                                   "Codex (gpt-x): source:graph, 2026-10-23")
+    assert validate(run).returncode == 0
+    data["analysed_by"] = [{"agent": "Codex"}]
+    data["entry_test_passes"] = {"by": "user", "date": "2026-10-01", "result": "pass", "build": "Fast"}
+    (run / "run.json").write_text(json.dumps(data))
+    out = validate(run).stdout
+    assert "analysed_by must be a list of" in out and "build 'Fast' not in" in out
+    del data["analysed_by"], data["entry_test_issues"]
+    data["entry_test_passes"]["build"] = ""
+    (run / "run.json").write_text(json.dumps(data))
+    out = validate(run).stdout
+    assert "has no analysed_by" in out and "has no entry_test_issues" in out and "entry_test_passes has no build" in out

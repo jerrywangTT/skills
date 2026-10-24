@@ -37,7 +37,7 @@ import pathlib
 import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-from merge_measured import decide_source_statuses, record_entry_result  # noqa: E402
+from merge_measured import add_build_argument, decide_source_statuses, record_entry_result  # noqa: E402
 from opa_schema import (  # noqa: E402
     GRAPH_HOST_TRANSFERS_COLUMNS, GRAPH_OPS_COLUMNS, ci_job, latest_entry_failure, op_table_columns, read_csv,
     run_targets, write_csv,
@@ -200,6 +200,7 @@ def main() -> int:
                         help="the entry test passed in this run; RESULT is its pass line (for example the PCC)")
     parser.add_argument("--entry-fail", metavar="RESULT",
                         help="the entry test failed in this run; RESULT is its failure line")
+    add_build_argument(parser)
     args = parser.parse_args()
     if args.decide:
         return decide(args.run_dir)
@@ -208,6 +209,9 @@ def main() -> int:
         return 2
     if args.entry_pass and args.entry_fail:
         print("ERROR: give --entry-pass or --entry-fail, not both")
+        return 2
+    if (args.entry_pass or args.entry_fail) and not args.build:
+        print("ERROR: --entry-pass and --entry-fail need --build, the tt-metal build type the test ran on")
         return 2
     if args.inferences < 1:
         print("ERROR: --inferences must be at least 1")
@@ -240,7 +244,7 @@ def main() -> int:
         "peak_dram_mib_per_device": {d: round(b / 2**20, 1) for d, b in sorted(dram.items())},
     }
     source, destinations = run_targets(run)
-    record_entry_result(run, source, args.date, "source:graph", args.entry_pass, args.entry_fail)
+    record_entry_result(run, source, args.date, "source:graph", args.entry_pass, args.entry_fail, args.build)
     op_path = args.run_dir / "op_table.csv"
     if args.entry_pass and op_path.exists():
         ops = read_csv(op_path)

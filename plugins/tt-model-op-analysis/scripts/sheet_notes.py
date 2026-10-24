@@ -250,6 +250,13 @@ CI_NOTE = ("Whether a CI workflow or pipeline list runs the entry test on the so
            "✅ yes: the job is named. ⚠️ no: nothing in CI guards this test on this profile, so a pass rests on "
            "local runs only, and a later commit can break it unnoticed. n/a: a Quasar source, whose entry test "
            "is read, never run.")
+ISSUES_NOTE = ("Open tt-metal issues that report this entry test failing (any build, any profile), from a search at "
+               "setup. While one is open the end-to-end test shows ⚠️ even after a local pass: a Release build "
+               "compiles TT_ASSERT out and can pass where an assertion-enabled build fails.")
+AGENT_NOTE = ("The coding agents that produced this analysis (for example Claude Code or Codex), with the model, "
+              "the work each did and when.")
+E2E_NOTE = ("The latest local run of the entry test and the tt-metal build it ran on. Release compiles TT_ASSERT out, "
+            "so a pass there can hide an assertion that Debug and RelWithDebInfo builds hit.")
 CONFIDENCE_NOTE = ("Confidence in the kernel-op list (device op and program factory per launch). high: a graph "
                    "capture ran. medium: Tracy or the kernel cache ran, no graph capture. low: only the static "
                    "trace.")

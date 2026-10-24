@@ -14,7 +14,7 @@ import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from opa_schema import (  # noqa: E402
-    ALWAYS, CALL_SITE, CALL_TRACE_COLUMNS, CI_KEY, CI_VALUES, CONFIDENCE_VALUES, CONFIG_KEYS, CONFIG_VALUES,
+    ALWAYS, BUILD_TYPES, CALL_SITE, CALL_TRACE_COLUMNS, CI_KEY, CI_VALUES, CONFIDENCE_VALUES, CONFIG_KEYS, CONFIG_VALUES,
     GRID_KEYWORDS,
     latest_entry_failure, HOST_OP_VALUES, HOST_OPS_COLUMNS, LAUNCH_PROFILES,
     LEGACY_RESULTS, NOT_CHECKED, NOT_TRACED, OP_SUPPORT_VALUES, ORIGIN_VALUES, PORT_BLOCKERS_COLUMNS, RESULT_STATUS, ROW_PREFIX,
@@ -261,6 +261,32 @@ def validate(run_dir: pathlib.Path) -> tuple[list[str], list[str], dict[str, tup
         warnings.append(f"run.json has no {CI_KEY}; record it (run-setup.md, setup order)")
     elif not isinstance(ci, dict) or ci.get("value") not in CI_VALUES or not str(ci.get("evidence", "")).strip():
         errors.append(f"run.json {CI_KEY} must be {{\"value\": one of {CI_VALUES}, \"evidence\": \"...\"}}")
+    for key in ("entry_test_passes", "entry_test_failure"):
+        record = run.get(key) or {}
+        if record.get("by"):
+            build = record.get("build", "")
+            if not build:
+                warnings.append(f"run.json {key} has no build; record the tt-metal build type it ran on "
+                                "(measured-source.md, step 1)")
+            elif build not in BUILD_TYPES:
+                errors.append(f"run.json {key} build '{build}' not in {BUILD_TYPES}")
+    issues = run.get("entry_test_issues")
+    if issues is None:
+        warnings.append("run.json has no entry_test_issues; search the open issues of the entry test "
+                        "(run-setup.md, setup order)")
+    elif (not isinstance(issues, dict) or not str(issues.get("checked", "")).strip()
+          or not isinstance(issues.get("open"), list)
+          or any(not isinstance(i, dict) or not all(str(i.get(f, "")).strip() for f in ("url", "title", "effect"))
+                 for i in issues["open"])):
+        errors.append("run.json entry_test_issues must be {\"checked\": \"YYYY-MM-DD\", \"open\": "
+                      "[{\"url\", \"title\", \"effect\"}, ...]}")
+    agents = run.get("analysed_by")
+    if not agents:
+        warnings.append("run.json has no analysed_by; record the agent that did this work (SKILL.md, Rules)")
+    elif not isinstance(agents, list) or any(
+            not isinstance(a, dict) or not all(str(a.get(f, "")).strip() for f in ("agent", "model", "work", "date"))
+            for a in agents):
+        errors.append("run.json analysed_by must be a list of {\"agent\", \"model\", \"work\", \"date\"}")
     layers = run.get("configurable_layers")
     if isinstance(layers, dict) and layers.get("value") in ("yes", "partial") and not str(layers.get("setting", "")).strip():
         errors.append("run.json configurable_layers needs \"setting\": the environment variable or test parameter "

@@ -27,13 +27,13 @@ import re
 import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-from sheet_notes import CI_NOTE, CONFIDENCE_NOTE, METHOD_NOTES, STATUS_NOTES, column_note, tab_description  # noqa: E402
+from sheet_notes import AGENT_NOTE, CI_NOTE, CONFIDENCE_NOTE, E2E_NOTE, ISSUES_NOTE, METHOD_NOTES, STATUS_NOTES, column_note, tab_description  # noqa: E402
 from opa_schema import (  # noqa: E402
     ALWAYS, CALL_SITE, CALL_TRACE_TAB, CI_KEY, ci_job, LLK_GAPS_TAB, CONFIDENCE_DISPLAY, DEVICE_OPS_TAB, GRID_KEYWORDS,
     KERNEL_OPS_TAB, LAUNCH_PROFILES, METHOD_ITEMS, METHOD_LABELS, NOT_CHECKED, NOT_TRACED, OP_SUPPORT_LABELS, OP_TABLE_TAB,
     ROW_PREFIX, SHEET_TABS, SOURCE_METHODS, STATUS_COUNT_FIELDS, STATUS_VALUES,
     TAB_METHOD, TARGET_LABELS, TEST_TARGETS, TTSIM_TESTS_TAB, column_width, confidence, display_header,
-    latest_entry_failure, methods_used, read_csv, read_header, run_targets, split_evidence,
+    build_label, latest_entry_failure, methods_used, read_csv, read_header, run_targets, split_evidence,
 )
 
 HEADER_GREY = {"red": 0.9, "green": 0.9, "blue": 0.9}
@@ -504,19 +504,55 @@ CONFIG_MARK = {"yes": "✅ yes", "no": "❌ no", "partial": "⚠️ partial", "n
 GRID_OVERRIDE = "TT_METAL_CORE_GRID_OVERRIDE_TODEPRECATE"
 
 
+def open_issues(run: dict) -> list[dict]:
+    return (run.get("entry_test_issues") or {}).get("open") or []
+
+
+def issue_ref(issue: dict) -> str:
+    number = issue.get("url", "").rstrip("/").rsplit("/", 1)[-1]
+    return f"#{number}" if number.isdigit() else issue.get("url", "")
+
+
 def entry_test_state(run: dict) -> str:
     passes, failure = run.get("entry_test_passes") or {}, latest_entry_failure(run)
     if failure:
         ci = f"; CI: {ci_job(run)}" if ci_job(run) else ""
-        return f"❌ failed: {failure['result']} ({failure['by']}, {failure['date']}){ci}"
+        return (f"❌ failed: {failure['result']} ({failure['by']}, {failure['date']}; "
+                f"{build_label(failure.get('build', ''))}){ci}")
     if passes:
         parts = []
         if passes.get("result"):
-            parts.append(f"{passes['result']} ({passes.get('by', '')}, {passes.get('date', '')})")
+            parts.append(f"{passes['result']} ({passes.get('by', '')}, {passes.get('date', '')}; "
+                         f"{build_label(passes.get('build', ''))})")
         if ci_job(run):
             parts.append(f"CI: {ci_job(run)}")
-        return "✅ passed: " + "; ".join(parts)
+        issues = open_issues(run)
+        where = " locally" if passes.get("result") and not ci_job(run) else ""
+        # A pass does not close an open issue that reports the test failing, for example in another build.
+        mark = f"⚠️ passed{where}" if issues else f"✅ passed{where}"
+        if issues:
+            parts.append("open " + ", ".join(issue_ref(i) for i in issues) + " reports it failing (Entry test issues)")
+        return f"{mark}: " + "; ".join(parts)
     return "not run on a device in this analysis"
+
+
+def issues_state(run: dict) -> str:
+    record = run.get("entry_test_issues")
+    if not record:
+        return "⏳ not checked"
+    issues = open_issues(run)
+    if not issues:
+        return f"✅ none open (searched {record.get('checked', '')})"
+    listed = "; ".join(f"{issue_ref(i)} {i.get('title', '')}: {i.get('effect', '')}".strip() for i in issues)
+    return f"⚠️ {len(issues)} open (searched {record.get('checked', '')}): {listed}"
+
+
+def analysed_by_state(run: dict) -> str:
+    entries = run.get("analysed_by") or []
+    if not entries:
+        return "not recorded"
+    return "; ".join(f"{e.get('agent', '')} ({e.get('model', '')}): {e.get('work', '')}, {e.get('date', '')}"
+                     for e in entries)
 
 
 HOST_SHARE_WARN = 5.0
@@ -587,7 +623,10 @@ CI_MARK = {"yes": "✅ yes", "no": "⚠️ no", "n/a": "n/a"}
 def ci_state(run: dict, source: str) -> str:
     entry = run.get(CI_KEY)
     if isinstance(entry, dict) and entry.get("value") in CI_MARK:
-        return f"{CI_MARK[entry['value']]} on {label(source)}: {entry.get('evidence', '')}"
+        # Without a CI job the end-to-end result below can only come from a local run; say so, or the two read
+        # as a contradiction.
+        local = ", so any pass below is from a local run" if entry["value"] == "no" else ""
+        return f"{CI_MARK[entry['value']]} on {label(source)}{local}: {entry.get('evidence', '')}"
     job = ci_job(run)
     return f"✅ yes on {label(source)}: {job}" if job else "⏳ not checked"
 
@@ -643,7 +682,7 @@ def info_view(run_dir: pathlib.Path, run: dict, targets: tuple[str, ...], op_col
             ("Entry test", run.get("test")), ("Entry test in CI", run.get("test") and ci_state(run, source)),
             ("Source", label(source)),
             ("Destinations", ", ".join(label(d) for d in destinations)), ("tt-metal commit", commit),
-            ("TTsim commit", run.get("ttsim_commit"))]
+            ("TTsim commit", run.get("ttsim_commit")), ("Analysed by", analysed_by_state(run))]
     rows += [[name, cell(str(v))] for name, v in meta if v]
 
     rows.append([])
@@ -651,6 +690,7 @@ def info_view(run_dir: pathlib.Path, run: dict, targets: tuple[str, ...], op_col
     rows.append(["Bring-up checks"])
     checks = [
         ("End-to-end test", entry_test_state(run)),
+        ("Entry test issues", issues_state(run)),
         ("Host fallback", host_fallback_state(run_dir, run)),
         ("Test hardware", f"{label(source)}: {profile}" if profile else label(source)),
         ("Peak DRAM", peak_dram_state(run_dir, run)),
@@ -671,6 +711,7 @@ def info_view(run_dir: pathlib.Path, run: dict, targets: tuple[str, ...], op_col
     label_notes = config_notes(run) | {METHOD_LABELS[m]: METHOD_NOTES[m] for m in SOURCE_METHODS}
     label_notes["Confidence"] = CONFIDENCE_NOTE
     label_notes["Entry test in CI"] = CI_NOTE
+    label_notes |= {"Entry test issues": ISSUES_NOTE, "Analysed by": AGENT_NOTE, "End-to-end test": E2E_NOTE}
     cell_notes = [(n, 0, label_notes[r[0]]) for n, r in enumerate(rows) if r and r[0] in label_notes]
 
     # Counts: formulas over the ttnn calls tab, so a reader can trace every number.

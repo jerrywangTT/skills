@@ -62,6 +62,18 @@ CALL_SITE = re.compile(r"[\w./-]+\.(?:py|cpp|hpp|cc|h):\d+")
 GRID_KEYWORDS = ("automatic", "none")
 
 
+# tt-metal build types (build_metal.sh --build-type). CMakeLists.txt defines DEBUG, and so compiles
+# TT_ASSERT in, only for Debug and RelWithDebInfo; a pass on Release can hide a failing assertion.
+BUILD_TYPES = ("Release", "RelWithDebInfo", "Debug", "ASan", "TSan", "ASanCoverage")
+BUILD_ASSERTS = {"Release": "TT_ASSERT off", "RelWithDebInfo": "TT_ASSERT on", "Debug": "TT_ASSERT on"}
+
+
+def build_label(build: str) -> str:
+    if not build:
+        return "build not recorded"
+    return f"{build} build, {BUILD_ASSERTS[build]}" if build in BUILD_ASSERTS else f"{build} build"
+
+
 def latest_entry_failure(run: dict) -> dict | None:
     """The recorded local failure of the entry test when it is not older than the latest local pass."""
     failure, passes = run.get("entry_test_failure"), run.get("entry_test_passes") or {}

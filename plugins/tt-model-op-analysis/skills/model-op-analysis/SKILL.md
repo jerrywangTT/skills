@@ -71,6 +71,8 @@ resolve every `<plugin-root>/...` path against it.
 
 ## Rules
 
+- Before ending a session that changed the run, append your entry to `run.json` `analysed_by`
+  (agent, model, the work done, date; run-setup.md, section 3). Never edit another agent's entry.
 - Ask one decision per turn, recommended option first; never infer choices from open files, IDE
   state or earlier runs.
 - Read tt-metal sources as `git show <sha>:<path>`; never the working tree, except an approved

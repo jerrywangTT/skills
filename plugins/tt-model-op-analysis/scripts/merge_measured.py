@@ -22,7 +22,7 @@ import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from opa_schema import (  # noqa: E402
-    ALWAYS, LAUNCH_PROFILES, NOT_TRACED, TARGET_LABELS, TEST_TARGETS, ci_job, op_table_columns, read_csv,
+    ALWAYS, BUILD_TYPES, LAUNCH_PROFILES, NOT_TRACED, TARGET_LABELS, TEST_TARGETS, ci_job, op_table_columns, read_csv,
     run_targets, write_csv,
 )
 
@@ -90,24 +90,33 @@ def merge(rows: list[dict], measured: list[dict], source: str, destinations: lis
     return out
 
 
-def entry_pass_record(previous: dict, source: str, result: str, date: str, item: str = "source:tracy") -> dict:
+def entry_pass_record(previous: dict, source: str, result: str, date: str, item: str = "source:tracy",
+                      build: str = "") -> dict:
     """entry_test_passes with this local run added; a CI record already there is kept."""
     record = {k: v for k, v in previous.items() if k == "ci"}
-    record.update({"by": f"{item} on a local {source} device", "date": date, "result": result})
+    record.update({"by": f"{item} on a local {source} device", "date": date, "result": result, "build": build})
     return record
 
 
-def record_entry_result(run: dict, source: str, date: str, item: str, passed: str | None, failed: str | None) -> None:
+def record_entry_result(run: dict, source: str, date: str, item: str, passed: str | None, failed: str | None,
+                        build: str = "") -> None:
     """Record the entry test's outcome in this run. A pass replaces an earlier local failure; a failure is kept
     beside earlier passes, and the later of the two decides what the sheet shows."""
     if passed:
-        run["entry_test_passes"] = entry_pass_record(run.get("entry_test_passes") or {}, source, passed, date, item)
+        run["entry_test_passes"] = entry_pass_record(run.get("entry_test_passes") or {}, source, passed, date, item,
+                                                     build)
         run.pop("entry_test_failure", None)
     elif failed:
-        run["entry_test_failure"] = {"by": f"{item} on a local {source} device", "date": date, "result": failed}
+        run["entry_test_failure"] = {"by": f"{item} on a local {source} device", "date": date, "result": failed,
+                                     "build": build}
         if (run.get("entry_test_passes") or {}).get("by"):
             print("WARNING: source statuses decided from the earlier local pass now rest on a superseded run; "
                   "rerun the entry test or decide them again")
+
+
+def add_build_argument(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--build", choices=BUILD_TYPES,
+                        help="CMAKE_BUILD_TYPE of the tt-metal build the entry test ran on; Release compiles TT_ASSERT out")
 
 
 def decide_source_statuses(rows: list[dict], measured: list[dict], source: str, inferences: int,
@@ -162,9 +171,13 @@ def main() -> int:
     parser.add_argument("--entry-fail", metavar="RESULT",
                         help="the entry test failed in this run; RESULT is its failure line")
     parser.add_argument("--date", default=datetime.date.today().isoformat(), help="date of the measured run")
+    add_build_argument(parser)
     args = parser.parse_args()
     if args.entry_pass and args.entry_fail:
         print("ERROR: give --entry-pass or --entry-fail, not both")
+        return 2
+    if (args.entry_pass or args.entry_fail) and not args.build:
+        print("ERROR: --entry-pass and --entry-fail need --build, the tt-metal build type the test ran on")
         return 2
     run_path = args.run_dir / "run.json"
     run = json.loads(run_path.read_text(encoding="utf-8"))
@@ -176,7 +189,7 @@ def main() -> int:
     except ValueError as exc:
         print(f"ERROR: {exc}")
         return 2
-    record_entry_result(run, source, args.date, "source:tracy", args.entry_pass, args.entry_fail)
+    record_entry_result(run, source, args.date, "source:tracy", args.entry_pass, args.entry_fail, args.build)
     if args.entry_pass:
         for warning in decide_source_statuses(merged, measured, source, args.inferences, run["entry_test_passes"],
                                               ci_job(run)):

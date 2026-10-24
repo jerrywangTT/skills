@@ -42,7 +42,12 @@ another host, or open the cache in the extension ("Cache API Analyzer: Analyze a
 
 ## Steps
 
-1. Run `python3 <plugin-root>/scripts/same_commit.py <run dir> --tt-metal <checkout>`. On failure,
+1. Read the build type of the checkout the runs will use: `CMAKE_BUILD_TYPE` in
+   `<checkout>/build/CMakeCache.txt` (`build` links to `build_<type>`). Every `--entry-pass` and
+   `--entry-fail` below passes it as `--build <type>`. tt-metal compiles `TT_ASSERT` only in Debug
+   and RelWithDebInfo builds (`-DDEBUG`, CMakeLists.txt), so a Release pass can hide an assertion
+   an issue reports; the sheet shows the build next to the result.
+   Then run `python3 <plugin-root>/scripts/same_commit.py <run dir> --tt-metal <checkout>`. On failure,
    offer: check out the recorded commit and rebuild, or start a new static run. Never measure on
    another commit.
 2. Probe the device: `python3 <plugin-root>/scripts/probe_device.py` through `tt-device-mcp`. The
@@ -114,8 +119,8 @@ another host, or open the cache in the extension ("Cache API Analyzer: Analyze a
    in Tracy become `static+measured`; op codes only Tracy shows become `measured` rows after the
    static row that ran just before them, with launches per inference, `call_site` and
    `grid_dependency` `not traced`, and no launch count on any destination.
-   When the entry test passed, add `--entry-pass "<pass line>"` (for example `PCC 0.990856`) and
-   `--date <YYYY-MM-DD>` of the run. The pass is then a recorded run (`target-status.md`): the
+   When the entry test passed, add `--entry-pass "<pass line>"` (for example `PCC 0.990856`),
+   `--date <YYYY-MM-DD>` of the run and `--build <type>` (step 1). The pass is then a recorded run (`target-status.md`): the
    script adds it to `run.json` `entry_test_passes` and decides every source `⚠️` row again, since
    that `⚠️` only said no passing run was found. A row the test launched becomes `✅`; a
    conditional row whose op code ran fewer times than its static rows allow stays `⚠️` (Tracy does
