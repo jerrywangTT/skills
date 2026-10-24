@@ -748,6 +748,9 @@ def test_the_tip_rerun_runs_only_the_failing_ids_in_its_own_worktree_and_removes
     out = (d._tip_dir(key) / "out").read_text()
     assert rc.read_text().strip() == "0", out
     assert "1 passed" in out and "test_other" not in out
+    # The runner removes its worktree just after writing rc: wait for that, not only rc.
+    while (d._tip_dir(key) / "wt").exists() and time.time() < deadline:
+        time.sleep(0.2)
     assert not (d._tip_dir(key) / "wt").exists()
     wts = subprocess.run([*git, "worktree", "list"], capture_output=True, text=True).stdout
     assert str(d._tip_dir(key)) not in wts
