@@ -191,7 +191,7 @@ python -m readiness_check.run_vllm_server \
 
 The runner owns server launch, health polling, check execution, and shutdown. It writes `server.log`, `sampling_tests.log`, `vllm_qualitative_outputs.json`, primary single-user raw `vllm_result.json`, primary normalized `vllm_benchmark.json`, `vllm_benchmark.log`, and by default the secondary CI serving-burst files `vllm_ci_serving_result.json`, `vllm_ci_serving_benchmark.json`, and `vllm_ci_serving_benchmark.log` under `<model_dir>/readiness_vllm/`.
 
-`--stages` accepts `serve`, `sampling`, `qualitative`, `benchmark`, `prefix_cache`, and `prefill_burst`. The default runs `serve,sampling,qualitative,benchmark`; add the last two for the required prefix-cache and batched-prefill evidence. Pass `--enable-prefix-caching` on launch, or `--server-log` when attaching to a hand-launched server, so the run summary records the prefix-caching state. To hold a server open while iterating:
+`--stages` accepts `serve`, `sampling`, `qualitative`, `benchmark`, `prefix_cache`, and `prefill_burst`. The default runs `serve,sampling,qualitative,benchmark`; add the last two for the required prefix-cache and batched-prefill evidence. Pass `--enable-prefix-caching` on launch, or `--server-log` when attaching to a hand-launched server, so the run summary records the prefix-caching state. Set `VLLM_SERVER_DEV_MODE=1` in the server environment so `/reset_prefix_cache` exists; the `prefix_cache` stage needs it for cold references and the long-resume comparison. To hold a server open while iterating:
 
 ```bash
 python -m readiness_check.run_vllm_server \

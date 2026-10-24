@@ -24,11 +24,14 @@ Stages:
                 profile as a secondary CI/capacity artifact. Defaults to greedy
                 ``--temperature 0.0``; opt into exact server-generation-config
                 behavior with ``--benchmark-use-server-generation-config``.
-  prefix_cache  Send one ~2300-token prompt cold, then warm, reset the prefix
-                cache, and repeat. Records /metrics prefix-cache counter deltas,
-                TTFT, first-token logprobs and greedy output per request, runs
-                the shared-prefix ``vllm bench serve`` workload, and writes
-                ``prefix_cache_check.json`` with a pass/fail verdict.
+  prefix_cache  Send one 2305-token prompt cold, then warm, reset the prefix
+                cache, and repeat; then append a 256-token new suffix so the
+                resume is a long continuation and compare it with a cold run
+                after another reset (needs VLLM_SERVER_DEV_MODE=1 on the server
+                for /reset_prefix_cache). Records /metrics prefix-cache counter
+                deltas, TTFT, first-token logprobs and greedy output per
+                request, runs the shared-prefix ``vllm bench serve`` workload,
+                and writes ``prefix_cache_check.json`` with a pass/fail verdict.
   prefill_burst Run 32 x 128-token prompts at concurrency 32 so the scheduler
                 forms multi-row prefill steps; writes
                 ``vllm_prefill_burst_benchmark.json``. Pass
@@ -135,6 +138,7 @@ ALL_STAGES: tuple[str, ...] = (*DEFAULT_STAGES, STAGE_PREFIX_CACHE, STAGE_PREFIL
 # deltas from /metrics around every request.
 DEFAULT_PREFIX_CACHE_PROMPT_TOKENS = 2305
 DEFAULT_PREFIX_CACHE_OUTPUT_TOKENS = 64
+DEFAULT_PREFIX_CACHE_RESUME_SUFFIX_TOKENS = 256
 PREFIX_CACHE_THRESHOLDS: dict[str, float] = {
     "warm_hit_rate_min": 0.9,
     "cold_hit_rate_max": 0.05,
@@ -872,19 +876,30 @@ def _reset_prefix_cache(server_url: str) -> bool:
     return resp.status_code == 200
 
 
+def _natural_text(tokenizer: Any, pieces: List[str], target_tokens: int, *, reverse: bool = False) -> str:
+    order = list(reversed(pieces)) if reverse else list(pieces)
+    text = ""
+    index = 0
+    while len(tokenizer.encode(text)) < target_tokens:
+        text = (text + "\n\n" if text else "") + order[index % len(order)]
+        index += 1
+    token_ids = tokenizer.encode(text)[:target_tokens]
+    return tokenizer.decode(token_ids, skip_special_tokens=True)
+
+
 def _build_prefix_cache_prompt(tokenizer: Any, prompts_file: Path, target_tokens: int) -> tuple[str, int]:
     """Deterministic natural text of about `target_tokens` tokens."""
     pieces = [p.strip() for p in prompts_file.read_text().split("\n\n") if p.strip()]
     if not pieces:
         raise RuntimeError(f"No prompts found in {prompts_file}")
-    text = ""
-    index = 0
-    while len(tokenizer.encode(text)) < target_tokens:
-        text = (text + "\n\n" if text else "") + pieces[index % len(pieces)]
-        index += 1
-    token_ids = tokenizer.encode(text)[:target_tokens]
-    prompt = tokenizer.decode(token_ids, skip_special_tokens=True)
+    prompt = _natural_text(tokenizer, pieces, target_tokens)
     return prompt, len(tokenizer.encode(prompt))
+
+
+def _build_resume_suffix(tokenizer: Any, prompts_file: Path, suffix_tokens: int) -> str:
+    """Different natural text appended to the shared prefix so the resume is a long continuation."""
+    pieces = [p.strip() for p in prompts_file.read_text().split("\n\n") if p.strip()]
+    return "\n\n" + _natural_text(tokenizer, pieces, suffix_tokens, reverse=True)
 
 
 def _stream_completion(*, server_url: str, hf_model: str, prompt: str, max_tokens: int) -> dict[str, Any]:
@@ -998,6 +1013,35 @@ def _prefix_cache_verdict(record: dict[str, Any], thresholds: dict[str, float]) 
             reasons.append(
                 f"shared-prefix benchmark hit rate {shared['hit_rate']:.2f} < {thresholds['shared_prefix_hit_rate_min']}"
             )
+    resume_warm = [r for r in requests_log if r["kind"] == "resume_warm"]
+    resume_cold = [r for r in requests_log if r["kind"] == "resume_cold"]
+    if resume_warm and resume_cold:
+        warm_r, cold_r = resume_warm[0], resume_cold[0]
+        if warm_r["hit_rate"] is None or warm_r["hit_rate"] <= 0.5:
+            reasons.append(f"resume_warm: shared prefix was not served from the cache (hit rate {warm_r['hit_rate']})")
+        if cold_r["hit_rate"] is not None and cold_r["hit_rate"] > thresholds["cold_hit_rate_max"]:
+            reasons.append(f"resume_cold: reference still hit the cache (hit rate {cold_r['hit_rate']:.2f})")
+        if not warm_r["tokens"] or not cold_r["tokens"]:
+            reasons.append("long resume: no tokens returned")
+        else:
+            if warm_r["tokens"][0] != cold_r["tokens"][0]:
+                reasons.append("long resume: first token differs between the resumed and the cold request")
+            warm_lp = warm_r["token_logprobs"][0] if warm_r["token_logprobs"] else None
+            cold_lp = cold_r["token_logprobs"][0] if cold_r["token_logprobs"] else None
+            if warm_lp is None or cold_lp is None:
+                reasons.append("long resume: first-token logprob missing")
+            elif abs(warm_lp - cold_lp) > thresholds["first_token_logprob_delta_max"]:
+                reasons.append(
+                    f"long resume: first-token logprob delta {abs(warm_lp - cold_lp):.3f} > "
+                    f"{thresholds['first_token_logprob_delta_max']}"
+                )
+            identical = _common_prefix_len(warm_r["tokens"], cold_r["tokens"])
+            warm_r["greedy_identical_through"] = identical
+            if identical < min(len(cold_r["tokens"]), int(thresholds["greedy_identical_min_tokens"])):
+                reasons.append(
+                    f"long resume: greedy output diverges after {identical} tokens "
+                    f"(< {int(thresholds['greedy_identical_min_tokens'])})"
+                )
     return ("pass" if not reasons else "fail"), reasons
 
 
@@ -1024,6 +1068,7 @@ def _run_prefix_cache_check(
     server_log: Optional[Path],
     shared_prefix_bench: bool,
     additional_benchmark_args: List[str],
+    resume_suffix_tokens: int = DEFAULT_PREFIX_CACHE_RESUME_SUFFIX_TOKENS,
 ) -> dict[str, Any]:
     print("\n=== Running prefix-cache check ===")
     tokenizer = AutoTokenizer.from_pretrained(hf_model)
@@ -1032,9 +1077,9 @@ def _run_prefix_cache_check(
 
     requests_log: List[dict[str, Any]] = []
 
-    def one(label: str, kind: str) -> None:
+    def one(label: str, kind: str, text: str = prompt) -> None:
         before = _fetch_prefix_cache_counters(server_url)
-        out = _stream_completion(server_url=server_url, hf_model=hf_model, prompt=prompt, max_tokens=output_tokens)
+        out = _stream_completion(server_url=server_url, hf_model=hf_model, prompt=text, max_tokens=output_tokens)
         after = _fetch_prefix_cache_counters(server_url)
         entry = {
             "label": label,
@@ -1058,9 +1103,26 @@ def _run_prefix_cache_check(
     one("warm2", "warm")
     reset_ok = _reset_prefix_cache(server_url)
     print(f"  reset_prefix_cache: {'ok' if reset_ok else 'unavailable'}")
+    long_resume: Optional[dict[str, Any]] = None
     if reset_ok:
         one("cold2", "cold")
         one("warm3", "warm")
+        suffix = _build_resume_suffix(tokenizer, prompts_file, resume_suffix_tokens)
+        extended = prompt + suffix
+        one("resume_warm", "resume_warm", extended)
+        if _reset_prefix_cache(server_url):
+            one("resume_cold", "resume_cold", extended)
+            long_resume = {
+                "continuation_tokens": len(tokenizer.encode(extended)) - measured_tokens,
+                "checked": True,
+            }
+        else:
+            long_resume = {"checked": False, "reason": "reset_prefix_cache failed before the cold reference"}
+    else:
+        long_resume = {
+            "checked": False,
+            "reason": "reset_prefix_cache unavailable; set VLLM_SERVER_DEV_MODE=1 on the server to enable it",
+        }
 
     shared: Optional[dict[str, Any]] = None
     if shared_prefix_bench:
@@ -1101,6 +1163,7 @@ def _run_prefix_cache_check(
         "apc_log_enabled": _server_log_apc_state(server_log),
         "reset_prefix_cache_before_cold1": reset_before,
         "reset_prefix_cache_available": reset_ok,
+        "long_resume": long_resume,
         "requests": requests_log,
         "shared_prefix_bench": shared,
     }
@@ -1447,6 +1510,16 @@ def _main() -> None:
         help=f"Greedy output length for the prefix_cache stage (default {DEFAULT_PREFIX_CACHE_OUTPUT_TOKENS}).",
     )
     parser.add_argument(
+        "--prefix-cache-resume-suffix-tokens",
+        type=int,
+        default=DEFAULT_PREFIX_CACHE_RESUME_SUFFIX_TOKENS,
+        help=(
+            "New-suffix length appended to the shared prefix for the long-resume comparison "
+            f"(default {DEFAULT_PREFIX_CACHE_RESUME_SUFFIX_TOKENS}). Needs /reset_prefix_cache, which vLLM "
+            "exposes with VLLM_SERVER_DEV_MODE=1."
+        ),
+    )
+    parser.add_argument(
         "--prefix-cache-shared-bench",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -1649,6 +1722,7 @@ def _main() -> None:
                     server_log=apc_log_source,
                     shared_prefix_bench=args.prefix_cache_shared_bench,
                     additional_benchmark_args=additional_benchmark_args,
+                    resume_suffix_tokens=args.prefix_cache_resume_suffix_tokens,
                 )
                 run_summary["outputs"]["prefix_cache"] = str(output_dir / "prefix_cache_check.json")
             elif stage == STAGE_PREFILL_BURST:

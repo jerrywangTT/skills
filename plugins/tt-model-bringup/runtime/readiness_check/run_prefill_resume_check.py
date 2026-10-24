@@ -18,7 +18,8 @@ W is ``[s, s + window)`` plus the final position. Two negative controls run
 where the window is wide enough and must fail the agreement gates:
 
   no_history    the continuation runs over an empty cache
-  fresh_suffix  the suffix is prefilled as a fresh request at position 0
+  fresh_suffix  the suffix is prefilled as a fresh request at position 0,
+                through the same driver so only the window's logits move
 
 CLI:
     python -m readiness_check.run_prefill_resume_check \\
@@ -196,8 +197,9 @@ def run_case(
                 control = generator.prefill_logits_continuation(tokens, start, positions=positions, prefill_prefix=False)
                 control = _select_positions(control, start, positions, length)
             elif name == "fresh_suffix":
-                suffix = generator.prefill_logits(tokens[start:])
-                control = _select_positions(suffix, start, positions, length)
+                shifted = [p - start for p in positions]
+                suffix = generator.prefill_logits_continuation(tokens[start:], 0, positions=shifted, prefill_prefix=True)
+                control = _select_positions(suffix, 0, shifted, length - start)
             else:
                 raise ValueError(f"unknown control {name!r}; expected one of {CONTROL_NAMES}")
             control_stats = compare_logits(reference, control)

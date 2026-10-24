@@ -48,7 +48,7 @@ def full_evidence(model: Path, **overrides) -> None:
     write(model / 'readiness_vllm/vllm_run_summary.json',
           overrides.get('summary', {'enable_prefix_caching': True, 'apc_log_enabled': True}))
     write(model / 'readiness_vllm/prefix_cache_check.json',
-          overrides.get('served', {'status': 'pass', 'reasons': []}))
+          overrides.get('served', {'status': 'pass', 'reasons': [], 'long_resume': {'checked': True}}))
     write(model / 'readiness/prefill_resume_check.json', overrides.get('resume', resume()))
     if overrides.get('burst', burst()) is not None:
         write(model / 'readiness_vllm/vllm_prefill_burst_benchmark.json', overrides.get('burst', burst()))
@@ -83,7 +83,7 @@ def test_complete_supported_evidence_passes(tmp_path):
 ])
 def test_supported_claims_need_passing_evidence(tmp_path, overrides, message):
     model = tmp_path / 'model'
-    served = overrides.pop('served', {'status': 'pass', 'reasons': []})
+    served = overrides.pop('served', {'status': 'pass', 'reasons': [], 'long_resume': {'checked': True}})
     full_evidence(model, **overrides)
     path = model / 'readiness_vllm/prefix_cache_check.json'
     if served is None:
@@ -165,6 +165,14 @@ def test_plugin_owned_prefix_caching_is_blocked_not_failed(tmp_path):
     full_evidence(model, contract=data)
     write(model / 'doc/vllm_integration/plugin_changes.md', '# record\n')
     assert run(model, '--stage', 'vllm').returncode == 0
+
+
+def test_served_check_without_long_resume_is_advisory(tmp_path):
+    model = tmp_path / 'model'
+    full_evidence(model, served={'status': 'pass', 'reasons': [], 'long_resume': {'checked': False}})
+    result = run(model, '--stage', 'vllm')
+    assert result.returncode == 1, result.stderr
+    assert 'one-token resumes' in result.stderr
 
 
 def test_incomplete_burst_is_always_critical(tmp_path):

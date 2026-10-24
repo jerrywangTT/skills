@@ -125,6 +125,63 @@ def test_prefix_cache_verdict_fails_each_gate(mutate, message):
     assert any(message in reason for reason in reasons), reasons
 
 
+def _with_long_resume(record, *, warm_hit=0.9, cold_hit=0.0, diverge_at=None, first_token="t0"):
+    tokens = [f"t{i}" for i in range(64)]
+    warm_tokens = list(tokens)
+    warm_tokens[0] = first_token
+    if diverge_at is not None:
+        warm_tokens[diverge_at] = "x"
+    record["requests"] += [
+        _request("resume_warm", "resume_warm", ttft=300.0, hit_rate=warm_hit, tokens=warm_tokens, logprob=-1.0),
+        _request("resume_cold", "resume_cold", ttft=1200.0, hit_rate=cold_hit, tokens=tokens, logprob=-1.0),
+    ]
+    record["long_resume"] = {"checked": True, "continuation_tokens": 256}
+    return record
+
+
+def test_long_resume_pair_passes_when_the_resumed_output_matches_the_cold_reference():
+    record = _with_long_resume(_record())
+    status, reasons = _prefix_cache_verdict(record, PREFIX_CACHE_THRESHOLDS)
+    assert (status, reasons) == ("pass", [])
+    assert record["requests"][-2]["greedy_identical_through"] == 64
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"warm_hit": 0.2}, "not served from the cache"),
+        ({"cold_hit": 0.9}, "reference still hit the cache"),
+        ({"first_token": "other"}, "first token differs between the resumed"),
+        ({"diverge_at": 4}, "long resume: greedy output diverges after 4"),
+    ],
+)
+def test_long_resume_pair_fails_each_gate(kwargs, message):
+    record = _with_long_resume(_record(), **kwargs)
+    status, reasons = _prefix_cache_verdict(record, PREFIX_CACHE_THRESHOLDS)
+    assert status == "fail"
+    assert any(message in reason for reason in reasons), reasons
+
+
+class _WordTokenizer:
+    def encode(self, text):
+        return text.split()
+
+    def decode(self, token_ids, skip_special_tokens=True):
+        return " ".join(token_ids)
+
+
+def test_resume_suffix_differs_from_the_prefix(tmp_path):
+    prompts = tmp_path / "prompts.txt"
+    prompts.write_text("alpha beta gamma\n\ndelta epsilon zeta\n\neta theta iota\n")
+    tokenizer = _WordTokenizer()
+    prompt, count = run_vllm_server._build_prefix_cache_prompt(tokenizer, prompts, 5)
+    suffix = run_vllm_server._build_resume_suffix(tokenizer, prompts, 4)
+    assert count == 5
+    assert prompt.split()[:3] == ["alpha", "beta", "gamma"]
+    assert suffix.split()[:3] == ["eta", "theta", "iota"]
+    assert len(suffix.split()) == 4
+
+
 def test_prefix_cache_verdict_tolerates_bf16_divergence_after_the_hard_window():
     record = _record()
     record["requests"][1]["tokens"][40] = "drift"

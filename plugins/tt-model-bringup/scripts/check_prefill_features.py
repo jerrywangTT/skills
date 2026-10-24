@@ -97,6 +97,13 @@ def check_prefix_cache(model_dir: Path, row: dict, critical: list[str], advisory
     else:
         if served.get("status") != "pass":
             critical.append(f"served prefix-cache check status is {served.get('status')!r}: {served.get('reasons')}")
+        long_resume = served.get("long_resume")
+        if not (isinstance(long_resume, dict) and long_resume.get("checked")):
+            advisory.append(
+                "served check covered only one-token resumes (no long-resume comparison); "
+                "the generator-level resume check is the long-continuation proof. Set VLLM_SERVER_DEV_MODE=1 "
+                "on the server to enable /reset_prefix_cache and the served long-resume comparison"
+            )
 
     if resume is None:
         critical.append(f"{RESUME_CHECK_PATH} is missing; run run_prefill_resume_check against the generator")

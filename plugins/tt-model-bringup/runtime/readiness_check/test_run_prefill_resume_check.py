@@ -39,7 +39,7 @@ class _ContinuationGenerator:
         self.reset_calls += 1
 
     def prefill_logits(self, prompt_token_ids):
-        return torch.stack([_position_logits(prompt_token_ids, p, noise=self.noise) for p in range(len(prompt_token_ids))])[None]
+        raise AssertionError("the resume check must not request all-position logits")
 
     def prefill_logits_continuation(self, prompt_token_ids, start, *, positions=None, prefill_prefix=True):
         if positions is None:

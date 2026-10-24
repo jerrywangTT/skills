@@ -61,7 +61,7 @@ The runner derives the resume starts from the geometry: the smallest block, the 
 
 Gates per start: mean PCC >= 0.99, minimum PCC >= 0.98, top-1 agreement >= 0.98, final-position top-1 equal. Continuation changes MoE and SDPA chunk boundaries, so bit equality is not expected; BF16 drift at the margin is legitimate. A failure here is a cache address, position, or history bug, not drift.
 
-Controls: `no_history` (continuation over an empty cache) and `fresh_suffix` (the suffix prefilled at position 0) must score top-1 agreement below 0.6 wherever the window has at least 64 positions. A control that still agrees means the check cannot see a broken resume; fix the check before trusting a pass. For a sliding-window model, add one model-local control that zeroes the history snapshot; it must break the sliding layers.
+Controls: `no_history` (continuation over an empty cache) and `fresh_suffix` (the suffix prefilled at position 0, through the same driver so only the window's logits are returned) must score top-1 agreement below 0.6 wherever the window has at least 64 positions. Return only the requested positions from `prefill_logits_continuation`: all-position logits for a 16K prompt do not fit, so the driver selects rows before the final norm and LM head. A control that still agrees means the check cannot see a broken resume; fix the check before trusting a pass. For a sliding-window model, add one model-local control that zeroes the history snapshot; it must break the sliding layers.
 
 ## Served prefix-cache check
 
@@ -73,7 +73,9 @@ python -m readiness_check.run_vllm_server --stages prefix_cache \
   --server-log models/autoports/<model>/readiness_vllm/server.log
 ```
 
-The stage resets the prefix cache, sends one deterministic prompt of 2305 tokens cold, warm, warm, resets again, then cold and warm again. Around every request it reads `vllm:prefix_cache_queries` and `vllm:prefix_cache_hits` from `/metrics`, and it records TTFT from the first streamed chunk, the first token and its logprob, and 64 greedy tokens. It also runs the shared-prefix `vllm bench serve` workload (4 prefixes of 2048 tokens, 128-token suffixes, 32 requests at concurrency 8) and records its hit rate. It writes `readiness_vllm/prefix_cache_check.json`; every run also writes `readiness_vllm/vllm_run_summary.json` with the server command, the flag, and the prefix-caching state read from the log. The prompt length is one token past a 256 multiple so a repeat hits every full block for block sizes up to 256; with a larger block or lcm, pass `--prefix-cache-prompt-tokens` as `k * lcm + 1`.
+An identical repeat resumes one token before the end of the prompt, so the warm requests below prove the hit path and the timing, not a long continuation. The stage therefore also appends a 256-token new suffix to the shared prefix (a multi-turn shape), serves it once from the cache and once cold after a reset, and compares the two. That long-resume comparison needs `POST /reset_prefix_cache`, which vLLM exposes only with `VLLM_SERVER_DEV_MODE=1` in the server environment; set it for readiness servers. Without it the stage records `long_resume.checked = false`, the gate reports an advisory, and the generator-level resume check above is the only long-continuation proof.
+
+The stage resets the prefix cache, sends one deterministic prompt of 2305 tokens cold, warm, warm, resets again, then cold and warm again, then the long-resume pair. Around every request it reads `vllm:prefix_cache_queries` and `vllm:prefix_cache_hits` from `/metrics`, and it records TTFT from the first streamed chunk, the first token and its logprob, and 64 greedy tokens. It also runs the shared-prefix `vllm bench serve` workload (4 prefixes of 2048 tokens, 128-token suffixes, 32 requests at concurrency 8) and records its hit rate. It writes `readiness_vllm/prefix_cache_check.json`; every run also writes `readiness_vllm/vllm_run_summary.json` with the server command, the flag, and the prefix-caching state read from the log. The prompt length is one token past a 256 multiple so a repeat hits every full block for block sizes up to 256; with a larger block or lcm, pass `--prefix-cache-prompt-tokens` as `k * lcm + 1`.
 
 Verdict:
 
@@ -87,6 +89,7 @@ Verdict:
 | First-token logprob delta | <= 0.25 nats |
 | Greedy output | identical through 16 tokens; divergence index after that is recorded, not failed |
 | Shared-prefix hit rate | >= 0.7 |
+| Long resume (when reset is available) | resumed request hit rate > 0.5, cold reference hit rate <= 0.05, first token identical, first-token logprob delta <= 0.25 nats, greedy identical through 16 tokens |
 
 Accuracy fence at this stage: the `sampling` and `qualitative` stages run against the same caching-enabled server, so their verdicts are the fence here; record the prefix-caching state beside them. Full-output greedy equality is not required; the resumed chunk starts at the cached length, which moves the chunk grid, and BF16 logits differ at the margin. A fixed-subset lm-eval comparison with caching on against the accepted caching-off result belongs to the benchmark stage and is not required to pass this gate.
 
@@ -135,9 +138,11 @@ Run the stage once with batched prefill disabled through the environment overrid
 
 Single-user unchanged: the primary 128/128/1 TTFT p50 and TPOT mean stay within 5 percent of the pre-change `vllm_benchmark.json`, and the mixed-shape trace reuse check shows zero recaptures after warmup with the batched path active.
 
+Stage split: Stage 9 measures the burst on whatever prefill path exists and records it; when prefill is still one row at a time, that measurement is the serial reference and the ratio gate is advisory. Stage 10 implements batched prefill, produces the batched-equals-solo evidence, and must meet the ratio gate.
+
 ## Gate
 
-`scripts/check_prefill_features.py` runs at the end of the Stage 9 and Stage 10 check scripts. It reads the serving contract row, `vllm_run_summary.json`, `prefix_cache_check.json`, `readiness/prefill_resume_check.json`, and `vllm_prefill_burst_benchmark.json`. Critical: a supported claim without passing artifacts, a disabled-APC server log, a negative control that did not fail, an undocumented exclusion, or, in Stage 10, a missing or failed burst comparison. Stage review adds the judgment the gate cannot make: whether the evidence covers the model's layer kinds, and whether a divergence recorded as drift was investigated.
+`scripts/check_prefill_features.py` runs at the end of the Stage 9 and Stage 10 check scripts. It reads the serving contract row, `vllm_run_summary.json`, `prefix_cache_check.json`, `readiness/prefill_resume_check.json`, and `vllm_prefill_burst_benchmark.json`, all at the `readiness_vllm/` and `readiness/` roots of the model directory; profile subdirectories are not read, so run the stages against the profile that the stage reports. Critical: a supported claim without passing artifacts, a disabled-APC server log, a negative control that did not fail, an undocumented exclusion, or, in Stage 10, a missing or failed burst comparison. Stage review adds the judgment the gate cannot make: whether the evidence covers the model's layer kinds, and whether a divergence recorded as drift was investigated.
 
 ## Evidence to leave
 
