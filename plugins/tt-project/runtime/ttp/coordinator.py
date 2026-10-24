@@ -1884,6 +1884,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     labels = json.loads(task["labels"] or "[]") if labels is None else labels
                     upd["labels"] = without_deferral(labels) + defer_labels(after, when, start_why(a, cur, when))
                     upd["not_before"] = after
+                    if after and after > time.time() and after != cur.get("after"):
+                        progress.drop_probe(db, task["id"])   # a planned deferral: its old answers no longer count
                     stale = marker_only_probe(when, p.root) if when != cur.get("when") else None
                     if stale:
                         notes.append(f"task_update: #{task['id']} flagged: {stale}")

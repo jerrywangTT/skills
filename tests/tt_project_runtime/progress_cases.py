@@ -836,3 +836,107 @@ def test_a_user_pause_probe_raises_no_probe_stall_and_the_sweep_and_wait_stale_a
     # on the waiting one.
     kinds = {i["task"]: i["kind"] for i in sweep.items(p.db, now + 30 * 3600, p.config()) if i.get("task")}
     assert (kinds.get(tid) == "user-pause", bool(userpause.probe_of(p.db.task(wid), p.config()))) == (hold, hold)
+
+
+_LIVE_START = "test -e state/out-ready || exit 1"
+
+
+def _deferred(p, probe, since, after=None):
+    """A queued task deferred on start_when `probe` since `since`, with an optional start_after."""
+    labels = ([f"start_after:{after:.0f}"] if after else []) + [f"start_when:{probe}", f"deferred_since:{since:.0f}"]
+    tid = p.db.add_task("starts on a file", "s", kind="work", tier="light", origin="user", labels=labels)
+    p.db.update_task(tid, not_before=after)
+    return tid
+
+
+def _broken_events(p, tid):
+    return p.db.q("SELECT * FROM events WHERE kind='deferral_probe_broken' AND task=? AND status='queued'", (tid,))
+
+
+def test_moving_start_after_into_the_future_drops_the_probe_count_and_its_stall(env):
+    """A start_when that said not yet 21 times in an hour raised a probe stall; the coordinator then
+    moved its start_after hours ahead. The count, the raised stall and the unhandled broken-probe
+    finding are dropped at once: no '(still)' re-raise follows while the probe does not run, and a
+    broken probe is reported again once it runs again."""
+    from ttp import coordinator as coord, progress
+    from ttp.daemon import Daemon
+    p = make(env)
+    d, now = Daemon(p.base), time.time()
+    tid = _deferred(p, _LIVE_START, now - 5000)
+    for i in range(21):
+        d._start_verdict(p.db.task(tid), 1, now - 3800 + i * 180)
+    d._start_verdict(p.db.task(tid), 2, now - 10)       # one broken answer, not yet handled
+    assert len(_broken_events(p, tid)) == 1
+    got = progress.check(p.db, p.config(), p.state, now)
+    assert [(e["kind"], e["keys"]) for e in got] == [("stall", [f"probe:#{tid}"])]
+    assert coord.apply(p, [{"type": "task_update", "id": tid, "start_after": "6h"}]) == []
+    st = progress.load(p.db)
+    assert str(tid) not in st["probes"] and f"stall:probe:#{tid}" not in st["raised"]
+    assert st["history"][-1]["key"] == f"stall:probe:#{tid}" and _broken_events(p, tid) == []
+    for dt in (60, 3600, 13 * 3600, 26 * 3600):         # well past rewake_h: nothing, not even '(still)'
+        assert progress.check(p.db, p.config(), p.state, now + dt) == []
+    assert [e for e in _prog_events(p, "stall") if "(still)" in e["text"]] == []
+    # Its start_after passes and the probe runs again, broken: reported again.
+    assert coord.apply(p, [{"type": "task_update", "id": tid, "start_after": "now"}]) == []
+    d._start_verdict(p.db.task(tid), 2, time.time())
+    assert len(_broken_events(p, tid)) == 1
+
+
+def test_no_probe_stall_while_start_after_is_ahead(env):
+    """However many not-yet answers a task's record holds, a task whose start_after is still ahead (set
+    by any path) raises no probe stall, and a stall raised before clears at once."""
+    from ttp import progress
+    p = make(env)
+    now = time.time()
+    tid = _deferred(p, _LIVE_START, now - 5000)
+    cur = lambda t: _LIVE_START
+    for i in range(21):
+        progress.note_probe(p.db, tid, _LIVE_START, 1, "not yet", now - 3800 + i * 180)
+    assert progress.check(p.db, {}, p.state, now, current_probe=cur)
+    p.db.update_task(tid, labels=[f"start_after:{now + 6 * 3600:.0f}", f"start_when:{_LIVE_START}",
+                                  f"deferred_since:{now:.0f}"], not_before=now + 6 * 3600)
+    progress.note_probe(p.db, tid, _LIVE_START, 1, "not yet", now + 30)   # a stray late answer
+    assert progress.check(p.db, {}, p.state, now + 60, current_probe=cur) == []
+    st = progress.load(p.db)
+    assert st["probes"] == {} and st["raised"] == {}
+    assert progress.check(p.db, {}, p.state, now + 13 * 3600 - 60, current_probe=cur) == []   # quiet, still ahead
+
+
+def test_after_start_after_passes_only_new_probe_answers_count(env):
+    """Answers from before start_after last changed never count toward a stall; once it has passed,
+    a probe that keeps saying not yet still raises the stall after probe_n answers and probe_h hours."""
+    from ttp import progress
+    p = make(env)
+    now = time.time()
+    tid = _deferred(p, _LIVE_START, now - 5000)
+    cur = lambda t: _LIVE_START
+    for i in range(21):                                   # 21 old answers
+        progress.note_probe(p.db, tid, _LIVE_START, 1, "not yet", now - 3800 + i * 180)
+    start = now + 3600
+    p.db.update_task(tid, labels=[f"start_after:{start:.0f}", f"start_when:{_LIVE_START}",
+                                  f"deferred_since:{now:.0f}"], not_before=start)
+    start = float(f"{start:.0f}")
+    for i in range(10):                                   # 10 new answers in under an hour: no stall yet
+        progress.note_probe(p.db, tid, _LIVE_START, 1, "not yet", start + 60 + i * 180)
+    assert progress.check(p.db, {}, p.state, start + 60 + 9 * 180 + 30, current_probe=cur) == []
+    assert progress.load(p.db)["probes"][str(tid)]["n"] == 10
+    for i in range(10, 22):                               # still not yet past probe_h: the stall is raised
+        progress.note_probe(p.db, tid, _LIVE_START, 1, "not yet", start + 60 + i * 180)
+    got = progress.check(p.db, {}, p.state, start + 60 + 21 * 180 + 30, current_probe=cur)
+    assert [(e["kind"], e["keys"]) for e in got] == [("stall", [f"probe:#{tid}"])]
+    assert json.loads(_prog_events(p, "stall")[-1]["data"])[0]["n"] == 22   # the new answers only
+
+
+def test_a_start_when_probe_that_stopped_answering_is_not_judged(env):
+    """A start_when probe with no answer for two probe intervals and its timeout is not running: its count is dropped
+    (its next answer starts afresh). A waiting task's retry_when, probed at its own retry, keeps its count."""
+    from ttp import daemon, progress
+    assert progress.QUIET_S == 2 * daemon.PROBE_EVERY_S + daemon.PROBE_TIMEOUT_S
+    p = make(env)
+    now = time.time()
+    tid = _deferred(p, _LIVE_START, now - 9000)
+    for i in range(21):
+        progress.note_probe(p.db, tid, _LIVE_START, 1, "not yet", now - 8000 + i * 180)
+    assert progress.check(p.db, {}, p.state, now - 8000 + 20 * 180 + 30, current_probe=lambda t: _LIVE_START)
+    assert progress.check(p.db, {}, p.state, now, current_probe=lambda t: _LIVE_START) == []
+    assert progress.load(p.db)["probes"] == {} and progress.load(p.db)["raised"] == {}

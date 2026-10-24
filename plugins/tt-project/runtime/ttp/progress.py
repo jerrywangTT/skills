@@ -52,7 +52,10 @@ Repeat detectors, each one keyed `stall` event with the count, first and last se
   task landing or a time are expected to be long and left out, and so is a user pause,
   userpause.is_probe: only the user's word ends it). It is flagged "waits on what it
   fixes" when the probe waits on a resource that is down or paused and the task is that resource's
-  fix, or a task holding the resource waits on this one;
+  fix, or a task holding the resource waits on this one. Only the answers since the task's
+  start_after last changed count; a task whose start_after is still ahead (a planned deferral) never
+  raises it, and its count (with a stall raised on it) is dropped, as is a start_when's whose probe
+  has not answered for QUIET_S (it is not running, so it cannot be judged);
 - runs: a task's (or one schedule's) worker runs failing `fail_n` (3) times in a row the same way;
 - schedule: a schedule failing `repeat_n` (5) times in a row with the same status. A skip on its own
   daily cap is not counted here: the daemon's schedule-budget observation (Daemon._schedule_skip)
@@ -237,6 +240,9 @@ HEADS = {"no_progress": "No progress: running work produced no result past its t
 CHECK_DEFAULTS = {"task_h": 2, "resource_h": 2, "project_h": 2, "probe_n": 10, "probe_h": 1, "repeat_n": 5,
                   "fail_n": 3, "escalate_x": 2, "rewake_h": 12, "quiet_h": 6, "clear_n": 3, "clear_min": 30,
                   "change_probe_m": 15}
+# A start_when probe starts every daemon.PROBE_EVERY_S (180 s) and answers within PROBE_TIMEOUT_S (60 s):
+# no answer for two intervals and a timeout means it is not running.
+QUIET_S = 2 * 180 + 60
 HEADER = "## Progress (stuck work: re-plan, re-tier, re-point the probe, route around, cancel or fix the cause)"
 BAD_RUNS = ("failed", "timeout", "stalled")
 # Waits expected to be long, whose producer has its own clock: the task's own detached job or checks,
@@ -315,18 +321,38 @@ def _take_results(st: dict, recs: list[dict], now: float) -> None:
 
 # ---- inputs the daemon feeds ----
 
+def _after(t: dict | None) -> float | None:
+    return deferral(t).get("after") if t else None
+
+
 def note_probe(db: DB, tid: int, probe: str, rc: Any, reason: str, now: float | None = None) -> None:
-    """A probe (retry_when or start_when) said not yet: count it for its task."""
+    """A probe (retry_when or start_when) said not yet: count it for its task. A count made under
+    another start_after starts over: only the answers since it last changed count."""
     now = time.time() if now is None else now
     st = load(db)
     rec = st["probes"].get(str(tid))
-    if rec and rec.get("probe") == probe and now <= float(rec["last"]):
+    after = _after(db.task(tid))
+    if rec and rec.get("probe") == probe and rec.get("after") == after and now <= float(rec["last"]):
         return   # this verdict is counted already
-    if rec and rec.get("probe") == probe:
+    if rec and rec.get("probe") == probe and rec.get("after") == after:
         rec.update(n=int(rec["n"]) + 1, last=now, rc=rc, reason=_clip(reason) or rec.get("reason"))
     else:
-        st["probes"][str(tid)] = {"probe": probe, "n": 1, "first": now, "last": now, "rc": rc, "reason": _clip(reason)}
+        st["probes"][str(tid)] = {"probe": probe, "n": 1, "first": now, "last": now, "rc": rc,
+                                  "reason": _clip(reason), "after": after}
     _save(db, st)
+
+
+def drop_probe(db: DB, tid: int, now: float | None = None) -> None:
+    """The task's start_after moved into the future (task_update): its probe stops until then, so
+    its not-yet count, a stall raised on it and a deferral_probe_broken finding not yet handled are
+    dropped. Counting starts afresh once the probe runs again; a broken probe is raised again then."""
+    now = time.time() if now is None else now
+    st = load(db)
+    st["probes"].pop(str(tid), None)
+    _unraise(st, f"stall:probe:#{tid}", now)
+    _save(db, st)
+    db.x("UPDATE events SET status='handled' WHERE status='queued' AND kind='deferral_probe_broken' AND task=?",
+         (tid,))
 
 
 def forget_probe(db: DB, tid: int) -> None:
@@ -489,13 +515,24 @@ def _self_ref(db: DB, t: dict, probe: str, rc: Any, paused: dict, trouble: dict)
 
 
 def probe_stalls(db: DB, s: dict, st: dict, now: float, current_probe: Callable[[dict], str | None],
-                 cfg: dict | None = None) -> list[dict]:
+                 cfg: dict | None = None, gone: set | None = None) -> list[dict]:
+    """Probe stalls; adds to `gone` the raised keys whose count was dropped as no longer valid."""
     out = []
     paused, trouble = db.paused_resources(), db.kv("resource_trouble") or {}
     for k, rec in list(st["probes"].items()):
         t = db.task(int(k))
         if not t or t["status"] in TERMINAL_TASK_STATES or t["status"] == "running" or current_probe(t) != rec["probe"]:
             st["probes"].pop(k)   # the wait ended, or its probe was re-pointed
+            continue
+        d = deferral(t)
+        after = d.get("after")
+        if (after or 0) > now or rec.get("after") != after \
+                or (d.get("when") == rec["probe"] and now - float(rec["last"]) > QUIET_S):
+            # A planned deferral, answers from before its start_after last changed, or a start_when
+            # probe that is not running: nothing to judge, and a stall raised on it ends now.
+            st["probes"].pop(k)
+            if gone is not None:
+                gone.add(f"stall:probe:#{k}")
             continue
         if t["status"] == "waiting" and load_result(t["result"]).get("wait_kind") == "self":
             continue   # its own job or window: the wait checks cover a job that hangs
@@ -625,10 +662,16 @@ def _decide(st: dict, conds: list[dict], s: dict, now: float, kinds: tuple = CHE
         r["ok_since"] = r.get("ok_since") or now
         if key not in gone and (r["ok_n"] < s["clear_n"] or now - float(r["ok_since"]) < s["clear_min"] * 60):
             continue
-        st["raised"].pop(key)
-        st["history"].append({"key": key, "kind": r.get("kind"), "what": r.get("what"), "raised": r.get("first"),
-                              "cleared": r["ok_since"], "wakes": r.get("wakes", 0)})
+        _unraise(st, key, now)
     return due
+
+
+def _unraise(st: dict, key: str, now: float) -> None:
+    """Clear a raised key into `history`."""
+    r = st["raised"].pop(key, None)
+    if r is not None:
+        st["history"].append({"key": key, "kind": r.get("kind"), "what": r.get("what"), "raised": r.get("first"),
+                              "cleared": r.get("ok_since") or now, "wakes": r.get("wakes", 0)})
 
 
 def check(db: DB, cfg: dict | None, state_dir: Path | str | None, now: float | None = None, where: Any = None,
@@ -646,14 +689,15 @@ def check(db: DB, cfg: dict | None, state_dir: Path | str | None, now: float | N
     st = load(db)
     recs = entries(Path(state_dir)) if state_dir else []
     _take_results(st, recs, now)
-    conds = (no_progress(db, cfg, s, st, now, streaks(recs)) + probe_stalls(db, s, st, now, current_probe, cfg)
+    gone: set = set()
+    conds = (no_progress(db, cfg, s, st, now, streaks(recs)) + probe_stalls(db, s, st, now, current_probe, cfg, gone)
              + run_stalls(db, s, now) + schedule_stalls(db, s, st, now))
-    kinds, gone = CHECK_KINDS, set()
+    kinds = CHECK_KINDS
     if changes is None:
         kinds = tuple(k for k in CHECK_KINDS if k != "change-probe")
     else:
-        got, gone = change_probes(db, s, st, changes, now)
-        conds += got
+        got, ended = change_probes(db, s, st, changes, now)
+        conds, gone = conds + got, gone | ended
     due = _decide(st, conds, s, now, kinds, gone)
     with db.tx():
         _save(db, st)
