@@ -2284,7 +2284,7 @@ def cmd_checks(a) -> None:
     unless a harness-tagged check applies to the head and ran or reused a recorded pass. With no
     harness-tagged check configured it runs the default harness plan (push.default_harness_checks). Its pass is recorded as such and never counts for a PR,
     an on_pass hand-off or `ttp push --own`; its failures open no check gap."""
-    from . import checkcap, checkdirs, cleantree, prguard, push, pushpass
+    from . import checkcap, checkdirs, cleantree, prguard, push, pushpass, slowtests
     if getattr(a, "gap", None):
         from . import checkgaps
         p = here()
@@ -2403,6 +2403,7 @@ def cmd_checks(a) -> None:
     run_env: dict = {}   # what the checks run in, for the pass's envs (pushpass.check_envs)
     base = _checks_base(p, Path(top), cmds)
     (Path(run_dir) / "check_failure.json").unlink(missing_ok=True)
+    (Path(run_dir) / slowtests.FILE).unlink(missing_ok=True)   # this run's slowest tests only
     start = log.stat().st_size if log.exists() else 0
     with open(log, "a") as out:
         out.write(f"ttp checks: in {top} on {head[:12]}" + (" (purpose harness)" if purpose == "harness" else "")
@@ -2580,6 +2581,8 @@ def cmd_checks(a) -> None:
                 group = bool(getattr(a, "own_group", False))
                 env = {**push.check_env("checks", run_dir=getattr(a, "check_run_dir", None)), **child_env,
                        "PWD": cwd, **({checkreap.MARKER: reap_tok} if reap_tok else {})}
+                if pushpass.resumable(str(c)) and not push.remote_host(c):   # one plain local pytest run
+                    env |= slowtests.env(Path(run_dir) / slowtests.FILE, env)
                 def said(line: str) -> None:   # a script it runs was rewritten as it ran: once more
                     nonlocal check_start
                     print(f"ttp checks: {line}", flush=True)
@@ -3468,6 +3471,9 @@ def _checks_result(run_dir: Path) -> int:
     if rc_file.exists():
         print(f"ttp checks: finished with exit code {rc_file.read_text().strip()}")
         print(f"ttp checks: full output ('$ cmd' lines, test results) in {run_dir / 'checks.log'}")
+        from . import slowtests
+        for line in slowtests.lines(run_dir / slowtests.FILE):
+            print(f"ttp checks: {line}")
     elif not info:
         print(f"ttp checks: no detached checks recorded in {run_dir}")
         return 0

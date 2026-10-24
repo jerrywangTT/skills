@@ -18691,7 +18691,12 @@ def test_a_push_batch_resumes_a_pytest_check_that_was_cut(env, monkeypatch, caps
     rc, m = _run_batch(p, _batch_marker(p, heads, bid="b2"), monkeypatch)
     assert rc == 0 and m["outcome"] == "pushed", m
     assert log.read_text().split() == ["b"]
-    assert f"resuming {cmd}: 2 test file(s) passed" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert f"resuming {cmd}: 2 test file(s) passed" in out
+    from ttp import slowtests   # the check's slowest tests, next to the batch's check report, in its log
+    slow = slowtests.load(pathlib.Path(m["check_report_dir"]) / slowtests.FILE)
+    assert [t for t, _ in slow] == ["suite/test_b.py::test_b"], slow
+    assert "slowest 1 tests" in out and "suite/test_b.py::test_b" in out
     assert not list((p.state / pushpass.RESUME_DIR).glob("*.txt")), "a whole pass removes its resume record"
 
 def _merge_entry(repo, name):
@@ -26392,6 +26397,8 @@ def test_durable_write_syncs_renames_and_keeps_the_mode(env, monkeypatch):
 # Every place the runtime writes a file directly, and why it need not survive a power cut. Anything
 # else goes through project.durable_write / durable_append / write_json.
 DURABLE_EXEMPT = {
+    ("ttp_pytest_durations.py", 'open(tmp, "w")'): "runs inside the checked repo's pytest, not the runtime: a timing note written whole to a temp file, then renamed; a lost one costs only the note",
+    ("ttp_pytest_durations.py", "os.replace(tmp, self.path)"): "renames that timing note into place: a rename lost to a crash leaves the old note or none",
     ("checkdirs.py", "os.fdopen(out, 'w')"): "new owner record: file and both directories synced before releasing the catalogue lock; descriptor-relative to refuse links",
     ("project.py", "os.replace(src, dst)"): "memory archive move: a rename, both directories synced after",
     ("project.py", "os.replace(a, b)"): "rolled-back memory retirement moves the file back: a rename, both directories synced after",

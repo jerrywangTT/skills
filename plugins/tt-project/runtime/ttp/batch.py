@@ -42,7 +42,7 @@ from collections import deque
 from pathlib import Path
 
 from . import (checkcap, checkdirs, conflictfix, envfault, locks, push, pushpass, runner, scopehold, scriptwatch,
-               sharedchecks, suitecost, worktree)
+               sharedchecks, slowtests, suitecost, worktree)
 from .project import Project, command_env, durable_write, write_json
 
 WORKTREE = "push"             # the batch's own checkout under the project's worktrees (never t<id>)
@@ -1136,12 +1136,17 @@ class Batch:
         slot = push.check_slot(head, say, checkcap.label(self.p.name, f"push batch {self.id}"),
                                priority=push.priority_key(self.repo, self.remote, self.branch), proj=self.p)
         started = time.time()   # a wait for the host-wide slot is not check time
+        slow = Path(self.check_run_dir) / slowtests.FILE if self.check_run_dir else None
+        if slow:
+            slow.unlink(missing_ok=True)   # this head's run only
         try:
             for line in push.sandbox_lines([cmd for cmd, _ in run]):
                 say(line)
             for cmd, eid in run:
                 resume = pushpass.resume_file(self.p, tree, str(cmd), eid) if tree and pushpass.resumable(str(cmd)) else None
                 extra = pushpass.resume_env(resume, env) if resume else {}
+                if slow and pushpass.resumable(str(cmd)) and not push.remote_host(cmd):
+                    extra |= slowtests.env(slow, {**env, **extra})
                 if done := pushpass.resumed(resume) if resume else []:
                     say(f"resuming {cmd}: {len(done)} test file(s) passed in an earlier run on tree {tree[:10]}; running the rest")
                 if push.remote_host(cmd):
@@ -1169,6 +1174,8 @@ class Batch:
             slot.close()
             self.checks["seconds"] = round(self.checks["seconds"] + time.time() - started, 1)
         push.record_check_s(self.p, time.time() - started)
+        for line in slowtests.lines(slow) if slow else []:
+            say(line)
         try:
             suitecost.record(self.p.db, self.id, head, self._version(head), "\n".join(suite_out))
         except Exception as e:   # a cost note never fails a batch
