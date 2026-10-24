@@ -6032,6 +6032,24 @@ def test_doctor_loop_stops_a_precheck_still_running_when_it_ends(env, monkeypatc
         seen.extend(i for i in map(cli._read_checks_pid, dirs) if cli._checks_alive(i))
         stop_all(p)
 
+    class Clock:   # jumps past the cap once the review is queued and the precheck runs (no 15 s wait)
+        skip = 0.0
+        sleep = staticmethod(time.sleep)
+
+        def time(self):
+            return time.time() + self.skip
+
+    clock, check = Clock(), loopcheck.Watch.check
+
+    def check_and_jump(w):
+        out = check(w)
+        if w.steps.get("review") and any(cli._checks_alive(cli._read_checks_pid(d))
+                                         for d in (w.p.state / daemon.PRECHECKS_DIR).glob("t*")):
+            clock.skip = 3600.0
+        return out
+
+    monkeypatch.setattr(loopcheck, "time", clock)
+    monkeypatch.setattr(loopcheck.Watch, "check", check_and_jump)
     monkeypatch.setattr(loopcheck, "setup", slow_checks)
     monkeypatch.setattr(loopcheck, "stop_all", stop_and_see)
     lines = []

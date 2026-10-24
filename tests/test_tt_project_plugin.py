@@ -2041,6 +2041,15 @@ def _agents_home(tmp_path):
     return home, env
 
 
+def _fast_sleep(env):
+    """A `sleep` first on the fake PATH that pauses a fifth as long: the box scripts' polls and pauses keep
+    their loops and counts, at less wall time."""
+    shim = pathlib.Path(env["PATH"].split(":")[0]) / "sleep"
+    shim.write_text("#!/bin/sh\ncase $1 in ''|*[!0-9.]*) exec /bin/sleep \"$@\" ;; esac\n"
+                    "exec /bin/sleep \"$(awk -v s=\"$1\" 'BEGIN { print s / 5 }')\"\n")
+    shim.chmod(0o755)
+
+
 def test_setup_box_agents_install_is_idempotent_and_covers_path_and_every_editor_build(tmp_path, monkeypatch):
     import subprocess
     ba = _agents(monkeypatch)
@@ -2123,6 +2132,7 @@ def test_setup_box_agents_login_relays_link_and_code_and_keeps_tokens_on_the_box
     import time
     ba = _agents(monkeypatch)
     home, env = _agents_home(tmp_path)
+    _fast_sleep(env)
     bin_ = home / ".local/bin"
     bin_.mkdir(parents=True)
     # A fake claude: logged in once a pasted code arrived; its login prints a link and asks for the code.
@@ -2487,6 +2497,7 @@ def test_setup_box_agents_glean_sign_in_runs_in_tmux_and_hands_out_a_link_only_w
         pytest.skip("no tmux")
     ba = _agents(monkeypatch)
     home, env = _agents_home(tmp_path)
+    _fast_sleep(env)
     _glean_fakes(home)
     (home / "claude-mcp").write_text("https://g.invalid/mcp\n")
     # A fake ss: the sign-in's callback listens once $HOME/listen exists.
