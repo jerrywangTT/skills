@@ -11539,3 +11539,87 @@ def test_a_landing_recorded_after_abandon_wins_over_it(env, monkeypatch, capsys)
     assert _ttp_task(p, "superseded", str(tid), _git_out(other, "rev-parse", "HEAD")) == 0
     assert "its abandon record is cleared" in capsys.readouterr().out
     assert landed.abandoned(p.db, tid) is None and landed.check(p, repo, tid=tid)[0] == 0
+
+
+_FLAKY_ID = "tests/test_a.py::test_waits_on_a_clock"
+_FLAKY_CHECK = "python3 -m pytest -q tests"
+
+
+def _rerun_stub(monkeypatch, tip, plan):
+    """batch._stream stubbed as the check runner, no real test run: `plan(where, selected)` gives the exit
+    code at the tip ("tip") or another head ("head"), `selected` the rerun's TTP_PYTEST_SELECT (None for
+    the full check). A failure prints pytest's lines for _FLAKY_ID. Returns the calls (where, selected)."""
+    from ttp import batch
+    calls = []
+
+    def fake(cmd, cwd, env=None, timeout=None, group=False, pass_fds=()):
+        head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=str(cwd), capture_output=True, text=True).stdout.strip()
+        where, selected = "tip" if head == tip else "head", (env or {}).get("TTP_PYTEST_SELECT")
+        calls.append((where, selected))
+        rc = plan(where, selected)
+        out = (f"F...\nFAILED {_FLAKY_ID} - AssertionError: took too long\n1 failed, 3 passed in 0.50s"
+               if rc == 1 else "....\n4 passed in 0.50s")
+        return rc, out, False
+
+    monkeypatch.setattr(batch, "_stream", fake)
+    return calls
+
+
+def test_a_push_batch_reruns_a_failing_test_once_at_the_same_head_and_goes_on_when_it_passes(env, monkeypatch):
+    """A push check fails on one test that passes on its one rerun at the same head: flaky. The batch
+    pushes, the marker records the test, head and command, and the queue tells the coordinator once per
+    test (a later batch with the same flake adds no second event within a day). A pass that came from a
+    rerun is not recorded as the tree's pass."""
+    from ttp import pushpass, pushq
+    p, repo, origin, other = _push_setup(env, monkeypatch, [_FLAKY_CHECK])
+    tip = _git_out(origin, "rev-parse", "proj")
+    calls = _rerun_stub(monkeypatch, tip, lambda where, sel: 1 if sel is None else 0)
+    rc, m = _run_batch(p, _batch_marker(p, [_entry(repo, "e1", {"f1.txt": "1\n"})]), monkeypatch)
+    assert rc == 0 and m["outcome"] == "pushed" and _statuses(m) == ["pushed"], m
+    assert calls == [("head", None), ("head", "^(?:test_waits_on_a_clock)$")], "one rerun, only the failing test"
+    [f] = m["flaky_tests"]
+    assert f["ids"] == [_FLAKY_ID] and f["cmd"] == _FLAKY_CHECK and f["head"] == m["pushed_sha"]
+    assert m["checks"]["flaky"] is True and m["checks"]["reruns"] == 1
+    assert not pushpass.passed(p, pushpass.tree_of(p.root, m["pushed_sha"]), _FLAKY_CHECK,
+                               pushpass.env_id(p.root, _FLAKY_CHECK, {}, tip)), "a rerun pass is not the tree's pass"
+    st, now = {}, time.time()
+    for bid in ("b1", "b2"):
+        pushq._flaky_told(p.db, st, {"id": bid}, m, now)
+    evs = p.db.q("SELECT * FROM events WHERE kind=?", (pushq.FLAKY_EVENT,))
+    assert len(evs) == 1 and evs[0]["status"] == "queued", evs
+    assert _FLAKY_ID in evs[0]["text"] and "b1" in evs[0]["text"] and "deterministic" in evs[0]["text"]
+    pushq._flaky_told(p.db, st, {"id": "b3"}, m, now + pushq.FLAKY_TOLD_S + 1)
+    assert len(p.db.q("SELECT * FROM events WHERE kind=?", (pushq.FLAKY_EVENT,))) == 2, "told again after a day"
+
+
+def test_a_push_batch_reports_the_tip_broken_when_the_failing_tests_fail_on_the_tip_alone_too(env, monkeypatch):
+    """The failing test fails again on its rerun at the head and on its one rerun on the tip without the
+    batch: the tip is broken (tip_failed), not the change, and the tip is not checked alone in full."""
+    p, repo, origin, other = _push_setup(env, monkeypatch, [_FLAKY_CHECK])
+    tip = _git_out(origin, "rev-parse", "proj")
+    calls = _rerun_stub(monkeypatch, tip, lambda where, sel: 1)
+    rc, m = _run_batch(p, _batch_marker(p, [_entry(repo, "e1", {"f1.txt": "1\n"})]), monkeypatch)
+    assert m["outcome"] == "tip_failed" and _statuses(m) == ["requeued"] and rc != 0, m
+    assert m["tip_check"]["cmd"] == _FLAKY_CHECK and _FLAKY_ID in m["tip_check"]["tail"]
+    assert "fails its checks on its own" in m["message"] and not m.get("flaky_tests")
+    sel = "^(?:test_waits_on_a_clock)$"
+    assert calls == [("head", None), ("head", sel), ("tip", sel)], calls
+    assert _git_out(origin, "rev-parse", "proj") == tip
+
+
+def test_a_push_batch_blames_the_change_when_its_failing_test_fails_twice_on_it_and_passes_on_the_tip(env, monkeypatch):
+    """A test that fails on both runs at the heads never passes, and one that passes on the tip alone is
+    the change's own failure: today's check_failed. Each test is rerun at most once per batch at a head and
+    once on the tip, however many prefixes the search checks."""
+    p, repo, origin, other = _push_setup(env, monkeypatch, [_FLAKY_CHECK])
+    tip = _git_out(origin, "rev-parse", "proj")
+    calls = _rerun_stub(monkeypatch, tip, lambda where, sel: 0 if where == "tip" else 1)
+    heads = [_entry(repo, n, {f"{n}.txt": f"{n}\n"}) for n in ("e1", "e2")]
+    rc, m = _run_batch(p, _batch_marker(p, heads), monkeypatch)
+    assert _statuses(m) == ["check_failed", "requeued"] and m["outcome"] != "tip_failed", m
+    assert not m.get("flaky_tests") and m["checks"]["flaky"] is False and m["checks"]["reruns"] == 2
+    sel = "^(?:test_waits_on_a_clock)$"
+    assert [c for c in calls if c[1] == sel] == [("head", sel), ("tip", sel)], calls
+    assert ("tip", None) not in calls, "the tip is not checked alone in full"
+    assert calls.count(("head", None)) == 3, "full head, prefix 1, and the entry after it: no further reruns"
+    assert _git_out(origin, "rev-parse", "proj") == tip

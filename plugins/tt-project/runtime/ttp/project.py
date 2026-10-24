@@ -435,9 +435,10 @@ EXTRA_KEYS = {
     # plugin_version_guard: refuse a change that edits plugins/<name>/ but keeps the tip's manifest version (off).
     # push_solo_paths: pathspecs a batch takes at most one change touching (pushq.SOLO_PATHS); push_cap_tests:
     # the name regex of prompt size cap tests, whose lone failure sends a trim-to-fit fix (conflictfix.CAP_TESTS).
+    # push_rerun_s: the time limit of one rerun of a failed push check's failing tests (batch.RERUN_S).
     "delivery": {"base_ref", "push_branch", "push_checks", "push_checks_by_repo", "push_exclude_paths", "push_rounds", "push_wait_s",
                  "version_bump", "push_queue", "push_batch_s", "push_batch_max", "push_min_gap_s", "push_landing_alert_h", "after_push",
-                 "push_solo_paths", "push_cap_tests",
+                 "push_solo_paths", "push_cap_tests", "push_rerun_s",
                  "after_push_timeout_s", "backup_remote", "fast_forward_also", "mirror_remotes",
                  "allow_protected_push_branch", "own_push", "own_push_remote", "deploy_restart_wait_s", "plugin_version_guard",
                  "checks_fast_globs", "checks_fast_exclude",   # these two: `ttp checks` fast path (push.FAST_GLOBS),

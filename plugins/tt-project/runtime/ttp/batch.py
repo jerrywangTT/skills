@@ -10,7 +10,10 @@ one spot, and both sides changing different lines that git calls a conflict only
 adjacent. The marker counts the entries that conflicted, were settled and were sent back. It bumps the version once for all entries, runs the push checks once on the result and
 pushes it without force. It always runs them itself and never reads the passes `ttp checks` records;
 it skips only a check a batch recorded passing on the same tree, command and environment (pushpass). When the checks fail, a binary search over prefixes finds the first failing
-entry, and the passing prefix is pushed. The outcome goes into the marker per entry; the daemon
+entry, and the passing prefix is pushed. A failed check's failing pytest ids are first rerun once at
+the same head: passing, the failure was flaky (recorded, reported once) and the batch goes on; when
+the first entry is blamed, they are rerun once on the tip alone, which is broken when they fail there
+too. The outcome goes into the marker per entry; the daemon
 applies it to the reviews.
 
 After the push it moves `delivery.fast_forward_also` and pushes the same commit to
@@ -39,7 +42,7 @@ from collections import deque
 from pathlib import Path
 
 from . import (checkcap, checkdirs, conflictfix, envfault, locks, push, pushpass, runner, scopehold, scriptwatch,
-               suitecost, worktree)
+               sharedchecks, suitecost, worktree)
 from .project import Project, command_env, durable_write, write_json
 
 WORKTREE = "push"             # the batch's own checkout under the project's worktrees (never t<id>)
@@ -52,6 +55,8 @@ MERGED_KINDS = {"added", "hunks"}   # settlements that keep both sides' changes:
 REPLAYED = "Ttp-Replayed-From"     # trailer of a commit the batch settled: the entry commit it replays
 RESCUES = 1                        # checks per batch of the entries after a blamed one, replayed without it
 NO_TESTS = 5                       # pytest's exit status when nothing was selected: a cap probe of a check without cap tests
+RERUN_S = 600.0                    # delivery.push_rerun_s: the time limit of one rerun of a failed check's failing tests
+RERUN_IDS = 10                     # a check failing more tests than this is not rerun: that is no flake
 OVER = re.compile(r"^E\s+assert (\d[\d_]*) <= (\d[\d_]*)\s*$")   # pytest's size-over-cap line
 SECTION = re.compile(r"^_{3,} (\S.*?) _{3,}$")                     # pytest's per-test failure header
 OVER_KEPT = 10                     # overshoot lines a check's tail keeps from its whole output
@@ -635,6 +640,8 @@ class Batch:
         self.scopes: list[dict] = []           # those refusals: scope, files, entry ids, check (scopehold)
         self.retried = False                   # this round checked the entries after a blamed one (_rescue)
         self.rescues = 0                       # such checks in the batch: at most RESCUES
+        self.reran: dict[str, set[str]] = {"head": set(), "tip": set()}   # failing test ids rerun: once each per batch
+        self.flaky: list[dict] = []            # failures whose tests passed on that rerun: {ids, head, cmd}
 
     # results
 
@@ -1085,7 +1092,7 @@ class Batch:
     def _check(self, head: str, checks: list[str]) -> tuple[str, str] | None:
         """Check `head` in the worktree: None when it passes, else (command, output tail). The stale
         version guard (push.stale_versions, with `delivery.plugin_version_guard` on) comes first and
-        runs no command."""
+        runs no command. A check whose failing tests pass on one rerun at `head` passes (_flaky)."""
         self._checkout(head)
         stale = push.stale_versions(self.wt, self.tip) if push.version_guard(self.d) else []
         if stale:
@@ -1147,6 +1154,10 @@ class Batch:
                     raise envfault.Fault(fault)   # the check host, not this head: push_phase holds the batch
                 if rc != 0:
                     say(f"check failed on {head[:10]}: {cmd}{push.where(cmd)}")
+                    if self._flaky(head, cmd, tail, env, slot.env()):
+                        if resume:
+                            resume.unlink(missing_ok=True)
+                        continue
                     return cmd, tail
                 if why := pushpass.record(self.p, tree, str(cmd), eid, self.id):
                     say(f"could not record the pass of {cmd}: {why}")
@@ -1161,6 +1172,73 @@ class Batch:
         except Exception as e:   # a cost note never fails a batch
             say(f"suite cost not recorded: {e}")
         return None
+
+    def _rerun_ids(self, cmd, tail: str, where: str) -> list[str]:
+        """The failing pytest ids of a failed check to rerun once at `where` ("head" or "tip"): none when
+        the check is not one plain local pytest run (pushpass.resumable), its list of failing ids is
+        incomplete (sharedchecks.failing_ids), it names more than RERUN_IDS, or one of them was rerun
+        there in this batch already."""
+        if cmd == STALE or push.remote_host(cmd) or not pushpass.resumable(str(cmd)):
+            return []
+        ids, complete = sharedchecks.failing_ids(tail)
+        if not complete or not ids or len(ids) > RERUN_IDS or self.reran[where] & set(ids):
+            return []
+        return ids
+
+    def _run_ids(self, at: str, cmd, ids: list[str], where: str, env: dict, slot_env: dict) -> tuple[int | None, str]:
+        """Run only `ids` of check `cmd` once at commit `at`: the check's own command, its other tests
+        deselected by name (pushpass.select_env), killed after delivery.push_rerun_s. (pytest's exit
+        code, None when it ran out of time; the output tail)."""
+        self.reran[where].update(ids)
+        self._checkout(at)
+        rx = "^(?:" + "|".join(re.escape(n) for n in sorted({i.rpartition("::")[2] for i in ids})) + ")$"
+        self.checks["reruns"] = self.checks.get("reruns", 0) + 1
+        rc, tail, late = _stream(push.check_argv(cmd, self.wt), self.wt,
+                                 env={**env, **pushpass.select_env(rx, env), **slot_env},
+                                 timeout=_seconds(self.d.get("push_rerun_s"), RERUN_S), group=True,
+                                 pass_fds=checkdirs.inherited())
+        return (None if late else rc), tail
+
+    def _flaky(self, head: str, cmd, tail: str, env: dict, slot_env: dict) -> bool:
+        """A failed check's failing tests (_rerun_ids) run once more at the same `head`. True when they all
+        pass: the failure was flaky. It is recorded (the marker's flaky_tests: ids, head, command; the
+        queue tells the coordinator once per test) and the check counts as passed in this batch only: no
+        pass is recorded for the tree. A test that fails again, or a rerun that runs out of time, keeps
+        the failure."""
+        ids = self._rerun_ids(cmd, tail, "head")
+        if not ids:
+            return False
+        say(f"rerunning the {len(ids)} failing test(s) once on {head[:10]}: {' '.join(ids)}")
+        rc, _ = self._run_ids(head, cmd, ids, "head", env, slot_env)
+        if rc != 0:
+            say(f"the rerun on {head[:10]} " + ("ran out of time" if rc is None else "failed too") + ": the failure stands")
+            return False
+        self.flaky.append({"ids": ids, "head": head, "cmd": str(cmd)})
+        self.checks["flaky"] = True
+        say(f"they passed on the rerun: flaky, the batch goes on: {' '.join(ids)}")
+        return True
+
+    def _tip_ids(self, tip: str, fail: tuple) -> tuple[str, str] | bool | None:
+        """Entry 1 failed a check: rerun only its failing tests (_rerun_ids) once on `tip`, without the
+        batch. (cmd, tail) when they fail there too (the tip is broken, not the entry), True when they
+        pass (the entry's own failure), None when that cannot tell (no such ids, a rerun out of time or
+        one pytest ends with neither: the tip is checked alone in full)."""
+        cmd = fail[0]
+        ids = self._rerun_ids(cmd, fail[1], "tip")
+        if not ids:
+            return None
+        say(f"rerunning the {len(ids)} failing test(s) once on the tip {tip[:10]} alone: {' '.join(ids)}")
+        env = push.check_env("target", self.tip, self.check_run_dir)
+        self._runners([cmd], env)
+        slot = push.check_slot(tip, say, checkcap.label(self.p.name, f"push batch {self.id}"),
+                               priority=push.priority_key(self.repo, self.remote, self.branch), proj=self.p)
+        try:
+            rc, tail = self._run_ids(tip, cmd, ids, "tip", env, slot.env())
+        finally:
+            slot.close()
+        if rc == 1:
+            return str(cmd), tail
+        return True if rc in (0, NO_TESTS) else None
 
     def _caps(self, head: str, checks: list[str], plain: str) -> tuple[str, str] | bool | None:
         """A cap probe of `head`: only the prompt size cap tests (delivery.push_cap_tests) of each check
@@ -1226,7 +1304,10 @@ class Batch:
         prefixes (each prefix: entries 1..k plus a bump), checking the tip alone only when prefix 1
         fails. Returns (entries to push, head to push or None, (cmd, tail) of the blamed entry's
         failure or None). When every prefix passes and the full head passes on a rerun, the failure
-        was flaky: the full head goes.
+        was flaky: the full head goes. A failing check whose failing pytest ids pass on one rerun at the
+        same head passes there (_flaky). When prefix 1 fails, its failing ids are rerun once on the tip
+        alone first (_tip_ids): failing there too, the tip is broken (tip_failed); passing, entry 1 is
+        blamed; only when that cannot tell is the tip checked alone in full.
 
         A tip the queue knows fails on its own (the marker's "bad_tip", pushq._known_bad) is never
         checked alone again: no prefix passes unless it fixes the tip. The prefix of entries not yet
@@ -1300,6 +1381,14 @@ class Batch:
                 and self._caps(tip, checks, tip) is None:
             say(f"entry 1 breaks a prompt size cap the tip {tip[:10]} keeps (its cap tests alone)")
             return 0, None, fails[1]
+        if hi == 1 and (tf := self._tip_ids(tip, fails[1])) is not None:
+            if tf is True:
+                say(f"they pass on the tip {tip[:10]}: the failure is entry 1's own")
+                return 0, None, fails[1]
+            self.message = f"the tip of {self.target} fails its checks on its own: {tf[0]} (its failing tests rerun on it)"
+            say(self.message)
+            self.detail_tip = {"cmd": tf[0], "tail": tf[1]}
+            return 0, None, None
         if hi == 1:
             say(f"checking the tip {tip[:10]} alone")
             if (tf := self._check(tip, checks)) is not None:
@@ -1565,7 +1654,7 @@ def run_batch(p: Project, marker: Path) -> int:
     conflicts = b.conflicts()
     m.update(outcome=outcome, tip=b.tip, pushed_sha=b.pushed_sha, version=b.version, results=b.results(),
              checks=b.checks, rounds=b.rounds, message=b.message or None, conflicts=conflicts,
-             reach=b.reach or None, scope_held=b.scopes or None)
+             reach=b.reach or None, scope_held=b.scopes or None, flaky_tests=b.flaky or None)
     if ff:
         m["fast_forward"] = ff
     if conflicts["conflicted"]:

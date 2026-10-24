@@ -57,6 +57,8 @@ ABSENT_TTL_S = 300              # _absent's answer, asked before a transaction, 
 AFTER_PUSH_OFF = "after_push_off"   # kv: true while after_push is unset (alerts.holds)
 AFTER_PUSH_OK = "after_push_ok_at"  # kv: when an ordinary push's after_push last succeeded (alerts.holds)
 TIPS_TOLD = 20                  # tip_failed shas remembered, so each tip is reported once
+FLAKY_EVENT = "push_flaky_test"   # a batch's failing tests passed on a rerun at the same head (batch._flaky)
+FLAKY_TOLD_S = 86400.0          # a flaky test id is reported once in this long ("flaky_told")
 ROW_RESULTS = ("pushed", "landed", "conflict", "check_failed", "requeued", "refused", "scope_held")
 AFTER_STATES = ("ok", "failed", "timeout", "killed", "skipped")
 STATS_S = 7 * 86400            # the conflict counts `ttp push --queue` and the web app show cover this long
@@ -162,6 +164,25 @@ def _event(db, task: dict | None, kind: str, text: str, queued: bool, severity: 
     db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
          (time.time(), f"task:{task['id']}" if task else "daemon", kind, severity, text[:6000],
           "queued" if queued else "handled", task["id"] if task else None))
+
+
+def _flaky_told(db, st: dict, b, m: dict, now: float) -> None:
+    """The marker's flaky_tests (tests that failed and then passed on one rerun at the same head): one
+    queued FLAKY_EVENT naming the ids not reported in the last FLAKY_TOLD_S, so the coordinator queues a
+    fix that makes them deterministic."""
+    flaky = [f for f in m.get("flaky_tests") or [] if isinstance(f, dict)]
+    told = {k: v for k, v in (st.get("flaky_told") or {}).items() if isinstance(v, (int, float)) and now - v < FLAKY_TOLD_S}
+    new = sorted({str(i) for f in flaky for i in f.get("ids") or []} - set(told))
+    if new:
+        told.update({i: now for i in new})
+        heads = sorted({_short(str(f.get("head") or "")) for f in flaky if set(map(str, f.get("ids") or [])) & set(new)})
+        _event(db, None, FLAKY_EVENT,
+               f"flaky test{'s' if len(new) > 1 else ''} in push batch {b['id']}: {', '.join(new)} failed, then passed on "
+               f"one rerun at the same head ({', '.join(heads)}), so the batch went on. Queue a fix that makes "
+               f"{'them' if len(new) > 1 else 'it'} deterministic (wait on the real condition or a test clock, not "
+               f"wall time).", queued=True)
+    if told or "flaky_told" in st:
+        st["flaky_told"] = told
 
 
 def _reply(db, task: dict, new: str, text: str, need: str | None = None) -> None:
@@ -1371,6 +1392,7 @@ def _apply(p: Project, b: dict, m: dict, alert: Callable, now: float) -> None:
             st["tips_told"] = ((st.get("tips_told") or []) + [tip])[-TIPS_TOLD:]
             _event(db, None, "push_tip_failed", f"the push branch tip {_short(tip)} of {b['target']} fails its checks: "
                                                 f"`{cmd}`\n{_tail_of(m, d or first)}", queued=True, severity="high")
+        _flaky_told(db, st, b, m, now)
         if warn := push.ff_warnings(m.get("fast_forward")):
             _event(db, None, "push_not_ff", f"push batch {b['id']} pushed {_short(sha)} to {b['target']}, but "
                                             f"delivery.fast_forward_also or delivery.mirror_remotes did not move "

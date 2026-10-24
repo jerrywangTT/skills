@@ -18675,7 +18675,8 @@ def test_a_push_batch_resumes_a_pytest_check_that_was_cut(env, monkeypatch, caps
     flag.write_text("")
     rc, m = _run_batch(p, _batch_marker(p, heads), monkeypatch)
     assert m["results"][0]["status"] != "pushed", m
-    assert log.read_text().split() == ["a1", "a2", "b", "c"] * 2, "the head, then the tip alone"
+    assert log.read_text().split() == ["a1", "a2", "b", "c", "b", "b"], \
+        "the head, its failing test once more there, then only that test on the tip alone"
     flag.unlink()
     log.write_text("")
     capsys.readouterr()

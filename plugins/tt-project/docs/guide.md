@@ -948,7 +948,12 @@ project with `ttp config <name> jev.enabled false`. Without a key, screening is 
   resolve the conflict; a failed check fails the
   review and wakes the coordinator. The batch finds the first change that fails by checking
   prefixes, pushes the ones before it, and checks the ones after it once more without it, pushing
-  them too when they pass. Keys, all under `delivery`: `push_batch_s` (default 900: a
+  them too when they pass. A failed pytest check first reruns only its failing tests once at the
+  same head (at most 10, each once per batch, within `push_rerun_s`, default 600): when they pass
+  the failure was flaky, the batch goes on and the coordinator is told once per test so a
+  deterministic fix gets queued; a test that fails twice never passes. When the first change is
+  blamed, its failing tests are rerun once on the tip alone: failing there too, the tip is reported
+  broken instead of the change. Keys, all under `delivery`: `push_batch_s` (default 900: a
   batch starts once the oldest approval waited this long; 0 = at once), `push_batch_max`
   (default 8: start at once with this many; also the most one batch takes), `push_min_gap_s`
   (default 1800: a batch starts only once the last one ended at least this long ago, measured
