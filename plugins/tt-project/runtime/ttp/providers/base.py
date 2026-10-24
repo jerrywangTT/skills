@@ -120,6 +120,9 @@ def _nullable(sub):
     return sub
 
 
+# Linux refuses one argument longer than 128 KiB (MAX_ARG_STRLEN; the exec fails with E2BIG), so a
+# provider passes longer text some other way: a file flag, or leading the prompt (stdin).
+MAX_ARG_BYTES = 120_000
 # The API takes at most this many cache_control breakpoints per request; one more fails the whole
 # call with a 400 ("A maximum of 4 blocks with cache_control may be provided").
 MAX_CACHE_BREAKPOINTS = 4
@@ -293,6 +296,11 @@ class Provider:
     def append_system_args(self, path: Path) -> list[str]:
         """Arguments that add the text in `path` to the agent's system prompt, where a provider
         caches it across runs; [] when the agent cannot, and the text then leads the prompt."""
+        return []
+
+    def system_prompt_args(self, path: Path) -> list[str]:
+        """Arguments that make the text in `path` the agent's whole system prompt; [] when the agent
+        cannot (or not for text that long), and the text then leads the prompt."""
         return []
 
     def isolation_args(self) -> list[str]:

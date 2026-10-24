@@ -36,12 +36,14 @@ from pathlib import Path
 
 from . import register
 from ..budget import Window
-from .base import (AUTH_RE, LIMIT_RE, MAX_CACHE_BREAKPOINTS, Provider, RunUsage, cap_cache_breakpoints, cli_output,
-                   find_binary, request_rejected, status_check, strict_schema, drop_nulls)
+from .base import (AUTH_RE, LIMIT_RE, MAX_ARG_BYTES, MAX_CACHE_BREAKPOINTS, Provider, RunUsage, cap_cache_breakpoints,
+                   cli_output, find_binary, request_rejected, status_check, strict_schema, drop_nulls)
 
 EXCLUDE_DYNAMIC = "--exclude-dynamic-system-prompt-sections"
 APPEND_SYSTEM = "--append-system-prompt"
 APPEND_SYSTEM_FILE = "--append-system-prompt[-file]"   # how `--help` names the (unlisted) file form
+SYSTEM_PROMPT = "--system-prompt"
+SYSTEM_PROMPT_FILE = "--system-prompt[-file]"   # likewise for the replacing flag
 INPUT_FORMAT = "--input-format"
 # The prompt cache lifetimes the CLI takes in CLAUDE_CODE_PROMPT_CACHE_TTL. Unset, it picks 1 h on a
 # plan within its limits and 5 min otherwise (API key, or a plan past its limits).
@@ -225,9 +227,21 @@ class Claude(Provider):
     def append_system_args(self, path: Path) -> list[str]:
         if self.supports(APPEND_SYSTEM_FILE):
             return ["--append-system-prompt-file", str(path)]
-        if self.supports(APPEND_SYSTEM):
-            return [APPEND_SYSTEM, Path(path).read_text()]
-        return []
+        return self._inline(APPEND_SYSTEM, path) if self.supports(APPEND_SYSTEM) else []
+
+    def system_prompt_args(self, path: Path) -> list[str]:
+        """Arguments that make the text in `path` the whole system prompt; [] when it cannot go on
+        the command line, and the text then leads the prompt."""
+        if self.supports(SYSTEM_PROMPT_FILE):
+            return ["--system-prompt-file", str(path)]
+        return self._inline(SYSTEM_PROMPT, path)
+
+    @staticmethod
+    def _inline(flag: str, path: Path) -> list[str]:
+        # A CLI without the file flag takes the text as one argument. Linux refuses one longer than
+        # 128 KiB (E2BIG: the agent never starts), so longer text leads the prompt instead.
+        text = Path(path).read_text()
+        return [flag, text] if len(text.encode()) <= MAX_ARG_BYTES else []
 
     def write_fence(self) -> str:
         gap = "bypassPermissions without the Bash sandbox"

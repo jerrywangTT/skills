@@ -2116,7 +2116,12 @@ class Daemon:
             if system is not None:
                 (run_dir / "system.md").write_text(system)
                 if provider == "claude":
-                    argv = _with_system_prompt(provider, argv, run_dir / "system.md")
+                    argv, inline = _with_system_prompt(prov, argv, run_dir / "system.md")
+                    if not inline:   # too long for the command line: it leads what the agent reads
+                        if stdin is not None:
+                            stdin = _lead_input(stdin, system)
+                        else:
+                            prompt = system + "\n\n" + prompt
                 else:   # no replaceable system prompt: added to the agent's own, or leading the prompt
                     sys_args = prov.append_system_args(run_dir / "system.md")
                     if sys_args:
@@ -2925,6 +2930,16 @@ class Daemon:
             note["session_id"] = usage.session_id   # a run the host takes away resumes it (_resumable)
         if refused:
             note.update(refused=refused, not_waste="refused")   # never started a model turn: spent nothing
+        launch_error = str(exit_info.get("launch_error") or "")
+        if launch_error:
+            # The runner could not exec the agent (runner.launch_error): a failed run, never a lost
+            # one, and one observation per provider and role while it keeps failing the same way.
+            usage.error = usage.error or launch_error
+            note["launch_error"] = launch_error
+            log(p, f"run {r['id']} ({r['role']}, {r['provider']}) never started: {launch_error}")
+            self.observe("daemon:launch", f"{r['role']} run {r['id']} on {r['provider']} never started, a harness "
+                         f"launch failure: {launch_error}", "normal", whole=True,
+                         key=f"launch:{r['provider']}:{r['role']}")
         try:   # the model and effort the agent's session resolved for a pinned task (runner.check_pin)
             session = exit_info.get("session") or json.loads((run_dir / "run.json").read_text()).get("session")
         except (OSError, ValueError, AttributeError):
@@ -11190,10 +11205,22 @@ def _before_stdin(argv: list[str], extra: list[str]) -> list[str]:
     return argv[:-1] + extra + ["-"] if argv[-1:] == ["-"] else argv + extra
 
 
-def _with_system_prompt(provider: str, argv: list[str], path: Path) -> list[str]:
-    if provider == "claude":
-        return argv + ["--safe-mode", "--strict-mcp-config", "--tools", "", "--system-prompt", path.read_text()]
-    return argv
+def _with_system_prompt(prov, argv: list[str], path: Path) -> tuple[list[str], bool]:
+    """`argv` for a run whose system prompt is the text in `path`, and whether the text is in it. The
+    CLI reads the file itself where it can (--system-prompt-file): text past the per-argument limit
+    on the command line fails the exec (E2BIG) before the agent starts. Where it cannot and the text
+    is too long, it is left out and leads what the agent reads instead (stdin has no limit)."""
+    if prov.name != "claude":
+        return argv, False
+    sys_args = prov.system_prompt_args(path)
+    return argv + ["--safe-mode", "--strict-mcp-config", "--tools", "", *sys_args], bool(sys_args)
+
+
+def _lead_input(stdin: str, text: str) -> str:
+    """The stream-json user message in `stdin` with `text` as its first block (cached with the next)."""
+    msg = json.loads(stdin)
+    msg["message"]["content"].insert(0, {"type": "text", "text": text})
+    return json.dumps(msg) + "\n"
 
 
 def _explicit_clear(payload: str | None) -> bool:

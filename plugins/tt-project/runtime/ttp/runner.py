@@ -39,6 +39,7 @@ It survives a daemon restart: the daemon re-adopts runs by run_dir, pid and boot
 """
 from __future__ import annotations
 
+import errno
 import json
 import os
 import shutil
@@ -204,6 +205,18 @@ def _write_exit(run_dir: Path, info: dict) -> None:
             pass
 
 
+def launch_error(e: OSError, argv: list[str], env: dict) -> str:
+    """Why the agent could not be started, with the command line's size where that is the cause."""
+    why = f"could not start the agent: {e}"
+    if e.errno == errno.E2BIG:
+        sizes = [len(os.fsencode(a)) + 1 for a in argv]
+        total = sum(sizes) + sum(len(os.fsencode(f"{k}={v}")) + 1 for k, v in env.items())
+        longest = max(range(len(argv)), key=sizes.__getitem__) if argv else 0
+        why += (f" (command line {total} bytes; longest argument #{longest}, {sizes[longest] - 1} bytes"
+                f"{', after ' + argv[longest - 1] if longest else ''})")
+    return why[:400]
+
+
 def _agent_preexec(nice: int):
     """The agent's preexec_fn and whether it arms PR_SET_PDEATHSIG: its nice level, and on Linux a
     SIGTERM from the kernel to the agent the moment the runner dies (the watchdog ends the rest of
@@ -305,7 +318,7 @@ def supervise(run_dir: Path) -> int:
         wait_s = min(float(spec.get("exclusive_wait_s") or 600), timeout_s)
         held = _take_exclusive(run_dir, spec.get("exclusive") or [], spec.get("env", {}), started + wait_s,
                                spec.get("holds"), inherited)
-    if held is not None and stop_reason(run_dir):
+    def let_go(held: list) -> None:
         if held:
             # The slots may have been handed over from an earlier run's keeper: its jobs keep them.
             try:
@@ -315,6 +328,9 @@ def supervise(run_dir: Path) -> int:
                 print(f"runner: could not keep the run's resources for its detached jobs: {e}", flush=True)
         for h in held:
             h.close()
+
+    if held is not None and stop_reason(run_dir):
+        let_go(held)
         held = None
     if held is None:
         remove_files(spec.get("private_files") or [])
@@ -329,8 +345,20 @@ def supervise(run_dir: Path) -> int:
     err = open(run_dir / "stderr.log", "wb")
     nice = int(spec.get("nice") or 0)
     preexec, _ = _agent_preexec(nice)
-    child = subprocess.Popen(argv, stdin=prompt, stdout=out, stderr=err, cwd=cwd, env=env,
-                             start_new_session=True, preexec_fn=preexec)
+    try:
+        child = subprocess.Popen(argv, stdin=prompt, stdout=out, stderr=err, cwd=cwd, env=env,
+                                 start_new_session=True, preexec_fn=preexec)
+    except OSError as e:
+        # The agent never started (E2BIG: an argument or the whole command line past the kernel's
+        # limit; a missing binary): a harness fault the same argv repeats, booked as a launch failure.
+        for f in (prompt, out, err):
+            f.close()
+        let_go(held)
+        remove_files(spec.get("private_files") or [])
+        remove_tmp(run_dir, spec)
+        _write_exit(run_dir, {"rc": None, "started": started, "ended": time.time(), "launched": False,
+                              "launch_error": launch_error(e, argv, env)})
+        return 1
     guard, watchdog = _start_watchdog(child.pid)
     (run_dir / "child.pid").write_text(f"{child.pid}\n{proc_start(child.pid) or ''}\n")
     niceness = _niceness(child.pid)

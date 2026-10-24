@@ -40,8 +40,8 @@ import sys
 from pathlib import Path
 
 from . import register
-from .base import (AUTH_RE, LIMIT_RE, Provider, RunUsage, cli_output, price_row, request_rejected, status_check,
-                   stderr_tail, strict_schema, drop_nulls)
+from .base import (AUTH_RE, LIMIT_RE, MAX_ARG_BYTES, Provider, RunUsage, cli_output, price_row, request_rejected,
+                   status_check, stderr_tail, strict_schema, drop_nulls)
 
 # $ per million tokens: (input, cached input, output). Estimates only; the project may override
 # them in project.json under pricing.codex.<model>. Unknown models use the "default" row.
@@ -60,8 +60,6 @@ PROVIDER_CONFIG_RE = re.compile(r"^\s*(?:\[\s*)?[\"']?(?:model_providers?|cli_au
 # A command the harness's hook denied (logged by codex_core::tools::router): its text is the
 # command's, so it says nothing about the run's login or limits.
 HOOK_DENIAL_RE = re.compile(r"^.*Command blocked by PreToolUse hook.*$\n?", re.M)
-# Linux refuses one argument longer than 128 KiB; longer system text leads the prompt instead.
-MAX_ARG_BYTES = 120_000
 
 
 @register
