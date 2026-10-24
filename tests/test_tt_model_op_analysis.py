@@ -167,6 +167,18 @@ def write_support(run: pathlib.Path, verdicts: list[tuple[str, str, str]]) -> No
     write_rows(run / "device_op_support.csv", [dict(zip(SUPPORT_FIELDS, v)) for v in verdicts], SUPPORT_FIELDS)
 
 
+def support_from_rows(run: pathlib.Path) -> None:
+    """A verdict per device op that agrees with its row statuses, for tests about other checks."""
+    statuses: dict[str, set[str]] = {}
+    for r in read(run / "op_table.csv"):
+        statuses.setdefault(r["device_op"] or r["op_code"], set()).add(r["quasar-bf16:status"])
+    verdicts = []
+    for op, s in statuses.items():
+        verdict = ("✅" if "✅" in s else "n/a" if s == {"n/a"} else "❌" if s <= {"❌", "n/a"} else "⚠️")
+        verdicts.append((op, verdict, "test"))
+    write_support(run, verdicts)
+
+
 def test_device_op_support_missing_or_undecided_warns(tmp_path):
     run = make_static_run(tmp_path, [op_row(1, 1), op_row(2, 1)], [trace_row(1, 1, 2)])
     result = validate(run)
@@ -366,7 +378,9 @@ def test_shared_evidence_passes_and_fake_or_long_evidence_warns(tmp_path):
     (tmp_path / "a").mkdir()
     (tmp_path / "b").mkdir()
     rows = [op_row(i, 1, port_ev="same text") for i in range(1, 6)]
-    result = validate(make_static_run(tmp_path / "a", rows, [trace_row(1, 5, 1)]))
+    run = make_static_run(tmp_path / "a", rows, [trace_row(1, 5, 1)])
+    support_from_rows(run)
+    result = validate(run)
     assert result.returncode == 0 and "WARNING" not in result.stdout, result.stdout
     rows = [op_row(1, 1, port_ev="Row 1 (encoder 1): fork x"), op_row(2, 1, port_ev="x" * 301),
             op_row(3, 1, port_ev="TTsim run: t.py::a hang || " + "y" * 290)]
@@ -1269,6 +1283,7 @@ def test_merge_entry_pass_decides_source_statuses_again(tmp_path):
     assert got["5"] == ("❌", "TT_FATAL at x.cpp:1")
     passes = json.loads((run / "run.json").read_text())["entry_test_passes"]
     assert passes == {"by": "source:tracy on a local p150 device", "date": "2026-10-13", "result": "PCC 0.99"}
+    support_from_rows(run)
     v = validate(run)
     assert v.returncode == 0 and "WARNING" not in v.stdout, v.stdout
 
@@ -1288,6 +1303,7 @@ def test_merge_without_entry_pass_leaves_statuses_and_validator_warns(tmp_path):
     run = make_static_run(tmp_path, [no_pass_row(1, "A")], [trace_row(1, 1, 1)])
     run_merge(str(run), str(measured_seq(tmp_path / "m.csv", ["A"])))
     assert read(run / "op_table.csv")[0]["p150:status"] == "⚠️"
+    support_from_rows(run)
     assert "WARNING" not in validate(run).stdout
     data = json.loads((run / "run.json").read_text())
     data["entry_test_passes"] = {"by": "user", "date": "2026-10-13", "result": "pass"}
