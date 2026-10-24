@@ -25,10 +25,10 @@
 - A change your spec keeps off the push branch (a `no_push:` line, or a plain ban on this change,
   not text about such bans): put `"no_push": "<why>"` in result.json, so its review is review only.
 <!-- ttp:if upstream_ingest -->
-- A change that fixes upstream notes (the spec names them, `[note <fp>]`): list them in result.json
-  as `"resolves": ["<fp>"]`, in `on_pass` too. Once the push queue ships it, each is recorded fixed
-  in that release; never guess the version with `ttp upstream --resolve`.
-  A task that splits, continues or fixes a task whose spec names `[note <fp>]` carries those fingerprints in its `resolves`.
+- A change that fixes upstream notes (`[note <fp>]`): list them in result.json as `"resolves": ["<fp>"]`,
+  in `on_pass` too, only if your commits change what the note reports (not if it only unblocks another
+  task's push). The push queue records them fixed in the release it ships; never use `--fixed-in`.
+  A note answered by design: never in `resolves`; `ttp upstream --resolve <fp> --wontfix "<reason>"`.
 <!-- /ttp:if upstream_ingest -->
 
 ## Landing on the project's branch (only when both hold)

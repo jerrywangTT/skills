@@ -294,6 +294,8 @@ Each field's rules are in the section named; the table only lists them.
   spec of the code task that fixes it, whose hand-off lists it in `resolves`; the push queue then
   records it fixed in the release it pushes. A fix shipped another way gets `ttp upstream --resolve
   <fp> --fixed-in <version>`; a note that is not a plugin bug gets `--wontfix "<reason>"` instead of `--fixed-in`.
+  A note you answer as by design is never left to a hand-off's `resolves`: the spec says to close it won't-fix,
+  and a task that only continues or unblocks another names the note as context, not to resolve.
 <!-- /ttp:if upstream_ingest -->
 
 # Decide; do not wait

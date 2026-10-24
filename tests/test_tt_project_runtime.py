@@ -24740,6 +24740,7 @@ def test_a_code_task_is_told_to_list_the_upstream_notes_it_fixes_only_with_inges
     off, on = _sections(raw, {}), " ".join(_sections(raw, {"upstream": {"ingest": True}}).split())
     assert "resolves" not in off and "ttp:if" not in off
     assert '`"resolves": ["<fp>"]`' in on and "in `on_pass` too" in on and "ttp:if" not in on
+    assert "only unblocks another task's push" in on and "--wontfix" in on and "never in `resolves`" in on
 
 
 def test_a_project_without_upstream_ingest_reads_nothing(env):

@@ -7678,6 +7678,39 @@ def test_upstream_wontfix_closes_a_note_with_a_reason_and_no_release(env, monkey
     assert len(upstream._records()) == n and upstream.resolution(fp) is None
 
 
+def test_a_note_is_recorded_fixed_from_the_task_given_it_never_from_a_task_that_only_unblocked_it(env, monkeypatch):
+    """A review that accepts an earlier task's commits (`inherited`) reads that task's hand-off: a note
+    it lists is recorded with its own summary, even when the reviewed task (which only fixed a test in
+    the way of its push) lists it too. A note a run closed as by design (won't-fix) is never recorded
+    fixed, whichever hand-off lists it, and the listing shows no earlier fixed-in record for it."""
+    from ttp import pushq, upstream
+    s = _pq(env, monkeypatch)
+    notes = [{"title": f"upstream: g{i}", "spec": "s"} for i in range(3)]
+    upstream.append("other", 2, notes)
+    shared, inherited_only, by_design = (upstream.fingerprint(n["title"], "s") for n in notes)
+    orig = s.p.db.add_task("guard change", "s", kind="code", origin="coordinator")
+    s.p.db.update_task(orig, status="done", result=json.dumps(
+        {"status": "done", "summary": "the guard now allows the probe", "resolves": [shared, inherited_only]}))
+    fix = s.p.db.add_task("fix a test in the way of the guard change's push", "s", kind="code", origin="coordinator")
+    s.p.db.update_task(fix, status="done", result=json.dumps(
+        {"status": "done", "summary": "a test runs on a fake clock", "resolves": [shared, by_design]}))
+    s.p.db.update_task(s.review, status="done", labels=json.dumps([f"auto_review:{fix}"]), result=json.dumps(
+        {"status": "done", "push": [{"branch": s.branch, "head": s.head, "inherited": [orig]}]}))
+    upstream.resolve(by_design, "0.3.0", f"#{fix} an unrelated test fix", "demo")
+    run_dir = env["tmp"] / "run-by-design"
+    run_dir.mkdir()
+    upstream.queue_wontfix(run_dir, by_design, "by design: a read-only probe")
+    assert upstream.file_queued_acks(run_dir, "demo") == 1
+    assert dict(pushq.resolves_of(s.p, s.review))[shared]["id"] == orig
+    pushq._resolve_upstream(s.p, [s.review], "0.3.1")
+    for fp in (shared, inherited_only):
+        r = upstream.resolution(fp)
+        assert r["fixed_in"] == "0.3.1" and r["note"] == f"#{orig} the guard now allows the probe", fp
+    assert upstream.state(by_design) == "wontfix" and upstream.resolution(by_design)["fixed_in"] == "0.3.0"
+    [line] = [ln for ln in upstream.listing(None) if ln.startswith(by_design)]
+    assert "0.3.0" not in line and "unrelated" not in line and "by design: a read-only probe" in line
+
+
 def test_landing_alert_clears_without_approvals_and_is_not_raised_while_paused(env, monkeypatch):
     from ttp import alerts, pushq
     from ttp.daemon import Daemon

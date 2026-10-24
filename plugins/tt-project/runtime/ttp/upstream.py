@@ -1181,6 +1181,7 @@ def listing(name: str | None, now: float | None = None) -> list[str]:
     out = []
     for fp in fps:
         res, st = resolution(fp, recs), state(fp, now, recs)
+        res = None if wontfixed(fp, recs) else res   # closed as not a bug: an earlier fixed-in record no longer holds
         n = notes.get(fp) or {}
         title = n.get("title") or (f"filed by {n.get('project')}" if n.get("project") else "")
         out.append(f"{fp} {st}" + (f" in {res['fixed_in']}" if res else "") + (f": {title[:120]}" if title else "")

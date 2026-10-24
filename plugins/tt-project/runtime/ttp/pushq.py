@@ -1521,19 +1521,25 @@ def tend_scope_holds(p: Project, cfg: dict | None = None, now: float | None = No
 def resolves_of(p: Project, review_id: int) -> list[tuple[str, dict]]:
     """The upstream note fingerprints (upstream.fingerprint) the change review `review_id` approved
     fixes, each with the task that names it: the `resolves` lists in the hand-offs of the review, of
-    the code tasks it covers (push._reviewed) and of the tasks they continue, plus the open known notes
-    their specs name as `[note <fp>]`."""
+    the code tasks it covers (push._reviewed), of the tasks whose commits it accepted (`inherited` in
+    its push entries) and of the tasks they continue, plus the open known notes their specs name as
+    `[note <fp>]`. A note several hand-offs list goes to the earliest done code task that lists it:
+    the one the note was given to, not a later task that only continued or unblocked it."""
     review = p.db.task(review_id)
     tasks = [review] if review else []
     seen: set[int] = set()
-    for t in push._reviewed(p, str(review_id)):
+    entries = load_result(review.get("result")).get("push") if review else None
+    inherited = [p.db.task(int(str(i).lstrip("#"))) for e in (entries if isinstance(entries, list) else [])
+                 if isinstance(e, dict) and isinstance(e.get("inherited"), list)
+                 for i in e["inherited"] if str(i).lstrip("#").isdigit()]
+    for t in push._reviewed(p, str(review_id)) + [t for t in inherited if t]:
         while t and t["id"] not in seen:
             seen.add(t["id"])
             tasks.append(t)
             c = continues_id(t)
             t = p.db.task(c) if c is not None else None
     out: dict[str, dict] = {}
-    for t in tasks:
+    for t in sorted(tasks, key=lambda t: (t.get("kind") == "review", t.get("status") != "done", t["id"])):
         got = load_result(t.get("result")).get("resolves")
         for fp in (got if isinstance(got, list) else [got] if isinstance(got, str) else []):
             fp = str(fp).strip().lower()
@@ -1545,6 +1551,13 @@ def resolves_of(p: Project, review_id: int) -> list[tuple[str, dict]]:
             if len(out) < RESOLVES_MAX and fp not in out and upstream._filed(fp) and upstream.state(fp) == "open":
                 out[fp] = t
     return list(out.items())
+
+
+def _resolution_text(t: dict) -> str:
+    """What a note's fixed-in record says changed: the task that names it, with its own hand-off's
+    summary (its title when it has none), never another task's."""
+    summary = " ".join(str(load_result(t.get("result")).get("summary") or "").split())
+    return f"#{t['id']} {summary or t.get('title') or ''}"[:300]
 
 
 def _resolve_upstream(p: Project, review_ids: list[int], version: str | None) -> None:
@@ -1562,7 +1575,7 @@ def _resolve_upstream(p: Project, review_ids: list[int], version: str | None) ->
                 had = upstream.resolution(fp)
                 if had and had.get("fixed_in") == str(version).lstrip("v"):
                     continue
-                upstream.resolve(fp, version, f"#{t['id']} {t.get('title') or ''}"[:300], p.name)
+                upstream.resolve(fp, version, _resolution_text(t), p.name)
                 done.append(fp)
             except (OSError, ValueError) as e:
                 failed.append(f"{fp} ({e})")
