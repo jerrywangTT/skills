@@ -345,6 +345,12 @@ class _Guard:
             sig, rest = args[0][1:], args[1:]
             if sig.startswith("s") and len(sig) > 1 and not sig.isupper():   # -sKILL
                 sig = sig[1:]
+        while sig is not None and rest[:1] and re.fullmatch(r"-[sn].*|--signal(?:=.*)?", rest[0]):
+            # a later -s/-n/--signal replaces the signal (`kill -0 -s 9 <pid>` sends 9)
+            if rest[0] in ("-s", "-n", "--signal"):
+                sig, rest = (rest[1] if len(rest) > 1 else ""), rest[2:]
+            else:
+                sig, rest = rest[0].split("=", 1)[1] if rest[0].startswith("--") else rest[0][2:], rest[1:]
         if rest[:1] == ["--"]:
             rest = rest[1:]
         if sig is not None and re.fullmatch(r"(?:SIG)?0", sig, re.I):   # signal 0 sends nothing: a liveness probe

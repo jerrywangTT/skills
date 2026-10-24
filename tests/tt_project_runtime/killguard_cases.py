@@ -69,6 +69,11 @@ def test_kill_guard_signal_zero_probes_pass_and_real_signals_are_refused(kill_tr
         for wrap in ("{}", "sudo {}", "env X=1 {}", "timeout 5 {}", "bash -c '{}'", "true; {}", "true && {}", "echo | {}"):
             cmd = wrap.format(f"kill {sig} {o}".replace("  ", " "))
             assert _kill_refusal(cmd, t) is not None, cmd
+    # A later -s/-n/--signal replaces signal 0 (bash and /bin/kill then send it), so these are real signals.
+    for sig in ("-0 -s 9", "-0 -sKILL", "-s 0 -s 9", "-n 0 -n 9", "-0 --signal KILL", "-0 --signal=9", "-SIG0 -s TERM"):
+        assert _kill_refusal(f"kill {sig} {o}", t) is not None, sig
+    # Signal 0 given twice still sends nothing.
+    assert _kill_refusal(f"kill -0 -s 0 {o}", t) is None
 
 
 def test_kill_guard_allows_kill_of_own_tree_only(kill_tree):
