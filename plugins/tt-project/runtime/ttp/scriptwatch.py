@@ -5,8 +5,9 @@ shell part of the old file and part of the new: a syntax error, or the wrong com
 nothing about what the command checks. Before a run, watch() records the scripts a command names (a
 path in it, a file in the folder it runs in, or a bare command found on PATH, that starts with `#!` or ends in .sh/.bash) and the
 other scripts in their folders that a watched script names (by path or file name, a .py also by module name, or a glob such
-as *.sh), followed from script to script. An unrelated script beside them is not watched, so editing it costs no rerun; a
-script that cannot be read in full is taken to name all of its neighbours. rerun() runs the command; a run that failed while
+as *.sh, or a path it builds at run time: `$here/lib-$x.sh` names lib-*.sh), followed from script to script. An unrelated
+script beside them is not watched, so editing it costs no rerun; a script that cannot be read in full, or that builds a
+path ending in an expansion or a bare `*` (`"$here"/*`, `$here/$f`), is taken to name all of its neighbours. rerun() runs the command; a run that failed while
 one of them changed is run once more, on the new version, and said as LABEL. The rerun's result counts,
 so a real failure still fails; a failure with nothing changed is reported as before.
 """
@@ -28,6 +29,10 @@ MAX_FOLDER = 200   # a folder with more entries (/usr/bin) adds only the named s
 MAX_WATCHED = 200  # at most this many scripts per command
 MAX_READ = 1 << 20  # a longer script is taken to name every neighbour
 _GLOB = re.compile(r"[\w.*?\[\]-]*[*?][\w.*?\[\]-]*")
+_SUBST = re.compile(r"\$\(\([^()]*\)\)|\$\([^()]*\)|`[^`]*`")   # innermost $((..)), $(..) or `..`
+_EXPANSION = re.compile(r"\$\{[^}]*\}|\$[A-Za-z_]\w*|\$[0-9@*!]")   # not $? or $#: no path part
+_SPLIT = re.compile(r"[\s;|&<>()=]+")
+_X = "\0"   # an expansion, told apart from a literal *
 
 
 def _words(cmd: str) -> list[str]:
@@ -79,8 +84,9 @@ def scripts(cmd: str, cwd: str | Path, env: dict | None = None) -> list[Path]:
         if len(near) > MAX_FOLDER:
             continue
         text = _text(p)
+        built = _built(text) if text is not None else None
         for q in sorted(near):
-            if str(q) not in out and len(out) < MAX_WATCHED and _is_script(q) and _names(text, q.name):
+            if str(q) not in out and len(out) < MAX_WATCHED and _is_script(q) and _names(text, built, q.name):
                 out[str(q)] = q
                 todo.append(q)
     return list(out.values())
@@ -96,10 +102,36 @@ def _text(path: Path) -> str | None:
     return None if len(data) > MAX_READ else data.decode("utf-8", "replace")
 
 
-def _names(text: str | None, name: str) -> bool:
+def _built(text: str) -> set[str] | None:
+    """The globs a script's run-time-built paths give for a file name (`"$here/${n}.sh"` gives *.sh), or None
+    when one ends in an expansion or a bare `*` after a `/` (`"$here"/*`, `$(dirname "$0")/$1`): it may be
+    any neighbour. A word that is only an expansion or a `*` with no `/` ($x, $*, a case pattern) names none."""
+    for _ in range(50):
+        text, n = _SUBST.subn(_X, text)
+        if not n:
+            break
+    text = _EXPANSION.sub(_X, text).replace('"', "").replace("'", "")
+    out: set[str] = set()
+    for word in _SPLIT.split(text):
+        if _X not in word and "/*" not in word:
+            continue
+        slash, last = "/" in word, word.rpartition("/")[2]
+        if not last.strip(_X + "*"):
+            if slash and last:
+                return None
+            continue
+        if _X in last:
+            out.add(last.replace(_X, "*"))
+    return out
+
+
+def _names(text: str | None, built: set[str] | None, name: str) -> bool:
     """Whether a script's text names the neighbour `name`: its file name (alone or ending a path), its module
-    name for a .py, or a glob that matches it. When in doubt (an unreadable script) it does."""
-    if text is None:
+    name for a .py, a glob that matches it, or a path built at run time that may be it (`built`, from
+    _built()). When in doubt (an unreadable script, a built path that may be any file) it does."""
+    if text is None or built is None:
+        return True
+    if any(fnmatch.fnmatchcase(name, g) for g in built):
         return True
     stem, suffix = os.path.splitext(name)
     for word in {name, stem} if suffix == ".py" and stem else {name}:

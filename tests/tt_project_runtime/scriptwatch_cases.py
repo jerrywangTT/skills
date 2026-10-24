@@ -130,6 +130,27 @@ def test_scriptwatch_reruns_for_an_edited_dependency_but_not_for_an_unrelated_ne
         assert len(count) == runs
         assert said == ([f"{scriptwatch.LABEL}: bin/deep.sh"] if runs == 2 else [])
 
+def test_scriptwatch_watches_neighbours_a_script_reaches_through_a_path_built_at_run_time(tmp_path):
+    # A path built at run time is an ambiguous reference: include what it may name rather than drop it.
+    from ttp import scriptwatch
+    bin_ = tmp_path / "bin"
+    bin_.mkdir()
+    for name in ("lib.sh", "other.sh", "common.bash"):
+        (bin_ / name).write_text("x=1\n")
+    every = {"check.sh", "lib.sh", "other.sh", "common.bash"}
+    sh = {"check.sh", "lib.sh", "other.sh"}
+    for body, want in (('for f in "$here"/*; do . "$f"; done\n', every),
+                       ('. "$here/$n.sh"\n', sh),
+                       ('. "$here/${NAME}.sh"\n', sh),
+                       ('bash "$(dirname "$0")/$1"\n', every),
+                       ('ls "$here" | while read f; do bash "$here/$f"; done\n', every),
+                       ('. `dirname $0`/lib-$x.sh\n', {"check.sh"}),          # lib-*.sh: none here
+                       ('. "$here/l${x}b.sh"\n', {"check.sh", "lib.sh"}),
+                       ('echo $x $* "$@"; [ $? = 0 ] && echo $#\ncase $1 in *) ;; esac\n', {"check.sh"})):
+        (bin_ / "check.sh").write_text(body)
+        assert {p.name for p in scriptwatch.scripts("bash bin/check.sh", tmp_path, {"PATH": ""})} == want, body
+
+
 def test_ttp_checks_reruns_a_check_whose_script_was_rewritten_mid_run_and_labels_it(env, tmp_path, monkeypatch, capsys):
     from ttp import cli, scriptwatch
     p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
