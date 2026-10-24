@@ -5512,7 +5512,7 @@ def _machine_activity(a) -> None:
     from . import activity
     now = time.time()
     try:
-        since = activity.parse_since(a.since, now)
+        since = activity.parse_since(a.since, now, where=here())
     except ValueError as e:
         die(str(e))
     view = activity.machine_view(a.alias, since, now)
@@ -8122,7 +8122,7 @@ def main(argv: list[str] | None = None) -> None:
     m = ms.add_parser("activity", help="who holds, waits for or runs on a machine now, and the locks and detached "
                                        "jobs logged on it, from all your projects here (read only)")
     m.add_argument("alias", help="the machine")
-    m.add_argument("--since", help="window start: a delay back (30m, 6h, 2d) or an ISO time (default 24h)")
+    m.add_argument("--since", help="window start: a delay back (30m, 6h, 2d) or an ISO time (home zone unless it has an offset; default 24h)")
     m.add_argument("--json", action="store_true", help="print JSON")
     m = ms.add_parser("remove", help="remove a machine")
     m.add_argument("alias", help="the machine")

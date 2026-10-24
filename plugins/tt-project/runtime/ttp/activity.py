@@ -187,8 +187,9 @@ def in_window(s: dict, since: float, until: float) -> bool:
     return s.get("state") == "running" or start >= min(since, until - OPEN_BACK_S)
 
 
-def parse_since(raw: str | None, now: float, default_s: float = 86400) -> float:
-    """`--since`: a delay back (`30m`, `6h`, `2d`) or an ISO date or time (local unless it names a zone)."""
+def parse_since(raw: str | None, now: float, default_s: float = 86400, where=None) -> float:
+    """`--since`: a delay back (`30m`, `6h`, `2d`) or an ISO date or time, read in the home zone of `where`
+    (a Project, settings or zone name; None: timefmt.ambient()) unless it names a zone or offset."""
     s = (raw or "").strip()
     if not s:
         return now - default_s
@@ -197,9 +198,11 @@ def parse_since(raw: str | None, now: float, default_s: float = 86400) -> float:
         return now - int(m[1]) * {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 7 * 86400}[m[2]]
     iso = re.sub(r"([+-][0-9]{2})([0-9]{2})$", r"\1:\2", s.replace(" ", "T", 1).replace("Z", "+00:00"))
     try:
-        return datetime.fromisoformat(iso).timestamp()
+        d = datetime.fromisoformat(iso)
     except ValueError:
         raise ValueError(f"--since {raw!r}: use a delay such as 30m or 6h, or an ISO time such as 2026-10-05T09:00")
+    from . import timefmt
+    return (d if d.tzinfo else d.replace(tzinfo=timefmt.reading_zone(where))).timestamp()
 
 
 def _alias_hostnames(alias: str, known: dict) -> set[str]:

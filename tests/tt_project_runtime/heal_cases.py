@@ -3388,3 +3388,16 @@ def test_heal_timed_out_run_that_ends_healthy_late_does_not_extend_the_streak(en
     row = p.db.one("SELECT * FROM schedules WHERE name='svc'")
     assert heal.state(p.db, "svc")[heal.STREAK_KEY] == 1
     assert row["next_run"] - row["last_run"] == pytest.approx(300)
+
+
+def test_activity_since_reads_a_zone_less_time_in_the_home_zone(env, utc_box):
+    """`machines activity --since 2027-01-14 22:00` on a UTC box is 22:00 in the project's home zone (06:00 UTC
+    next day); a time with an offset or a delay is unchanged."""
+    from ttp import activity
+    now = 1_800_000_000.0
+    assert activity.parse_since("2027-01-14 22:00", now, where="America/Los_Angeles") == now - 7200
+    assert activity.parse_since("2027-01-15T06:00Z", now, where="America/Los_Angeles") == now - 7200
+    assert activity.parse_since("2h", now, where="America/Los_Angeles") == now - 7200
+    p = make(env)
+    p.set_config("home_timezone", "America/Los_Angeles")
+    assert activity.parse_since("2027-01-14 22:00", now, where=p) == now - 7200
