@@ -15184,3 +15184,78 @@ def test_connector_rule_leaves_isolation_no_internet_and_the_tool_allowlist_alon
     argv, run_env = _worker_env(p, monkeypatch)
     assert argv[argv.index("--tools") + 1] == "Bash,Read,Edit,Write,Skill,ToolSearch"
     assert run_env.get("ENABLE_CLAUDEAI_MCP_SERVERS") == "false"
+
+
+
+def _standing_memory_project(env):
+    """A project with 14 memory entries: standing preferences (for workers, unaddressed, one that
+    speaks of workers, and two for the coordinator), large pinned restrictions, resources and entries
+    for workers that overflow the workers' pinned room, and ordinary decisions and facts."""
+    p = make(env)
+    items = [("STANDING-PLAIN-1: reply in plain words.", None),
+             ("STANDING-PLAIN-2: name each run's spend in its hand-off.", None),
+             ("STANDING-WORKERS-3: workers report each allocation they hold.", None),
+             ("STANDING-TAGGED-4: keep each change on its own branch.", "workers"),
+             ("STANDING-COORD-5: answer the user within a day.", "coordinator"),
+             ("STANDING-COORD-6: plan the week on Mondays.", "coordinator")]
+    paths = {}
+    for i, (text, aud) in enumerate(items):
+        paths[text.split(":")[0]] = p.add_memory(text, kind="preference", title=f"standing {i}", standing=True,
+                                                 audience=aud)
+    p.add_memory("RULE-BIG never reboot a box mid-job. " + "r" * 2500, kind="restriction", title="rule big")
+    p.add_memory("BOX-BIG box A keeps its data on the scratch disk. " + "b" * 2500, kind="resource", title="box big")
+    p.add_memory("TAGGED-BIG benchmarks run warm. " + "t" * 2500, kind="decision", title="tagged big",
+                 audience="workers")
+    p.add_memory("DECISION-1 the cache stays on.", kind="decision", title="decision 1")
+    p.add_memory("DECISION-2 builds use the release profile.", kind="decision", title="decision 2")
+    for i in range(3):
+        p.add_memory(f"FACT-{i} the nightly run took {i + 1} h.", kind="fact", title=f"fact {i}")
+    assert len(p._memory_entries()) == 14
+    return p, paths
+
+
+@pytest.mark.parametrize("tier", ["light", "standard", "deep"])
+@pytest.mark.parametrize("kind", ["code", "work", "question", "review", "plan", "harness"])
+def test_every_worker_prompt_carries_every_standing_entry_for_workers(env, kind, tier):
+    """Every worker run's memory block carries each standing entry meant for workers (no audience, or
+    `workers`), whatever the kind, tier or memory budget; only entries that are not standing are
+    trimmed, and standing entries for the coordinator stay out."""
+    p, _ = _standing_memory_project(env)
+    from ttp.prompts import worker_context, worker_system
+    task = {"id": 1, "kind": kind, "tier": tier, "title": f"{kind}: tidy the nightly report",
+            "spec": "Edit notes/report.md only."}
+    system = worker_system(p, task)
+    block = system[system.index("# PROJECT MEMORY"):]
+    for want in ("STANDING-PLAIN-1", "STANDING-PLAIN-2", "STANDING-WORKERS-3", "STANDING-TAGGED-4"):
+        assert want in block, (want, block[:2000])
+    for gone in ("STANDING-COORD-5", "STANDING-COORD-6"):
+        assert gone not in system, gone
+    use = worker_context(p, task)[2]
+    assert use["pinned_dropped"] > 0, "the fixture must overflow the workers' pinned room"
+    assert "STANDING-" not in "".join(x for x in block.splitlines() if x.startswith("(")), "a pointer stands in"
+
+
+def test_standing_worker_memory_past_its_room_is_kept_whole_and_alerts_once(env):
+    """Standing entries for workers that alone outgrow the workers' pinned room are all kept, whole,
+    ahead of every other entry, and the coordinator is told once."""
+    p = make(env)
+    from ttp import coordinator as coord
+    from ttp.prompts import worker_context, worker_system
+    duties = [p.add_memory(f"DUTY-{i:02} report it each time. " + "s" * 900, kind="preference", title=f"duty {i}",
+                           standing=True) for i in range(8)]
+    p.add_memory("FACT-1 the nightly run took 2 h.", title="fact 1")
+    text, mem, use = worker_context(p)
+    assert use["standing_chars"] > use["memory_limit"] and use["pinned_dropped"] == 0, use
+    shown = {e["name"] for e in mem}
+    assert {d.stem for d in duties} <= shown and use["standing_over"]
+    system = worker_system(p)
+    for i in range(8):
+        assert f"DUTY-{i:02} report it each time. " + "s" * 900 in system, i
+    alerts = lambda: p.db.q("SELECT text FROM events WHERE kind='memory_over_budget'")
+    coord.memory_budget_check(p)
+    coord.memory_budget_check(p)
+    assert len(alerts()) == 1 and "8 standing entries for workers" in alerts()[0]["text"], alerts()
+    for d in duties[1:]:   # fits again: re-armed, silent
+        p.forget_memory(d.stem, why="test")
+    coord.memory_budget_check(p)
+    assert len(alerts()) == 1 and not p.db.kv(coord.MEMORY_ALERT_KEY)
