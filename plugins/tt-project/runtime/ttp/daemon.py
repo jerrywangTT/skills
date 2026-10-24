@@ -766,6 +766,11 @@ class Daemon:
                             f"{filled['legacy']} marked legacy")
         except Exception:  # a report backfill must never keep the daemon from starting
             log(self.p, "cache telemetry backfill error: " + traceback.format_exc().replace("\n", " | ")[:2000])
+        try:   # push batch files left `running` by a batch whose row is final (pushq.close_strays)
+            if closed := pushq.close_strays(self.p):
+                log(self.p, f"closed {len(closed)} stray push batch file(s)")
+        except Exception:
+            log(self.p, "stray batch file close error: " + traceback.format_exc().replace("\n", " | ")[:2000])
         signal.signal(signal.SIGTERM, lambda *_: setattr(self, "stopping", True))
         signal.signal(signal.SIGINT, lambda *_: setattr(self, "stopping", True))
         r = self.identity

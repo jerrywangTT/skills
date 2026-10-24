@@ -2881,6 +2881,12 @@ def test_a_batch_cut_short_by_a_reboot_runs_again_at_once_without_backoff(env, m
         assert not st.get("deaths") and not st.get("backoff_until")
         rows, why = pushq.due(s.p, time.time())
         assert rows and why == f"a rerun of {bid}, cut short by a reboot"
+        mk = json.loads(__import__("pathlib").Path(s.p.db.one("SELECT marker FROM push_batches WHERE id=?", (bid,))["marker"]).read_text())
+        assert mk["status"] == "finished" and mk["outcome"] == "rebooted" and mk["ended"]
+        again = _pq_batch(s)
+        mk = json.loads(__import__("pathlib").Path(s.p.db.one("SELECT marker FROM push_batches WHERE id=?",
+                                                              (bid,))["marker"]).read_text())
+        assert mk["rerun_by"] == again
     else:
         assert "ended before writing an outcome" in ev["text"] and outcome == "died"
         assert s.p.db.one("SELECT status, tries FROM push_queue") == {"status": "approved", "tries": 1}
@@ -11678,3 +11684,31 @@ def test_a_push_batch_blames_the_change_when_its_failing_test_fails_twice_on_it_
     assert ("tip", None) not in calls, "the tip is not checked alone in full"
     assert calls.count(("head", None)) == 3, "full head, prefix 1, and the entry after it: no further reruns"
     assert _git_out(origin, "rev-parse", "proj") == tip
+
+
+def test_stray_running_batch_file_is_closed_at_daemon_start_and_a_live_one_is_left(env, monkeypatch):
+    from ttp import pushq
+    s = _pq(env, monkeypatch)
+    monkeypatch.setattr(pushq.runner, "boot_time", lambda: None)
+    _pq_plan(s, die="push")
+    _pq_hand_off(env, s)
+    bid = _pq_batch(s)
+    row = s.p.db.one("SELECT marker FROM push_batches WHERE id=?", (bid,))
+    marker = __import__("pathlib").Path(row["marker"])
+    _pq_tend(s)
+    # Put the file back as the old code left it, then let the daemon-start step close it.
+    m = json.loads(marker.read_text())
+    for k in ("outcome", "ended", "rerun_by"):
+        m.pop(k, None)
+    m.update(status="running", phase="push")
+    marker.write_text(json.dumps(m))
+    assert pushq.close_strays(s.p) == [bid]
+    m = json.loads(marker.read_text())
+    assert m["status"] == "finished" and m["outcome"] == "died" and m["ended"]
+    # A row that is not final is never touched.
+    m.update(status="running")
+    m.pop("outcome")
+    marker.write_text(json.dumps(m))
+    s.p.db.x("UPDATE push_batches SET finalized=NULL WHERE id=?", (bid,))
+    assert pushq.close_strays(s.p) == []
+    assert json.loads(marker.read_text())["status"] == "running"

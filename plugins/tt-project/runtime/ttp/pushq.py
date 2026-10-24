@@ -830,6 +830,10 @@ def start(p: Project, rows: list[dict], name: str, now: float | None = None) -> 
         m["pid"] = child.pid
         write_json(marker, m)
         child.stdin.close()      # the go
+        prev = db.one("SELECT * FROM push_batches WHERE outcome='rebooted' AND id!=? ORDER BY started DESC LIMIT 1",
+                      (bid,))
+        if prev and _read(Path(prev["marker"])).get("rerun_by") is None:
+            _close_marker(prev, {"rerun_by": bid})
     except _Changed:
         marker.unlink(missing_ok=True)
         checkdirs.finish(Path(m["check_run_dir"]))
@@ -927,8 +931,49 @@ def _reboot_in(p: Project, started: float, now: float) -> float | None:
     return min((t for t in times if started < t <= now), default=None)
 
 
+def _close_marker(b: dict, extra: dict | None = None) -> None:
+    """Rewrite the batch's marker as finished with the DB row's outcome and end (atomic, never inside a
+    transaction), so a file never stays `running` once its row is final. A live batch is left alone."""
+    marker = Path(b["marker"])
+    m = _read(marker)
+    if not m or m.get("kind") != "batch" or not b.get("finalized"):
+        return
+    if m.get("status") == "finished" and m.get("outcome") and not extra:
+        return
+    if locks.any_free([Path(m["lock"])]) is False:
+        return
+    m.update(extra or {})
+    if m.get("status") != "finished" or not m.get("outcome"):
+        m.update(status="finished", phase="finished", outcome=b["outcome"], ended=b["ended"])
+    write_json(marker, m)
+
+
+def close_strays(p: Project) -> list[str]:
+    """At daemon start: close the marker of every batch whose DB row is already final but whose file
+    still says `running`. Rows still live are left alone."""
+    done = []
+    rows = p.db.q("SELECT * FROM push_batches WHERE finalized IS NOT NULL ORDER BY started")
+    for i, b in enumerate(rows):
+        m = _read(Path(b["marker"]))
+        if m and m.get("kind") == "batch" and m.get("status") == "running" and not m.get("outcome"):
+            nxt = next((r["id"] for r in rows[i + 1:]), None) if b["outcome"] == "rebooted" else None
+            _close_marker(b, {"rerun_by": nxt} if nxt else None)
+            done.append(b["id"])
+    return done
+
+
 def _died(p: Project, b: dict, m: dict, alert: Callable, why: str, now: float, queued: bool = False,
           rebooted: float | None = None) -> None:
+    was = p.db.one("SELECT finalized FROM push_batches WHERE id=?", (b["id"],))
+    _died_db(p, b, m, alert, why, now, queued, rebooted)
+    if was and was["finalized"] is None:
+        row = p.db.one("SELECT * FROM push_batches WHERE id=?", (b["id"],))
+        if row and row["finalized"]:
+            _close_marker(row)
+
+
+def _died_db(p: Project, b: dict, m: dict, alert: Callable, why: str, now: float, queued: bool = False,
+             rebooted: float | None = None) -> None:
     """A batch that ended without a usable outcome: its rows go back to approved, a try counted, and
     the queue backs off. DYING_AFTER of them in a row raise push_queue_dying. `queued`: the event
     needs the coordinator (something is left that the queue cannot recover). `rebooted`: the boot
