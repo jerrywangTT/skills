@@ -8026,6 +8026,9 @@ class Daemon:
 
     def _start_probe(self, tid: int, probe: str, now: float, what: str = "retry_when") -> None:
         self._probed[tid] = now
+        if ends.hides_test(probe):   # stored before it was refused: a broken probe, never a pass
+            self._probe_rc[tid] = (ends.TRIVIAL_WHY, now, probe)
+            return
         # One run per distinct command per probe cycle: tasks waiting on the same thing share it.
         for other, run in self._probes.items():
             if other != tid and run[2] == probe:

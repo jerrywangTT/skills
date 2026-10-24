@@ -14276,7 +14276,7 @@ def test_a_probe_only_coordinator_pause_outlasts_a_timed_coordinator_hold(env, t
     a, b, _ = _fleet(env, tmp_path)
     coord.pause_machine(a, "box1", True, by="coordinator", end=pauseends.from_action({"until": "1d"}))
     assert coord.apply(a, [{"type": "resource_pause", "resource": "box1-chip0", "paused": True,
-                            "end_when": "true"}]) == []
+                            "end_when": "test -d ."}]) == []
     got = a.db.paused_resources(shared=False)["box1-chip0"]
     assert got["by"] == "coordinator" and not got.get("until"), got
 
@@ -14336,7 +14336,7 @@ def test_a_fleet_user_hold_shows_when_its_end_when_passed_and_a_broken_probe_nev
     assert "can no longer be checked" in ev and "Tell the user once that it passed" not in ev
     assert "end condition passed" not in status_text(a) and "ends only on the user's word" in status_text(a)
     fleethold.lift("box1", True, "test")
-    fleethold.set_hold("box1", "", "user", "demo", {"end_when": "true"})
+    fleethold.set_hold("box1", "", "user", "demo", {"end_when": "test -d ."})
     pe = pauseends.PauseEnds(a)
     assert _settle_end_probes(pe, now + 3 * pauseends.PROBE_EVERY_S) == ["machine:box1"]
     hold = fleethold.active()["box1"]
@@ -14346,7 +14346,7 @@ def test_a_fleet_user_hold_shows_when_its_end_when_passed_and_a_broken_probe_nev
     assert shown in fleethold.line(hold, a) and shown in status_text(a)
     # A new hold (another identity) does not show the old pass.
     fleethold.lift("box1", True, "test")
-    fleethold.set_hold("box1", "", "user", "demo", {"end_when": "true"})
+    fleethold.set_hold("box1", "", "user", "demo", {"end_when": "test -d ."})
     assert "end condition passed" not in fleethold.line(fleethold.active()["box1"], a)
 
 
@@ -15259,3 +15259,159 @@ def test_standing_worker_memory_past_its_room_is_kept_whole_and_alerts_once(env)
         p.forget_memory(d.stem, why="test")
     coord.memory_budget_check(p)
     assert len(alerts()) == 1 and not p.db.kv(coord.MEMORY_ALERT_KEY)
+
+
+ALWAYS_0 = ["test -e /tmp/fixed || true", "check-board; exit 0", "test -e x || :"]
+REAL_ENDS = ["test -e /tmp/fixed || exit 1", "test -e /tmp/fixed", "ttp lock --probe board | grep -q free"]
+
+
+def test_an_end_probe_that_always_exits_0_is_refused_and_a_real_test_is_kept(env, capsys):
+    """A memory or charter until_probe, a pause's or a mute's end_when, and a task's start_when or
+    retry_when that tests something and then always exits 0 would end (or start) what waits on it at
+    once: each is refused on one line pointing to `|| exit 1`, and nothing is written. A real test is kept,
+    and so are `landed:#<id>` and a bare `true` as a task's deliberate "now"."""
+    p = make(env)
+    from ttp import cli, coordinator as coord
+    from ttp import screen as scr
+    for bad in ALWAYS_0:
+        problems = coord.apply(p, [
+            {"type": "resource_pause", "resource": "board", "paused": True, "end_when": bad},
+            {"type": "memory_add", "text": "Stay off box A for now.", "until_probe": bad},
+            {"type": "charter_update", "section": "Restrictions", "text": "Leave the queue alone.", "until_probe": bad},
+            {"type": "task_add", "spec": "s", "title": "later", "start_when": bad},
+            {"type": "observation_mute", "source": "watcher:hw", "match": "dropped", "end_when": bad}])
+        assert len(problems) == 5 and all("always exits 0" in x and "|| exit 1" in x and "\n" not in x
+                                          for x in problems), problems
+    assert p.db.paused_resources() == {} and scr.mutes(p.db) == []
+    assert not p.db.one("SELECT id FROM tasks WHERE title='later'")
+    assert [e for e in p._memory_entries() if e.get("end")] == []
+    assert "Leave the queue alone." not in p.charter_path.read_text()
+    with pytest.raises(SystemExit):
+        cli.main(["pause", "demo", "--resource", "board", "--end-when", ALWAYS_0[0]])
+    assert "always exits 0" in capsys.readouterr().err
+    tid = _due_waiting_task(p, "exit 1")
+    with pytest.raises(SystemExit):
+        cli.main(["task", "demo", "set-when", str(tid), ALWAYS_0[1]])
+    assert "retry_when always exits 0" in capsys.readouterr().err
+    assert json.loads(p.db.task(tid)["result"])["retry_when"] == "exit 1"
+    deferred = p.db.add_task("deferred", "s", kind="work", tier="light", origin="user")
+    assert coord.apply(p, [{"type": "task_update", "id": deferred, "start_when": "test -e x"}]) == []
+    problems = coord.apply(p, [{"type": "task_update", "id": deferred, "start_when": ALWAYS_0[0]}])
+    assert problems and "start_when always exits 0" in problems[0], problems
+    for i, good in enumerate(REAL_ENDS):
+        assert coord.apply(p, [
+            {"type": "resource_pause", "resource": f"board{i}", "paused": True, "end_when": good},
+            {"type": "memory_add", "text": f"Stay off box {i} for now.", "until_probe": good},
+            {"type": "task_add", "spec": "s", "title": f"later {i}", "start_when": good},
+            {"type": "observation_mute", "source": "watcher:hw", "match": f"dropped {i}", "end_when": good}]) == []
+        cli.main(["task", "demo", "set-when", str(tid), good])
+        assert json.loads(p.db.task(tid)["result"])["retry_when"] == good
+    assert coord.apply(p, [{"type": "task_add", "spec": "s", "title": "after", "start_when": f"landed:#{deferred}"},
+                           {"type": "task_add", "spec": "s", "title": "now", "start_when": "true"}]) == []
+    # An on_pass_cmd is a command, not a probe: its `|| true` is fine.
+    coord.check_probe("cleanup || true", "on_pass_cmd")
+
+
+def _store_trivial(path, good, bad):
+    path.write_text(path.read_text().replace(good, bad))
+
+
+def test_a_stored_always_0_until_probe_never_retires_its_entry_and_is_reported_once(env):
+    """A memory entry or charter section stored with such a probe (before it was refused) is never retired
+    by it: the probe never runs and is listed broken (ends.BROKEN_KEY) for the digest. Its expires still
+    ends it."""
+    p = make(env)
+    from ttp import coordinator as coord
+    from ttp import ends
+    good, bad = "test -e /tmp/fixed || exit 1", "test -e /tmp/fixed || true"
+    assert coord.apply(p, [{"type": "memory_add", "text": "Stay off box A for now.", "until_probe": good,
+                            "expires": "2d"},
+                           {"type": "charter_update", "section": "Restrictions", "text": "Leave the queue alone.",
+                            "until_probe": good}], turn=5) == []
+    for f in p.memory_dir.glob("*.md"):
+        _store_trivial(f, good, bad)
+    _store_trivial(p.charter_path, good, bad)
+    assert sorted(i["end"]["probe"] for i in ends.temporaries(p)) == [bad, bad]
+    e, now = ends.Ends(p), time.time()
+    for i in range(3):
+        assert e.tick(now + i * (ends.PROBE_EVERY_S + ends.CHECK_EVERY_S)) == []
+        assert not e._procs, "never run"
+    broken = p.db.kv(ends.BROKEN_KEY)
+    assert len(broken) == 2 and all("always exits 0" in v for v in broken.values()), broken
+    assert "Leave the queue alone." in p.charter_path.read_text() and len(list(p.memory_dir.glob("*.md"))) == 1
+    assert ends.digest_lines(p, now, now) == []   # first seen: listed for the coordinator a day later
+    lines = ends.digest_lines(p, now, now + ends.RECHECK_S + 1)
+    assert sum("until_probe is broken" in x and "always exits 0" in x for x in lines) == 2, lines
+    assert not ends.digest_lines(p, now, now + ends.RECHECK_S + 2), "once a day"
+    retired = e.tick(now + 3 * 86400)
+    assert len(retired) == 1 and "expired" in retired[0], "its expires still ends the memory entry"
+    assert "Leave the queue alone." in p.charter_path.read_text()
+    e.stop()
+
+
+def test_a_stored_always_0_end_when_never_lifts_a_pause_or_ends_a_mute(env):
+    """A pause or a mute stored with such an end_when: the probe never runs, it is reported once as a
+    broken probe, and the pause keeps its `until` (whose passing is still reported) and the mute its time."""
+    p = make(env)
+    from ttp import coordinator as coord, pauseends
+    from ttp import screen as scr
+    good, bad = "test -e /tmp/fixed || exit 1", "test -e /tmp/fixed || true"
+    assert coord.apply(p, [{"type": "resource_pause", "resource": "board", "paused": True, "end_when": good,
+                            "until": "1d", "reason": "flaky"},
+                           {"type": "observation_mute", "source": "watcher:hw", "match": "dropped",
+                            "end_when": good, "hours": 6}]) == []
+    with p.db.tx():
+        paused = p.db.paused_resources()
+        p.db.set_kv("paused_resources", {**paused, "board": {**paused["board"], "end_when": bad}})
+        mutes = p.db.kv(scr.MUTES_KEY)
+        mutes[0]["end_when"] = bad
+        p.db.set_kv(scr.MUTES_KEY, mutes)
+    assert p.db.paused_resources()["board"]["end_when"] == bad
+    until = p.db.paused_resources()["board"]["until"]
+    pe, me, now = pauseends.PauseEnds(p), pauseends.MuteEnds(p), time.time()
+    for i in range(3):
+        at = now + i * (pauseends.PROBE_EVERY_S + pauseends.CHECK_EVERY_S)
+        assert pe.tick(at) == (["board"] if i == 0 else []) and me.tick(at) == []
+        assert not pe._procs and not me._procs, "never run"
+    [due] = [e["text"] for e in p.db.q("SELECT text FROM events WHERE kind='pause_end_due'")]
+    assert "broken" in due and "always exits 0" in due and "passed" not in due, due
+    assert p.db.paused_resources()["board"]["until"] == until
+    [m] = scr.mutes(p.db)
+    assert m["probe_broken"] and "always exits 0" in m["probe_broken"] and m["until"] > now + 5 * 3600
+    broken = [e["text"] for e in p.db.q("SELECT text FROM events WHERE kind='observation'") if "broken" in e["text"]]
+    assert len(broken) == 1, broken
+    assert pe.tick(until + 1) == ["board"], "its until passing is still reported"
+    assert "end time" in p.db.q("SELECT text FROM events WHERE kind='pause_end_due'")[-1]["text"]
+    assert pe.tick(until + 1000) == []
+    pe.stop()
+    me.stop()
+
+
+def test_a_stored_always_0_task_probe_never_starts_or_wakes_its_task(env, monkeypatch):
+    """A start_when or retry_when stored with such a probe is never run: a deferred task stays deferred with one
+    deferral_probe_broken event, and a waiting task is not woken by it (only at its timer, as broken)."""
+    p = make(env)
+    from ttp import coordinator as coord
+    from ttp import daemon as dmod
+    monkeypatch.setattr(dmod, "PROBE_EVERY_S", 0)
+    bad = "test -e /tmp/fixed || true"
+    coord.apply(p, [{"type": "task_add", "title": "deferred", "spec": "s", "start_when": "test -e /tmp/fixed"}])
+    tid = _added(p, "deferred")
+    labels = [l.replace("test -e /tmp/fixed", bad) for l in json.loads(p.db.task(tid)["labels"])]
+    p.db.update_task(tid, labels=labels)
+    waiting = _due_waiting_task(p, bad)
+    p.db.update_task(waiting, not_before=time.time() + 3600)
+    d = dmod.Daemon(p.base)
+    for _ in range(2):
+        d.probe_waiting()
+        assert tid not in d._probes and waiting not in d._probes, "never run"
+    assert not _ready(p, tid) and p.db.task(waiting)["not_before"] > time.time() + 3000
+    [ev] = p.db.q("SELECT text FROM events WHERE kind='deferral_probe_broken'")
+    assert "always exits 0" in ev["text"], ev["text"]
+    # At its timer the waiting task wakes as broken, never as a passed probe.
+    monkeypatch.setattr(dmod, "PROBE_EVERY_S", 60)
+    p.db.update_task(waiting, not_before=time.time() - 1)
+    d.probe_waiting()
+    d.probe_waiting()
+    woke = json.loads(p.db.task(waiting)["result"])["woke"]
+    assert _ready(p, waiting) and woke.startswith("probe broken") and "always exits 0" in woke, woke

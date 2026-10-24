@@ -585,8 +585,9 @@ def mute(db: DB, source: Any, match: Any, hours: Any, below: Any = None, why: An
         raise ValueError(f"observation_mute `end_when` must be one shell command on one line, at most "
                          f"{MUTE_PROBE_CHARS} characters (exit 0 once the mute can end, 1 while not)")
     if probe:
-        from .ends import check_sh
+        from .ends import check_not_trivial, check_sh
         check_sh(probe, "observation_mute `end_when`")
+        check_not_trivial(probe, "observation_mute `end_when`")
     h = None
     if not (probe and hours in (None, "")):
         try:

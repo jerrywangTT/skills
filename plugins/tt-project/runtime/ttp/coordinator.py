@@ -1372,7 +1372,9 @@ def _hold_anchor(db, task: dict, a: dict, turn_asks: list[tuple[int, int]], late
 
 
 def check_probe(probe, what: str = "start_when") -> None:
-    """A task's shell probe (start_when, or a waiting task's retry_when): one command, bounded."""
+    """A task's shell probe (start_when, or a waiting task's retry_when): one command, bounded. One that
+    tests something and then always exits 0 (ends.hides_test) is refused: it would start or wake the
+    task at once."""
     if not isinstance(probe, str) or len(probe) > START_WHEN_CHARS:
         raise ValueError(f"{what} must be one shell command of at most {START_WHEN_CHARS} characters")
     if re.match(r"\s*landed:", probe, re.I) and not re.fullmatch(r"\s*landed:\s*#?\d+\s*", probe):
@@ -1381,6 +1383,8 @@ def check_probe(probe, what: str = "start_when") -> None:
                          f"`ttp landed --task <id> && ...`")
     if probe.strip() and not landed.LANDED_PROBE.fullmatch(probe):
         ends.check_sh(probe.strip(), what)
+        if what != "on_pass_cmd" and ends.hides_test(probe):   # a bare `true` stays: a deliberate "now"
+            ends.check_not_trivial(probe.strip(), what)
 
 
 def start_why(a: dict, cur: dict, when: str | None) -> str | None:

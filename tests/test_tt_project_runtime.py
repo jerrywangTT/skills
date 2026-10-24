@@ -38427,7 +38427,7 @@ def test_a_probe_that_exits_0_wakes_its_task_and_is_never_flagged(env, tmp_path)
     _settle_probe(d, unknown)
     assert _ready(p, unknown) and not _never(p, unknown)
     # The same for any probe that passes, even one naming a run dir that is gone.
-    gone = _due_waiting_task(p, f"test -e {p.runs}/99999/done || true")
+    gone = _due_waiting_task(p, f"test -e {p.runs}/99999/done || test -d .")
     _settle_probe(d, gone)
     assert _ready(p, gone) and not _never(p, gone)
 
@@ -45590,12 +45590,12 @@ def test_a_mute_that_ended_with_nothing_muted_or_by_its_probe_settles_without_a_
     scr.expire_mutes(p.db, now)
     assert ended()[-1][1] == "queued" and "3 observations" in ended()[-1][0]
     # Ended by its end_when probe (the recovery condition passed): settled, whatever it counted.
-    scr.mute(p.db, "watcher:hw", "held", 6, now=now, end_when="true")
+    scr.mute(p.db, "watcher:hw", "held", 6, now=now, end_when="test -d .")
     with p.db.tx():
         [m] = p.db.kv(scr.MUTES_KEY)
         m.update(count=2, last_at=now)
         p.db.set_kv(scr.MUTES_KEY, [m])
-    assert scr.end_mute(p.db, "watcher:hw", "held", "true", "probe `true` passed", now=now + 1)
+    assert scr.end_mute(p.db, "watcher:hw", "held", "test -d .", "probe `test -d .` passed", now=now + 1)
     assert ended()[-1][1] == "handled" and "2 observations" in ended()[-1][0]
 
 

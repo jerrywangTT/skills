@@ -68,6 +68,7 @@ def from_action(a: dict, now: float | None = None, p: Project | None = None, by:
         raise ValueError(f"end_when must be one shell command on one line, at most {ends.PROBE_CHARS} characters")
     if probe and probe.strip():
         ends.check_sh(probe.strip(), "end_when")
+        ends.check_not_trivial(probe.strip(), "end_when")
         out["end_when"] = probe.strip()
     elif p is not None and (by == "coordinator" or not out.get("until")):
         health = health_end(p, a.get("resource"))
@@ -300,9 +301,14 @@ class PauseEnds:
             probe, rc = v.get("end_when"), verdicts.get(name, (None, "", ""))
             if isinstance(probe, dict):
                 probe = None   # health results come from heal.run, never a shell probe; `until` still ends it
-            why, state = "", "passed"
+            why, state, mark = "", "passed", _sig(v)
             if v.get("until") and float(v["until"]) <= now:
                 why = f"its end time {ends.shown(float(v['until']), self.p)} passed"
+            elif probe and ends.always_succeeds(probe):
+                # Stored before it was refused: never run. Reported once as broken under its own mark,
+                # so its `until` passing is still reported after it.
+                state, mark = "broken", _sig(v) + "|always 0"
+                why = f"its end_when probe `{probe}` is broken: {ends.TRIVIAL_WHY}"
             elif probe and rc[1] == probe and rc[0] == 0:
                 why = f"its end_when probe `{probe}` passed"
             elif probe and rc[1] == probe and detach.failed_check(probe, rc[0]):
@@ -314,9 +320,9 @@ class PauseEnds:
                 why = (f"its end_when probe `{probe}` is broken "
                        f"({rc[0] if isinstance(rc[0], str) else f'exit {rc[0]}'}): it would never end"
                        + (f". Its stderr: {rc[2]}" if rc[2] else ""))
-            if why and sent.get(name) != _sig(v):
+            if why and sent.get(name) != mark:
                 _queue(db, name, v, why, now, state)
-                sent[name] = _sig(v)
+                sent[name] = mark
                 due.append(name)
             elif probe and not why and name not in self._procs and now - self._probed.get(name, 0) >= PROBE_EVERY_S:
                 self._start(name, probe, now)
@@ -497,6 +503,9 @@ class MuteEnds:
         for m in scr.mutes(self.p.db, now):
             probe = m.get("end_when")
             if not probe:
+                continue
+            if ends.always_succeeds(probe):   # stored before it was refused: never run; its time ends the mute
+                scr.mute_probe_broken(self.p.db, m["source"], m["match"], probe, ends.TRIVIAL_WHY, now, where=self.p)
                 continue
             key = f"{m['source'].lower()}\n{m['match'].lower()}"
             rc, ran, err = verdicts.get(key, (None, "", ""))

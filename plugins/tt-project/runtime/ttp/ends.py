@@ -176,6 +176,17 @@ def check_not_trivial(probe: str, what: str) -> None:
                          f"that ends with `|| exit 1`, e.g. `test -e /path/to/marker || exit 1`")
 
 
+def hides_test(probe: str) -> bool:
+    """always_succeeds, but not only `true`, `:` or `exit 0` steps: a probe that runs a test and then
+    drops its answer (`test -e x || true`). A task's bare `true` is a deliberate "now" (`set-when <id>
+    true` wakes it); this one would start or wake a task by mistake."""
+    return always_succeeds(probe) and not all(_trivial_command(c) for _, c in _top_level(probe))
+
+
+TRIVIAL_WHY = ("it always exits 0 (it ends in `true`, `:` or `exit 0`, e.g. after `|| true`), so it never tells "
+               "over from not yet; restate it ending in `|| exit 1`")
+
+
 def stamp(ts: float) -> str:
     """The stored form (charter lines, front matter); `shown` is the one people read."""
     return time.strftime("%Y-%m-%dT%H:%MZ", time.gmtime(ts))
@@ -241,6 +252,7 @@ def from_action(a: dict, now: float | None = None, where=None) -> dict:
         if not isinstance(probe, str) or "\n" in probe.strip() or len(probe) > PROBE_CHARS:
             raise ValueError(f"until_probe must be one shell command on one line, at most {PROBE_CHARS} characters")
         check_sh(probe.strip(), "until_probe")
+        check_not_trivial(probe.strip(), "until_probe")
         out["probe"] = probe.strip()
     return out
 
@@ -381,7 +393,7 @@ class Ends:
         retired, broken = [], dict(self.p.db.kv(BROKEN_KEY) or {})
         for item in temporaries(self.p):
             end, key = item["end"], item["key"]
-            rc = verdicts.get(key, (None, "", ""))
+            rc = verdicts.get(key, (None, "", "")) if not always_succeeds(end.get("probe") or "") else (None, "", "")
             why = ""
             if end.get("expires") and end["expires"] <= now:
                 why = f"expired {shown(end['expires'], self.p)}"
@@ -389,6 +401,9 @@ class Ends:
                 why = "its until_probe passed"
             elif end.get("probe") and rc[1] == end["probe"] and failed_check(end["probe"], rc[0]):
                 why = f"the detached job its until_probe waits on ended but failed or left no exit code ({detach.failed_why(end['probe'], rc[0], self.p.root)})"
+            if not why and end.get("probe") and always_succeeds(end["probe"]):
+                broken[key] = TRIVIAL_WHY   # stored before it was refused: never run, only its expires ends it
+                continue
             if why:
                 try:
                     retire(self.p, item, why, now)
