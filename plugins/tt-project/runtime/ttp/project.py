@@ -920,7 +920,7 @@ _WORKER_WORD = re.compile(r"\bworkers?\b", re.I)
 
 def worker_memory(e: dict) -> int:
     """Where memory entry `e` stands in a worker's prompt: 1, pinned (tagged for workers,
-    restrictions, resources, standing entries); 2, shown first while they fit (entries that speak of
+    restrictions, resources, standing entries; worker_always says which of them no limit drops); 2, shown first while they fit (entries that speak of
     workers); 3, then the newest facts that fit; 0, never (the rest, written for the coordinator:
     decisions and preferences that are not standing, and anything tagged for the coordinator but a
     restriction)."""
@@ -929,6 +929,13 @@ def worker_memory(e: dict) -> int:
     if e["kind"] in ("restriction", "resource") or e.get("standing"):
         return 1
     return 2 if _WORKER_WORD.search(e["line"]) else 3 if e["kind"] == "fact" else 0
+
+
+def worker_always(e: dict) -> bool:
+    """Whether a worker's prompt carries pinned entry `e` whatever its limits: the set the coordinator
+    always shows (restrictions, resources, standing entries). Other pinned ones (tagged for workers)
+    fill the room left."""
+    return bool(e["kind"] in ("restriction", "resource") or e.get("standing"))
 
 
 _TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_./#:-]*[A-Za-z0-9]")
@@ -1373,7 +1380,8 @@ class Project:
     def worker_memory_select(self, limit_chars: int, task: dict | None = None, pinned_limit: int | None = None,
                              restated=None) -> tuple[list[dict], dict]:
         """The entries a worker's prompt gets, whole, oldest first: those worker_memory pins, the
-        standing ones always, whatever the limits, then the others while they fit `pinned_limit` (None:
+        restrictions, resources and standing ones always (worker_always), whatever the limits, then the
+        others while they fit `pinned_limit` (None:
         all; when not all fit, those that share the most words with `task` first, then the oldest);
         then, only if every pinned one fits: for `task`, the
         others that share words with its title and spec (task_words; a word few entries share weighs
@@ -1381,8 +1389,8 @@ class Project:
         then the facts, newest first while all fit `limit_chars`. An entry whose text `restated(text)`
         says the prompt already states (the charter's restrictions) is left out. Usage numbers as
         memory_select's, counting only the entries meant for workers, plus `duplicates` (left out as
-        restated), `pinned_dropped` (pinned ones past `pinned_limit`), `standing_chars` and
-        `standing_over` (the standing ones alone outgrow `pinned_limit`, or `limit_chars` without one).
+        restated), `pinned_dropped` (pinned ones past `pinned_limit`), `kept`, `kept_chars` and
+        `kept_over` (those always carried alone outgrow `pinned_limit`, or `limit_chars` without one).
         user_corrections are left out: worker_system lists them on their own, outside this budget."""
         corrected = {e["name"] for e in self.user_corrections()}
         entries = [e for e in self._memory_entries() if worker_memory(e) and e["name"] not in corrected]
@@ -1398,10 +1406,11 @@ class Project:
                 for w in ws:
                     df[w] = df.get(w, 0) + 1
             return {n: sum(1 / df[w] for w in ws) for n, ws in words.items()}
-        # Standing entries first, every one whatever the limits: a worker that misses a standing rule breaks it.
-        standing = [e for e in pinned if e["standing"]]
-        used = standing_chars = sum(len(e["line"]) + 1 for e in standing)
-        chosen = {e["name"] for e in standing}
+        # Restrictions, resources and standing entries first, every one whatever the limits: a worker that
+        # misses one breaks a rule or acts on the wrong machine or folder.
+        kept = [e for e in pinned if worker_always(e)]
+        used = kept_chars = sum(len(e["line"]) + 1 for e in kept)
+        chosen = {e["name"] for e in kept}
         over = pinned_limit is not None and pinned_chars > pinned_limit
         score = scores(pinned) if over and want else {}
         for _, e in sorted(enumerate(pinned), key=lambda x: (-score.get(x[1]["name"], 0), x[0])):
@@ -1433,8 +1442,8 @@ class Project:
                        "limit": limit_chars, "duplicates": len(dup),
                        "pinned_over": pinned_chars > (limit_chars if pinned_limit is None else pinned_limit),
                        "pinned_dropped": len([e for e in pinned if e["name"] not in chosen]),
-                       "standing": len(standing), "standing_chars": standing_chars,
-                       "standing_over": standing_chars > (limit_chars if pinned_limit is None else pinned_limit)}
+                       "kept": len(kept), "kept_chars": kept_chars,
+                       "kept_over": kept_chars > (limit_chars if pinned_limit is None else pinned_limit)}
 
     def memory_text(self, limit_chars: int = COORDINATOR_MEMORY_CHARS) -> str:
         """Pinned entries, then the newest others (newest last), whole and bounded so they never

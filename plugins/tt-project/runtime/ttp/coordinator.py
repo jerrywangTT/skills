@@ -3469,7 +3469,9 @@ def worker_pinned_line(p: Project, use: dict | None = None) -> str:
     from .prompts import worker_context
     use = use or worker_context(p)[2]
     if not use["pinned_dropped"]:
-        return ""
+        return (f"pinned worker memory over budget: the {use['kept']} restriction, resource and standing entries for "
+                f"workers ({use['kept_chars']} chars) outgrow their {use['memory_limit']} chars of room; every "
+                f"worker prompt still carries them whole; merge or shorten them") if use["kept_over"] else ""
     return (f"pinned worker memory over budget: {use['pinned_chars']} chars for {use['memory_limit']} of room "
             f"leaves {use['pinned_dropped']} of {use['pinned']} pinned entries out of worker prompts (they get "
             f"a pointer to memory/); merge or shorten restrictions, resources and entries for workers")
@@ -3503,27 +3505,29 @@ def memory_pinned_line(p: Project) -> str:
 
 def memory_budget_check(p: Project) -> None:
     """Tell the coordinator once when the memory pinned for workers no longer fits the room their
-    prompt leaves it, so some of it is left out (worker_pinned_line), or its standing entries alone
-    outgrow that room (all kept whole, past the budget: Project.worker_memory_select). Also
+    prompt leaves it, so some of it is left out (worker_pinned_line), or its restriction, resource and
+    standing entries alone outgrow that room (all kept whole, past the budget:
+    Project.worker_memory_select). Also
     once when pinned entries alone take over half the coordinator's budget (memory_pinned_line). Each
     re-arms once it fits again."""
     from .prompts import worker_context
     over = worker_context(p)[2]
-    over["pinned_over"] = over["pinned_dropped"] > 0 or over["standing_over"]
+    over["pinned_over"] = over["pinned_dropped"] > 0 or over["kept_over"]
     flagged = p.db.kv(MEMORY_ALERT_KEY)
     if over["pinned_over"] and not flagged and not over["pinned_dropped"]:
         p.db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
                (time.time(), "daemon", "memory_over_budget", "normal",
-                f"The {over['standing']} standing entries for workers ({over['standing_chars']} chars) alone exceed "
+                f"The {over['kept']} restriction, resource and standing entries for workers "
+                f"({over['kept_chars']} chars) alone exceed "
                 f"the {over['memory_limit']} chars their prompt leaves memory after the charter digest "
                 f"({over['charter_chars']} chars). Every worker prompt still carries them whole, past the budget. "
-                f"Merge or shorten them with a standing `memory_add` that supersedes them; never retire them "
-                f"for space.", "queued"))
+                f"Merge or shorten them (`memory_add` with `supersedes`, same kind, a standing one kept standing); "
+                f"never retire them for space.", "queued"))
         p.db.set_kv(MEMORY_ALERT_KEY, True)
     elif over["pinned_over"] and not flagged:
         p.db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
                (time.time(), "daemon", "memory_over_budget", "normal",
-                f"Memory pinned for workers ({over['pinned']} restriction/resource entries or ones for workers, "
+                f"Memory pinned for workers ({over['pinned']} restriction, resource, standing or workers' entries, "
                 f"{over['pinned_chars']} chars) exceeds the {over['memory_limit']} chars their prompt leaves it "
                 f"after the charter digest ({over['charter_chars']} chars), so {over['pinned_dropped']} of them "
                 f"reach workers only as a pointer to memory/, and no other entries do. Merge or retire those "

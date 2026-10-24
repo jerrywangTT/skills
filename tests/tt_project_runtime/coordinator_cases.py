@@ -6035,7 +6035,7 @@ def test_pinned_memory_overflow_is_marked_in_the_prompt_and_alerts_the_coordinat
     p = make(env)
     from ttp import coordinator as coord
     from ttp.prompts import worker_context, worker_system
-    big = [("restriction" if i % 2 else "resource", f"RULE-{i} " + "y" * 900) for i in range(10)]
+    big = [("decision", f"RULE-{i} " + "y" * 900, "workers") for i in range(10)]
     _memories(p, [("fact", "OLD-FACT")] + big)
     assert coord.apply(p, [{"type": "memory_add", "text": "NEW-FACT"}], turn=1) == []
     system = worker_system(p)
@@ -14461,7 +14461,7 @@ def test_worker_memory_keeps_charter_policies_drops_restated_restrictions_and_ma
                   ("restriction", "keep content   GENERIC: no hostnames or credentials"),
                   ("restriction", "Never push."),   # not what the charter says: kept
                   ("fact", "FACT-NEWEST workers may reuse the build cache.")]
-              + [("restriction", f"RULE-{i:02} " + "r" * 900) for i in range(30)])
+              + [("decision", f"RULE-{i:02} " + "r" * 900, "workers") for i in range(30)])
     system = worker_system(p)
     block = system[system.index("# CHARTER"):]
     text, mem, use = worker_context(p)
@@ -14660,10 +14660,10 @@ def test_memory_cli_add_prints_the_pinned_worker_total_and_warns_once_it_outgrow
     assert use["pinned"] == 1 and not use["pinned_dropped"]
     assert f"pinned worker memory: {use['pinned_chars']} of {use['memory_limit']} chars (1 entry)" in out.out
     assert "warning" not in out.out + out.err
-    old = _memories(p, [("restriction", f"RULE-{i:02} " + "r" * 900) for i in range(30)])
+    old = _memories(p, [("decision", f"RULE-{i:02} " + "r" * 900, "workers") for i in range(30)])
     capsys.readouterr()
-    cli.main(["memory", "demo", "RULE-00 and RULE-01 merged. " + "m" * 900, "--kind", "restriction",
-              "--supersedes", old[0].stem, old[1].stem])
+    cli.main(["memory", "demo", "RULE-00 and RULE-01 merged. " + "m" * 900, "--kind", "decision",
+              "--audience", "workers", "--supersedes", old[0].stem, old[1].stem])
     out = capsys.readouterr()
     use = worker_context(p)[2]
     n, total = use["pinned_dropped"], use["pinned_chars"]
@@ -14688,7 +14688,7 @@ def test_worker_policies_keep_their_own_room_beside_long_goals_and_large_pinned_
     policies = [f"- Policy {i}: workers open a draft PR only once the tests pass. " + "p" * 280 for i in range(10)]
     assert 3000 < sum(len(x) + 2 for x in policies) < WORKER_POLICY_MIN_CHARS
     p.charter_path.write_text(_LONG_GOALS_CHARTER.replace("## Policies\n", "## Policies\n" + "\n".join(policies) + "\n"))
-    _memories(p, [("restriction", f"RULE-{i:02} " + "r" * 900) for i in range(30)])
+    _memories(p, [("decision", f"RULE-{i:02} " + "r" * 900, "workers") for i in range(30)])
     text, mem, use = worker_context(p)
     assert use["charter_dropped"] == 0
     for item in policies + ["- Delivery: workers commit on their own branch", "- Style: workers keep answers short"]:
@@ -15245,16 +15245,17 @@ def test_standing_worker_memory_past_its_room_is_kept_whole_and_alerts_once(env)
                            standing=True) for i in range(8)]
     p.add_memory("FACT-1 the nightly run took 2 h.", title="fact 1")
     text, mem, use = worker_context(p)
-    assert use["standing_chars"] > use["memory_limit"] and use["pinned_dropped"] == 0, use
+    assert use["kept_chars"] > use["memory_limit"] and use["pinned_dropped"] == 0, use
     shown = {e["name"] for e in mem}
-    assert {d.stem for d in duties} <= shown and use["standing_over"]
+    assert {d.stem for d in duties} <= shown and use["kept_over"]
     system = worker_system(p)
     for i in range(8):
         assert f"DUTY-{i:02} report it each time. " + "s" * 900 in system, i
     alerts = lambda: p.db.q("SELECT text FROM events WHERE kind='memory_over_budget'")
     coord.memory_budget_check(p)
     coord.memory_budget_check(p)
-    assert len(alerts()) == 1 and "8 standing entries for workers" in alerts()[0]["text"], alerts()
+    assert len(alerts()) == 1, alerts()
+    assert "8 restriction, resource and standing entries for workers" in alerts()[0]["text"], alerts()
     for d in duties[1:]:   # fits again: re-armed, silent
         p.forget_memory(d.stem, why="test")
     coord.memory_budget_check(p)
@@ -15449,3 +15450,94 @@ def test_a_probe_that_exits_non_zero_before_its_final_exit_0_is_a_real_test(env,
     d._start_probe(tid, EARLY_EXIT_ENDS[0], time.time())
     assert tid in d._probes and d._probes[tid][2] == EARLY_EXIT_ENDS[0], "a stored one starts a real probe"
     d._probes[tid][0].wait(_load_scaled(60))
+
+
+def _pinned_kinds_project(env):
+    """The reported case, with made-up entries: 14 memory entries and a charter whose Goals leave the
+    workers only their pinned floor. The standing ones alone outgrow it; a resource and a restriction
+    that are not standing, an entry tagged for workers, and ordinary decisions and facts come after."""
+    p = make(env)
+    p.charter_path.write_text(_LONG_GOALS_CHARTER)
+    pins = {}
+    pins["RULE-STANDING"] = p.add_memory("RULE-STANDING never patch the device service. " + "r" * 850,
+                                         kind="restriction", title="rule standing", standing=True,
+                                         audience="workers")
+    pins["DUTY-1"] = p.add_memory("DUTY-1 recover a stuck job yourself. " + "s" * 2600, kind="preference",
+                                  title="duty 1", standing=True)
+    pins["DUTY-2"] = p.add_memory("DUTY-2 make your own operational calls. " + "s" * 1500, kind="preference",
+                                  title="duty 2", standing=True)
+    pins["HOST-RESOURCE"] = p.add_memory("HOST-RESOURCE box A (alias box-a) is the project's host; the data "
+                                         "folder is read-only. " + "h" * 850, kind="resource", title="host")
+    pins["RULE-PLAIN"] = p.add_memory("RULE-PLAIN never reboot box A mid-job. " + "q" * 600, kind="restriction",
+                                      title="rule plain")
+    tagged = p.add_memory("TAGGED-DECISION releases go out on the release branch. " + "t" * 250,
+                          kind="decision", title="tagged", audience="workers")
+    for i in range(4):
+        p.add_memory(f"DECISION-{i} the cache stays on. " + "d" * 500, kind="decision", title=f"decision {i}")
+    p.add_memory("COORD-DECISION plan the week on Mondays.", kind="decision", title="coord", audience="coordinator")
+    p.add_memory("FACT-1 the nightly run took 2 h.", kind="fact", title="fact 1")
+    p.add_memory("FACT-2 the nightly run took 3 h.", kind="fact", title="fact 2", audience="coordinator")
+    p.add_memory("FACT-3 workers keep build logs for a week.", kind="fact", title="fact 3")
+    assert len(p._memory_entries()) == 14
+    return p, pins, tagged
+
+
+def _memory_block(system):
+    return system[system.index("# PROJECT MEMORY"):]
+
+
+@pytest.mark.parametrize("kind,tier", [("harness", "light"), ("code", "standard"), ("review", "standard"),
+                                       ("question", "light"), ("plan", "deep"), ("work", "standard")])
+def test_every_worker_prompt_carries_a_resource_entry_that_is_not_standing(env, kind, tier):
+    """A resource entry (and a restriction) that is not tagged standing is in every worker run's memory
+    block, whatever the kind or tier, even when the standing entries alone fill the workers' room."""
+    p, pins, _ = _pinned_kinds_project(env)
+    from ttp.prompts import worker_context, worker_system
+    task = {"id": 1, "kind": kind, "tier": tier, "title": f"{kind}: tidy the nightly report",
+            "spec": "Edit notes/report.md only."}
+    use = worker_context(p, task)[2]
+    standing = sum(len(e["line"]) + 1 for e in p._memory_entries() if e["standing"])
+    assert standing > use["memory_limit"], "the fixture must make the standing entries alone outgrow the workers' room"
+    block = _memory_block(worker_system(p, task))
+    for want in ("HOST-RESOURCE box A (alias box-a) is the project's host", "RULE-PLAIN never reboot box A"):
+        assert want in block, (want, block[:1500])
+
+
+def test_the_reported_light_harness_run_carries_every_restriction_resource_and_standing_entry(env):
+    """The reported case: 14 entries, a light-tier harness run. Every restriction, resource and standing
+    entry is there, whole; the entry tagged for workers that no longer fits is pointed to, never dropped
+    silently, and the coordinator and `ttp doctor` are told the kept ones outgrow the room."""
+    p, pins, tagged = _pinned_kinds_project(env)
+    from ttp import coordinator as coord
+    from ttp.prompts import worker_context, worker_system
+    task = {"id": 1, "kind": "harness", "tier": "light", "title": "harness: tidy the watcher's log",
+            "spec": "Shorten the watcher's log lines."}
+    text, mem, use = worker_context(p, task)
+    shown = {e["name"] for e in mem}
+    assert {f.stem for f in pins.values()} <= shown, shown
+    block = _memory_block(worker_system(p, task))
+    for f in pins.values():
+        line = next(e["line"] for e in p._memory_entries() if e["name"] == f.stem)
+        assert line in block, f.stem
+    assert "COORD-DECISION" not in block and "FACT-2" not in block
+    assert tagged.stem not in shown and use["pinned_dropped"] == 1
+    assert f"(1 more entries for workers are in {p.memory_dir}/" in block
+    line = coord.worker_pinned_line(p)
+    assert line.startswith("pinned worker memory over budget: ") and "1 of 6 pinned entries" in line, line
+    coord.memory_budget_check(p)
+    alerts = p.db.q("SELECT text FROM events WHERE kind='memory_over_budget'")
+    assert len(alerts) == 1 and "so 1 of them reach workers only as a pointer" in alerts[0]["text"], alerts
+
+
+def test_pinned_worker_memory_is_the_same_in_light_standard_and_deep_runs(env):
+    """With the same memory, the light, standard and deep tiers carry the same restriction, resource and
+    standing entries: none is lost between tiers."""
+    p, pins, _ = _pinned_kinds_project(env)
+    from ttp.prompts import worker_system
+    blocks = {}
+    for tier in ("light", "standard", "deep"):
+        task = {"id": 1, "kind": "code", "tier": tier, "title": "code: fix the report script",
+                "spec": "Change scripts/report.py."}
+        block = _memory_block(worker_system(p, task))
+        blocks[tier] = {n for n, f in pins.items() if n + " " in block}
+    assert blocks["light"] == blocks["standard"] == blocks["deep"] == set(pins), blocks

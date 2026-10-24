@@ -16629,10 +16629,10 @@ def test_a_coordinator_turn_replayed_after_a_crash_writes_its_files_once(env, tm
 
 
 def _memories(p, items):
-    """Add (kind, text) memories with strictly increasing mtimes, oldest first."""
+    """Add (kind, text) or (kind, text, audience) memories with strictly increasing mtimes, oldest first."""
     paths = []
-    for i, (kind, text) in enumerate(items):
-        path = p.add_memory(text, kind=kind, title=f"{kind} {i}")
+    for i, (kind, text, *aud) in enumerate(items):
+        path = p.add_memory(text, kind=kind, title=f"{kind} {i}", audience=aud[0] if aud else None)
         os.utime(path, (1_000_000 + i, 1_000_000 + i))
         paths.append(path)
     return paths
