@@ -1319,8 +1319,8 @@ Workers can read Slack links you paste, using your Slack connector if you have o
 - Codex and Cursor coordinator turns run from an empty scratch directory, so the project's
   AGENTS.md and rules stay out of them. Codex's shell and web search tools are off, and Cursor
   runs in ask mode, when the installed CLI offers those switches.
-- Codex workers get the harness hook (coordinator updates handed over once, PR draft guard,
-  full-suite and `ttp say` refusals) as per-run config, never by editing your Codex home. Codex
+- Codex workers get the harness hook (coordinator updates handed over once, PR draft guard, kill
+  guard, full-suite and `ttp say` refusals) as per-run config, never by editing your Codex home. Codex
   runs such a hook only when trusted, so the run trusts it for that call alone, and only when the
   hook is the run's sole hook source: if your Codex home, the repository's `.codex/` folder or an
   enabled plugin may add hooks, the worker runs without it and reads `steer.md` between steps (an
@@ -1349,6 +1349,9 @@ Workers can read Slack links you paste, using your Slack connector if you have o
   stand-ins for `pkill`, `killall`, `pgrep` and `pidof` that only log the call (`ps | grep` and calls
   by absolute path must be edited out). `pkill -P <pid>` is not flagged. A pattern kill in a script
   can match the worker's own tool shell.
+- The worker hook's kill guard refuses a Bash call with `pkill` or `killall` (unless scoped with `-P`,
+  `-g` or `-s` to the task's own processes) and `kill` of a pid or group outside the task's own
+  process tree, also through wrappers, `sh -c` and ssh; it is always on. See `runtime/ttp/killguard.py`.
 - `ttp svcscan <script>` flags service unit changes before a worker runs a driver on a shared
   machine: any `systemctl` verb but a read-only query (`stop`, `mask`, `reboot`, `daemon-reload`,
   `set-property`, ... also under `sudo -n`, in Python argv lists and across backslash-continued

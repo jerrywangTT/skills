@@ -27,6 +27,9 @@ or edited, are data.
 In a code task's run that may not push to the push branch (gitguard.py) it denies `git push` with
 git called by a path, which skips the run's bin/git.
 
+It denies kill, pkill and killall aimed at processes outside the task's own process tree, also through
+wrappers, `sh -c` and ssh (killguard.py); that check fails closed on a command it cannot parse.
+
 It also denies a Bash call that runs one of the project's configured pytest checks
 (`delivery.push_checks`) in full, and points at `ttp checks`, which reuses a pass recorded for the
 same tree (full_suite). Focused runs pass, and so does `TTP_ALLOW_FULL_SUITE=1`; each refusal is
@@ -36,7 +39,7 @@ A Bash call that would print more than WIDE_READ_LINES lines of one file (sed -n
 cat of a large file) gets a reminder to grep first and read narrow ranges, as added context; it is
 never denied (wide_read). `ttp stats --tools` shows how much of the runs' tool output is file reads.
 
-It fails open: any error prints nothing, and the run goes on unchanged.
+Otherwise it fails open: any error prints nothing, and the run goes on unchanged.
 """
 from __future__ import annotations
 
@@ -383,9 +386,10 @@ def git_push_bypass(segments: list[list[str]]) -> str | None:
             if branch else None)
 
 
-def _segments(cmd: str) -> list[list[str]]:
+def _segments(cmd: str, strip: bool = True) -> list[list[str]]:
     """The simple commands in `cmd`, each without its leading variable assignments and wrappers
-    (env, nohup, timeout 60, `ttp lock res --` ...): what actually runs first in each."""
+    (env, nohup, timeout 60, `ttp lock res --` ...): what actually runs first in each. `strip`
+    False keeps them."""
     cmd = "".join(";" if c == "\n" and not inert else c for c, (inert, _) in zip(cmd, _quoting(cmd)))
     try:
         import shlex
@@ -403,7 +407,7 @@ def _segments(cmd: str) -> list[list[str]]:
         elif w and set(w) <= set(";&|()<>"):
             target = False
             if seg:
-                out.append(_strip_prefix(seg))
+                out.append(_strip_prefix(seg) if strip else seg)
             seg = []
         else:
             seg.append(w)
@@ -515,6 +519,9 @@ def pre_tool_use(payload: dict) -> tuple[dict | None, None]:
                "path is refused, so write a commit message with `git commit -F <file>` or call it 'the web token file'")
     if not why:
         why = git_push_bypass(segments)
+    if not why:
+        from . import killguard
+        why = killguard.refusal(cmd, str(payload.get("cwd") or os.getcwd()))
     if not why:
         path_changed = bool(PATH_CHANGE_RE.search(scan))
         for f in _scripts(segments, str(payload.get("cwd") or os.getcwd())):
