@@ -7043,6 +7043,71 @@ def test_an_end_when_probe_prompts_the_coordinator_and_a_user_pause_is_left_alon
 
 
 
+def test_a_user_pause_end_when_is_a_signal_status_says_so_and_the_coordinator_is_told_once(env):
+    p = make(env)
+    from ttp import coordinator as coord, ends, pauseends
+    from ttp.cli import status_text
+    from ttp.web import state_payload
+    flag = p.root / "done"
+    coord.pause_resource(p, "rig", True, reason="the user's", by="user", end={"end_when": f"test -e {flag}"})
+    pe = pauseends.PauseEnds(p)
+
+    def settle(now):
+        pe.tick(now)
+        for proc, _, _ in list(pe._procs.values()):
+            proc.wait(10)
+        return pe.tick(now + 1)
+    now = time.time()
+    assert settle(now) == []
+    before = "set by the user; ends only on the user's word; end condition: when `test -e"
+    assert before in status_text(p) and before in coord.digest(p, {}, [], [])
+    flag.write_text("")
+    assert settle(now + pauseends.PROBE_EVERY_S + 5) == ["rig"]
+    assert p.db.paused_resources()["rig"]["by"] == "user", "an end condition never lifts a user's pause"
+    (ev,) = p.db.q("SELECT text, severity FROM events WHERE kind IN ('observation', 'pause_end_due')")
+    assert ev["severity"] == "low" and "`rig`" in ev["text"] and "The pause stays" in ev["text"]
+    assert "Tell the user once" in ev["text"] and "never say it is being lifted" in ev["text"]
+    assert "a turn that carries the user's word (`resource_pause` paused false)" in ev["text"]
+    at = pauseends.passed_at(p.db, "rig", p.db.paused_resources()["rig"])
+    assert at is not None and now + pauseends.PROBE_EVERY_S + 5 <= at <= now + pauseends.PROBE_EVERY_S + 6
+    shown = f"end condition passed at {ends.shown(at, p)}; lifting needs the user's word"
+    assert shown in status_text(p) and shown in coord.digest(p, {}, [], [])
+    (row,) = state_payload(p, p.db)["health"]["resources_paused"]
+    assert row["end"] == f"set by the user; {shown}", "the web app shows the same text"
+    assert "ends when" not in status_text(p), "no end that reads as automatic"
+    # Once per pass: later probe ticks add nothing, and the pause still stands.
+    for k in (2, 3):
+        assert settle(now + k * pauseends.PROBE_EVERY_S + 10) == []
+    assert p.db.one("SELECT COUNT(*) n FROM events WHERE kind IN ('observation', 'pause_end_due')")["n"] == 1
+    assert "rig" in p.db.paused_resources()
+    # A new pause by the user (a new end) is a new signal: the old pass is not shown for it.
+    flag.unlink()
+    coord.pause_resource(p, "rig", True, reason="again", by="user", end={"end_when": f"test -e {flag}x"})
+    assert pauseends.passed_at(p.db, "rig", p.db.paused_resources()["rig"]) is None
+    assert "end condition passed" not in status_text(p)
+    # Only the user's word lifts it.
+    assert coord.pause_resource(p, "rig", False, by="user") == "rig resumed"
+    assert settle(now + 5 * pauseends.PROBE_EVERY_S) == [] and not p.db.kv(pauseends.PASSED_KEY)
+
+
+def test_a_user_pause_until_that_passed_shows_as_a_signal_not_an_end(env):
+    p = make(env)
+    from ttp import coordinator as coord, ends, pauseends
+    now = time.time()
+    v = {"by": "user", "until": now - 60}
+    assert pauseends.describe(v, p, now=now) == (f"set by the user; end condition passed at {ends.shown(now - 60, p)}; "
+                                                 f"lifting needs the user's word")
+    assert pauseends.describe({**v, "by": "coordinator"}, p, now=now) == f"ends {ends.shown(now - 60, p)}"
+    coord.pause_resource(p, "rig", True, by="user", end={"until": now + 3600})
+    assert "(its end passed" not in coord.digest(p, {}, [], [])
+
+
+def test_the_coordinator_prompt_says_a_user_pause_end_never_lifts_it():
+    text = " ".join((RUNTIME.parent / "template" / "prompts" / "coordinator.md").read_text(encoding="utf-8").split())
+    assert ("A pause the user set is lifted only on their word: its `end_when` or `until` only signals; say it is "
+            "lifting only in a turn with their word.") in text
+
+
 def _settle_end_probes(owner, now):
     """Tick `owner` (PauseEnds, Ends or MuteEnds) until its probes and their 255 checks are reaped."""
     from ttp import ends
@@ -8948,7 +9013,8 @@ def test_the_coordinator_role_prompt_carries_only_the_rules_of_features_that_are
     # and facts-at-send-time rules, the Course check and Progress rule, the overlaps rule, the likely-correction rule,
     # and the loosening-as-written and restriction-evidence rules;
     # +300: the delivery.rebase_replace / never_force config_set rule and the rebase rule per mode
-    assert len(role) <= 32_950, len(role)
+    # +90: a user pause's end_when or until only signals; it is said to lift only with the user's word
+    assert len(role) <= 33_040, len(role)
     assert "<!-- ttp:" not in role and "<!-- /ttp:" not in role
     assert role in coord.prompt_parts(p)[0]
     # Rules for features that are off are left out; turning one on brings its rules in.
@@ -14108,7 +14174,7 @@ def test_a_fleet_hold_end_is_checked_by_the_setter_or_else_the_recovery_owner(en
     fleethold.lift("box1", False, "test")
     fleethold.set_hold("box1", "", "user", "demo", {"until": time.time() - 1})
     assert pauseends.PauseEnds(b).tick() == ["machine:box1"]
-    assert "Only the user lifts it" in b.db.q("SELECT text FROM events ORDER BY id DESC LIMIT 1")[0]["text"]
+    assert "The pause stays: an end condition only signals" in b.db.q("SELECT text FROM events ORDER BY id DESC LIMIT 1")[0]["text"]
 
 
 def test_a_fleet_hold_quiets_the_machine_like_a_user_pause(env):

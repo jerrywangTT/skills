@@ -2233,7 +2233,7 @@ def test_health_pause_user_end_only_reports_once_and_never_lifts(env):
     assert p.db.paused_resources()["board"]["by"] == "user"
     assert not p.db.kv(sweep.SIGNAL_KEY)
     (event,) = p.db.q("SELECT * FROM events WHERE kind='observation'")
-    assert event["severity"] == "low" and "Only the user lifts it" in event["text"]
+    assert event["severity"] == "low" and "The pause stays" in event["text"] and "never say it is being lifted" in event["text"]
 
 
 @pytest.mark.parametrize("field,value", [("expected_count", 4), ("max_recent_failures", 0)])
@@ -2359,7 +2359,7 @@ def test_users_pause_with_until_reports_once_and_is_never_lifted(env, how):
     for dt in (86400 + 60, 86400 + 120):
         d._pause_ends.tick(now + dt)
     (event,) = p.db.q("SELECT * FROM events WHERE kind IN ('pause_ended','pause_end_due','observation')")
-    assert event["kind"] == "observation" and "Only the user lifts it" in event["text"]
+    assert event["kind"] == "observation" and "The pause stays" in event["text"] and "never say it is being lifted" in event["text"]
     assert p.db.paused_resources()["board"]["by"] == "user"
 
 

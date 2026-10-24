@@ -1296,7 +1296,7 @@ def status_text(p: Project, verbose: bool = False) -> str:
             continue   # one line per hold above
         lines.append(f"resource {pr['resource']} paused since {at(pr['since'], now, tz)} by {pr.get('by') or 'user'}"
                      + (f" in {pr['project']} (shared: holds in every project)" if pr.get("shared") else "")
-                     + (f": {pr['reason']}" if pr.get("reason") else "")
+                     + (f": {pr['reason']}" if pr.get("reason") else "") + (f"; {pr['end']}" if pr.get("end") else "")
                      + f" — resume: ttp resume {p.name} --resource {pr['resource']}")
     from . import checkcap, locks, shared
     if host := checkcap.line():

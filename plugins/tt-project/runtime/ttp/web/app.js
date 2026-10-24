@@ -256,7 +256,7 @@ function healthHtml(h) {
     (h.outages || []).map((line) => `<div class="row"><span class="pill ${/OVERDUE/.test(line) ? "lv-red" : "lv-yellow"}">${esc(line)}</span></div>`).join("") +
     (h.upstream ? `<div class="row"><span class="meta">${esc(h.upstream)}</span></div>` : "") +
     (h.resources_paused || []).map((r) =>
-    `<div class="row"><b>${esc(r.resource)}</b><span class="pill lv-orange">resource paused</span><span>${esc(r.reason || "")}</span><span class="meta">since ${at(r.since)} by ${esc(r.by || "user")}: its tasks wait</span><button data-resume-resource="${esc(r.resource)}">Resume</button></div>`).join("");
+    `<div class="row"><b>${esc(r.resource)}</b><span class="pill lv-orange">resource paused</span><span>${esc(r.reason || "")}</span><span class="meta">since ${at(r.since)} by ${esc(r.by || "user")}${r.end ? `; ${esc(r.end)}` : ""}: its tasks wait</span><button data-resume-resource="${esc(r.resource)}">Resume</button></div>`).join("");
 }
 
 let lastKey = "";

@@ -19,7 +19,7 @@ from . import globalcap as gcap
 from . import coordinator as coord
 from . import credits, heal, identity, lockprobe, obligations, outagetask, projpause, pushq, release, responsibilities, sweep, timefmt, waits
 from . import schedule as sched
-from . import startgate, sweepskip, timefmt, trend, upstream
+from . import pauseends, startgate, sweepskip, timefmt, trend, upstream
 from .daemon import (AUTH_PROBE_S, HEARTBEAT_STALE_S, KV_LOCAL_ONLY, KV_WORKTREES_DIRTY, LOGGED_OUT_NOTE, NET_HELD_NOTE,
                      SLACK_ERROR_KEY, WAIT_KEYS, heartbeat, idle_wake)
 from .alerts import cleared  # noqa: F401  (readers import it from here)
@@ -297,7 +297,8 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
             note = str(v.get("note") or "limit reached")
             paused_providers.append({"provider": r["key"].split(":", 1)[1], "note": note, "until": v["until"],
                                      "fix": fix_for(r["key"].split(":", 1)[1], note)})
-    paused_resources = [{"resource": k, **v} for k, v in sorted(db.paused_resources().items())]
+    paused_resources = [{"resource": k, **v, "end": pauseends.describe(v, tz, pauseends.passed_at(db, k, v), now)}
+                        for k, v in sorted(db.paused_resources().items())]
     # A deferred task waits to start (start_after / start_when): a plan, not a problem or a retry.
     start_gates, warn_s = db.kv(startgate.KEY, {}) or {}, startgate.warn_after(cfg)
     deferred = [{"id": t["id"], "title": t["title"], "starts": coord.starts_text(t, now, plain=True, where=tz, db=db),

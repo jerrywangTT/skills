@@ -15,7 +15,9 @@ accepted gap). Any other pause gets the health end only when it names no end. Fo
 when its time passes, its probe passes or breaks, the
 daemon queues one `pause_end_due` event and the coordinator lifts the pause or extends it with a
 reason. A note from the `report_from` project re-prompts it the same way. A pause the user set is
-lifted only on their word: its end gives one low, ask-free line instead. A pause recorded without
+lifted only on their word: its end is a signal, never an end. Once it passes the pause stays, the
+time is kept (PASSED_KEY; describe shows it) and the coordinator gets one low observation: tell the
+user once, never say it is lifting. A pause recorded without
 an end (from before ends were required) gets DEFAULT_S and one info message saying so.
 
 Only the project that set a shared pause (shared.py) checks it, so one owner is prompted."""
@@ -39,6 +41,7 @@ FLEET_PREFIX = "machine:"   # owned() keys a fleet hold this project checks by i
 DUE_KEY = "pause_end_due"      # kv: {resource: end signature} whose end was reported to the coordinator
 HEALTH_KEY = "pause_health"   # kv: consecutive check results fenced to each pause's identity
 RELEASE_KEY = "pause_release"  # kv: shared pauses whose file removal began, so a crash cannot lose the receipt
+PASSED_KEY = "pause_end_passed"  # kv: {resource: {"sig", "at"}}: when a user pause's end condition passed
 CHECK_EVERY_S = 60
 PROBE_EVERY_S = ends.PROBE_EVERY_S
 PROJECT_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.@+-]{0,79}")
@@ -86,18 +89,34 @@ def health_end(p: Project, resource: str) -> dict | None:
     return None
 
 
-def describe(v: dict, where=None) -> str:
-    """'ends 2026-10-06 05:00 UTC, or when `probe` passes; waits on project x's report' (or '')."""
+def describe(v: dict, where=None, passed: float | None = None, now: float | None = None) -> str:
+    """'ends 2026-10-06 05:00 UTC, or when `probe` passes; waits on project x's report' (or ''). A
+    pause the user set never ends by itself: its end is shown as a condition, and once it passed
+    (`passed`, see passed_at, or an `until` before `now`) as passed, needing the user's word."""
     end = v.get("end_when")
     when = (f"when heal `{end['heal']}` has {end['healthy_n']} healthy results over {end['clean_s']:g} s"
             if isinstance(end, dict) else f"when `{end}` passes")
     parts = ([ends.shown(float(v["until"]), where)] if v.get("until") else []) + ([when] if end else [])
     out = "ends " + ", or ".join(parts) if parts else ""
+    if v.get("by") == "user":
+        now = time.time() if now is None else now
+        if passed is None and v.get("until") and float(v["until"]) <= now:
+            passed = float(v["until"])
+        out = ("set by the user; " + (f"end condition passed at {ends.shown(passed, where)}; lifting needs the "
+                                      f"user's word" if passed is not None else
+                                      "ends only on the user's word" + (f"; end condition: {', or '.join(parts)}"
+                                                                        if parts else "")))
     if v.get("end_default"):
         out += " (a default: it was set without an end)"
     if v.get("report_from"):
         out += f"; waits on project {v['report_from']}'s report"
     return out.strip("; ")
+
+
+def passed_at(db, name: str, v: dict) -> float | None:
+    """When the end condition of the user's pause `v` of `name` passed, if it did (PASSED_KEY)."""
+    got = (db.kv(PASSED_KEY) or {}).get(name)
+    return float(got["at"]) if isinstance(got, dict) and got.get("sig") == _sig(v) else None
 
 
 def _sig(v: dict) -> str:
@@ -149,16 +168,29 @@ def owned(p: Project, db=None) -> dict[str, dict]:
     return out
 
 
-def _queue(db, name: str, v: dict, why: str, now: float) -> None:
+def _user_said(what: str, why: str, passed: bool, lift: str) -> str:
+    """The observation for the user's pause or hold `what`: it stays; their word alone lifts it."""
+    return ((f"The end condition of the user's {what} passed ({why}). The pause stays: an end condition only "
+             f"signals, it never lifts a user's pause. Tell the user once that it passed; never say it is being "
+             f"lifted. Lift it only in a turn that carries the user's word ({lift}); do not ask about it."
+             if passed else
+             f"The user's {what} waits on a report: {why}. The pause stays; only the user's word lifts it "
+             f"({lift}): never say it is being lifted, and do not ask about it."))
+
+
+def _queue(db, name: str, v: dict, why: str, now: float, passed: bool = True) -> None:
+    """Queue the end of pause `name`: a `pause_end_due` event, or for the user's pause one observation
+    (its end condition passed, kept in PASSED_KEY; `passed` False: a report it waits on arrived)."""
+    if v.get("by") == "user" and passed:
+        db.set_kv(PASSED_KEY, {**(db.kv(PASSED_KEY) or {}), name: {"sig": _sig(v), "at": now}})
     if v.get("fleet"):
-        _queue_fleet(db, v, why, now)
+        _queue_fleet(db, v, why, now, passed)
         return
     if v.get("by") == "user":
-        # The user's pause: their word lifts it, so the coordinator neither lifts it nor asks.
         db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
              (now, "daemon", "observation", "low",
-              f"The user's pause of `{name}` reached its end ({why}). Only the user lifts it: leave it, do not "
-              f"ask about it; it stays listed under Paused resources.", "queued"))
+              _user_said(f"pause of `{name}`", why, passed, "`resource_pause` paused false")
+              + " It stays listed under Paused resources.", "queued"))
         return
     db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
          (now, "daemon", "pause_end_due", "normal",
@@ -167,13 +199,13 @@ def _queue(db, name: str, v: dict, why: str, now: float) -> None:
           f"`resource_pause` paused true, a new `until` or `end_when`, and a `reason` saying why.", "queued"))
 
 
-def _queue_fleet(db, v: dict, why: str, now: float) -> None:
+def _queue_fleet(db, v: dict, why: str, now: float, passed: bool = True) -> None:
     alias, hid = v.get("machine"), v.get("fleet")
     if v.get("by") == "user":
         db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
              (now, "daemon", "observation", "low",
-              f"The user's machine-wide hold of `{alias}` (hold {hid}) reached its end ({why}). Only the user "
-              f"lifts it: leave it, do not ask about it.", "queued"))
+              _user_said(f"machine-wide hold of `{alias}` (hold {hid})", why, passed,
+                         f"`resource_pause` machine {alias}, paused false"), "queued"))
         return
     db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
          (now, "daemon", "pause_end_due", "normal",
@@ -193,7 +225,7 @@ def note_arrived(p: Project, from_project: str | None, now: float | None = None)
     for name, v in sorted(owned(p).items()):
         if v.get("report_from") == from_project:
             _queue(p.db, name, v, f"a note from project {from_project}, whose report it waits on, arrived "
-                                  f"(the upstream_note event); read it", now)
+                                  f"(the upstream_note event); read it", now, passed=False)
             n += 1
     return n
 
@@ -279,6 +311,9 @@ class PauseEnds:
                 self._start(name, probe, now)
         if sent != (db.kv(DUE_KEY) or {}):
             db.set_kv(DUE_KEY, sent or None)
+        passed = db.kv(PASSED_KEY) or {}
+        if any(k not in pauses for k in passed):
+            db.set_kv(PASSED_KEY, {k: w for k, w in passed.items() if k in pauses} or None)
         if due:
             self.log(f"pause end due: {', '.join(due)}")
         return due

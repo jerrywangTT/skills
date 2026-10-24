@@ -39087,7 +39087,7 @@ def test_machine_status_lists_co_tenants_owner_pauses_changes_and_checks_read_on
     out = capsys.readouterr().out
     assert "projects: alpha, beta" in out and "gamma" not in out
     assert "recovery owner: alpha, fallback beta" in out
-    assert "paused: box-a-device by beta (firmware); ends" in out
+    assert "paused: box-a-device by beta (firmware); set by the user; ends only on the user's word; end condition: " in out
     assert "change: " in out and "drop-in for the broker" in out
     assert "heal check alpha/box-a-up: not checked yet" in out
     main(["machines", "status", "--json"])

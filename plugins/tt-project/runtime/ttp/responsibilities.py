@@ -560,7 +560,8 @@ def _read_project(name: str, db: ReadOnly, view: dict, now: float) -> None:
         for a, v in view.items():
             if _names(a, res) and isinstance(pz, dict):
                 v["pauses"].append({"resource": res, "project": name, "reason": pz.get("reason") or "",
-                                    "by": pz.get("by") or "", "end": pauseends.describe(pz)})
+                                    "by": pz.get("by") or "",
+                                    "end": pauseends.describe(pz, None, pauseends.passed_at(db, res, pz), now)})
     stats = machines.stats(db, now)
     for res, s in stats.items():
         for a, v in view.items():

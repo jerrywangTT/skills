@@ -822,9 +822,8 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
             lines.append(f"- {name}: paused {(now - float(v.get('since') or now)) / 3600:.1f}h ago by "
                          f"{v.get('by') or 'user'}" + (f" in project {v.get('project')} (shared by all projects)"
                                                       if v.get("shared") else "") + (f": {clip(v['reason'], NOTE_CHARS)}" if v.get("reason") else "")
-                         + (f" ({pauseends.describe(v, p)})" if pauseends.describe(v) else "")
-                         + (" (its end passed; the user's pause: only they lift it, no ask)" if v.get("by") == "user"
-                            and v.get("until") and float(v["until"]) <= now else ""))
+                         + (f" ({end})" if (end := pauseends.describe(v, p, pauseends.passed_at(db, name, v), now))
+                            else ""))
     section("paused", lines)
     section("resources", machines.digest_lines(db, paused, now))
     lines = []
