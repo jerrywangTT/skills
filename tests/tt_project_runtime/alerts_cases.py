@@ -4073,8 +4073,22 @@ def test_setup_polls_usernoted_log_after_the_first_post_and_never_backs_off_on_a
     from ttp import notifier
     _mac_app_stubs(monkeypatch, tmp_path)
     monkeypatch.setattr(notifier, "LOG_SETTLE_S", 1.5)
+    monkeypatch.setattr(notifier, "LOG_POLL_S", 0.5)
+    # A test clock only the notifier reads, moved only by its sleeps: the read count decides, not load.
+    clock = {"t": float(int(time.time()))}
+
+    class _Clock:
+        def __getattr__(self, name):
+            return getattr(time, name)
+
+        def time(self):
+            return clock["t"]
+
+        def sleep(self, s):
+            clock["t"] += s
+    monkeypatch.setattr(notifier, "time", _Clock())
     _usernoted_log(tmp_path, text, after=2)   # the record shows only from the third read on (usernoted is slower)
-    t0 = time.time()
+    t0 = notifier.time.time()
     ok, lines = notifier.test()
     reads = len((tmp_path / "log.calls").read_text().splitlines())
     assert ok and "test notification sent (osascript); macOS does not say whether it was shown" in lines, lines
@@ -4083,7 +4097,7 @@ def test_setup_polls_usernoted_log_after_the_first_post_and_never_backs_off_on_a
     assert reads >= 3 and bool(d.get("app_allowed")) == switches
     assert notifier.show("t", "b")["backend"] == ("tt-project" if switches else "osascript")
     if switches:
-        assert time.time() - t0 < notifier.LOG_SETTLE_S, "a decisive record ends the poll early"
+        assert notifier.time.time() - t0 < notifier.LOG_SETTLE_S, "a decisive record ends the poll early"
     else:
         assert d["app_log_checked"] >= d["app_posted"] + notifier.LOG_SETTLE_S, "only a read after the window backs off"
 
