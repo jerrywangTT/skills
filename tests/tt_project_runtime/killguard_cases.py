@@ -111,6 +111,32 @@ def test_kill_guard_looks_through_wrappers_shells_and_lists(kill_tree):
         assert _kill_refusal(cmd, t) is None, cmd
 
 
+def test_kill_guard_parses_sudo_options_before_the_kill(kill_tree):
+    # sudo -n is not nice's `-n VALUE`; options with values (-u, -p, -g) and combined flags (-nu) are sudo's own.
+    t = kill_tree
+    for cmd in (f"sudo -n kill {t.outside}", "sudo -n pkill -f sleep", f"sudo -nu root kill {t.outside}",
+                f"sudo -p prompt kill {t.outside}", f"sudo -g grp kill {t.outside}", f"sudo --user=root kill {t.outside}",
+                f"sudo --user root -n kill {t.outside}", f"sudo -n -- kill {t.outside}", "doas -u root pkill sleep",
+                f"sudo -n FOO=1 kill {t.outside}", f"timeout 5 sudo -n kill {t.outside}", "sudo -n killall sleep"):
+        assert _kill_refusal(cmd, t), cmd
+    for cmd in ("ssh host 'sudo -n pkill -f x'", "ssh host sudo -n pkill x", "ssh host sudo -nu root killall x"):
+        assert "another machine" in (_kill_refusal(cmd, t) or ""), cmd
+    for cmd in (f"sudo -n kill {t.child}", f"sudo -nu root kill -9 {t.child}", "sudo -n true", "sudo -u root ls"):
+        assert _kill_refusal(cmd, t) is None, cmd
+
+
+def test_kill_guard_skips_redirection_fd_numbers(kill_tree):
+    t = kill_tree
+    for cmd in ("sleep 9 & kill $! 2>/dev/null", "kill %1 2>&1", "kill -9 $$ 1>&2", f"kill {t.child} 2>>log",
+                f"kill {t.child} 0</dev/null", f"echo '2>x'; kill {t.child} 2>/dev/null"):
+        assert _kill_refusal(cmd, t) is None, cmd
+    for cmd, why in ((f"kill {t.outside} 2>/dev/null", f"pid {t.outside} is not"),
+                     (f"kill 1 2>&1", "init process")):
+        assert why in (_kill_refusal(cmd, t) or ""), cmd
+    # With a space the digit is an argument again: `kill 1 >/dev/null` signals pid 1.
+    assert "init process" in _kill_refusal("kill 1 >/dev/null", t)
+
+
 def test_kill_guard_inside_ssh_refuses_pattern_kills_and_allows_printed_pids(kill_tree):
     t = kill_tree
     for cmd in ("ssh host 'pkill -f sleep'", "ssh -p 2222 -o BatchMode=yes host killall sleep",

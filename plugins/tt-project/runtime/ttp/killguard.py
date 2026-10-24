@@ -17,8 +17,9 @@ A pid or group with no process left passes: the kill finds nothing.
   reads (`$(cat f)`, `$(<f)`, `$(head -n1 f)`) that holds own pids. -1 and 1 are refused, and so is
   any target the hook cannot resolve before the command runs: pgrep, pidof or ps output, another
   variable or substitution, xargs input. kill -0 (a probe) and kill -l/-L always pass.
-- Wrappers (sudo, env, nohup, timeout, setsid, `ttp lock ... --`), `sh -c`/`bash -c`, eval and su -c
-  strings, command substitutions, pipelines and lists are looked through.
+- Wrappers (sudo and doas with their own options, env, nohup, timeout, setsid, `ttp lock ... --`),
+  `sh -c`/`bash -c`, eval and su -c strings, command substitutions, pipelines and lists are looked
+  through; a redirection's fd number (`2>/dev/null`) is not a target.
 - Inside an ssh command (its command words or a heredoc it reads) the remote tree cannot be checked:
   pkill and killall are refused; kill of literal pids and groups passes, so a worker can stop its own
   remote job by the pid or group ttp printed; other targets follow the rules above.
@@ -48,6 +49,12 @@ OWN_WORDS = {"$!", "${!}", "$$", "${$}", "$BASHPID", "${BASHPID}"}
 SUB = "__ttpsub{}__"
 SUB_RE = re.compile(r"__ttpsub(\d+)__")
 VAR_RE = re.compile(r"\$\{?([A-Za-z_]\w*)\}?")
+# sudo's and doas's options that take a value (sudo -u root, -p prompt, -g grp; doas -u, -C)
+SUDO_VALUE_OPTS = set("ugpChDrRtUTa")
+SUDO_LONG_VALUE = {"user", "group", "prompt", "host", "close-from", "chdir", "role", "type", "other-user",
+                   "command-timeout", "chroot"}
+# A file descriptor written against its redirection (`2>/dev/null`, `1>&2`): not a kill target
+FD_RE = re.compile(r"(^|[\s;&|()])(\d+)(?=[<>])")
 PIDFILE_RE = re.compile(r"\s*(?:<\s*(\S+)|cat\s+(\S+)|head\s+(?:-n\s*1|-1)\s+(\S+))\s*")
 
 ADVICE = ("kill only what this task started: record `$!` when you start a process and kill that pid, end your "
@@ -238,7 +245,7 @@ class _Guard:
         self._assignments(flat, remote)
         for code in self.subs[first:]:
             self.check(code, remote, depth + 1)
-        for argv in hook._segments(flat, strip=False):
+        for argv in hook._segments(_drop_fds(flat), strip=False):
             self._segment(argv, remote, depth)
 
     def _assignments(self, flat: str, remote: bool) -> None:
@@ -252,9 +259,8 @@ class _Guard:
 
     def _segment(self, argv: list[str], remote: bool, depth: int) -> None:
         from . import hook
-        stripped = hook._strip_prefix(argv)
-        wrappers = [os.path.basename(w) for w in argv[:len(argv) - len(stripped)]]
-        stdin, argv = "xargs" in wrappers, stripped
+        wrappers, argv = _command(argv)
+        stdin = "xargs" in wrappers
         if not argv:
             return
         name = os.path.basename(argv[0])
@@ -404,6 +410,47 @@ class _Guard:
             raise cant
         lines = [line.split() for line in text.splitlines()][:1 if first_line else None]
         return lines
+
+
+def _command(argv: list[str]) -> tuple[list[str], list[str]]:
+    """The wrapper names leading `argv` and the command they run. sudo and doas options are parsed
+    here: hook._strip_prefix reads `sudo -n kill` as nice's `-n VALUE` and would hide the kill."""
+    from . import hook
+    wrappers = []
+    while argv:
+        stripped = hook._strip_prefix(argv)
+        prefix = argv[:len(argv) - len(stripped)]
+        s = next((i for i, w in enumerate(prefix + stripped[:1]) if os.path.basename(w) in ("sudo", "doas")), None)
+        if s is None:
+            return wrappers + [os.path.basename(w) for w in prefix], stripped
+        wrappers += [os.path.basename(w) for w in argv[:s + 1]]
+        argv = argv[s + 1 + _sudo_opts(argv[s + 1:]):]
+    return wrappers, argv
+
+
+def _sudo_opts(args: list[str]) -> int:
+    """How many words of `args` (what follows sudo or doas) are its own options."""
+    i = 0
+    while i < len(args) and args[i].startswith("-") and len(args[i]) > 1:
+        a = args[i]
+        if a == "--":
+            return i + 1
+        if a.startswith("--"):
+            i += a[2:] in SUDO_LONG_VALUE
+        else:
+            for j, ch in enumerate(a[1:], 2):
+                if ch in SUDO_VALUE_OPTS:
+                    i += not a[j:]
+                    break
+        i += 1
+    return i
+
+
+def _drop_fds(flat: str) -> str:
+    """`flat` without the fd numbers written against a redirection (`kill $! 2>/dev/null`)."""
+    from . import hook
+    q = hook._quoting(flat)
+    return FD_RE.sub(lambda m: m[0] if q[m.start(2)][0] else m[1], flat)
 
 
 def _ssh_command(argv: list[str]) -> str:
