@@ -2541,7 +2541,8 @@ def test_setup_box_agents_glean_sign_in_runs_in_tmux_and_hands_out_a_link_only_w
         rc, out = login(code_stdin=True)
         assert rc == 0 and "passed to the pending" in out, out
         for _ in range(100):
-            if (home / "pasted").exists():
+            # The file can exist before its line is written: wait for the text, not the name.
+            if (home / "pasted").exists() and (home / "pasted").read_text().strip():
                 break
             time.sleep(0.1)
         assert (home / "pasted").read_text().strip() == back
