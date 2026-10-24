@@ -12680,10 +12680,11 @@ def test_blocker_sweep_replay_of_a_day_of_signals_over_probe_watched_holds(env):
 
 
 
-def _held_sweep(p, monkeypatch):
+def _held_sweep(p, monkeypatch, before=None):
     """A daemon whose stuck items each end without a turn: a user-set resource pause, a task blocked until
     a time ahead, a wait on a retry_when probe and a deferral on a start_when probe whose last answers are
-    a fresh not yet, and a task blocked on an open ask. The first sweep at T0 runs the model."""
+    a fresh not yet, and a task blocked on an open ask. The first sweep at T0 runs the model, after
+    `before(db, t0, ids)` adds to them."""
     from ttp import anchors, coordinator as coord, daemon as dm, startgate, sweep, sweepskip
     db, t0 = p.db, time.time()
     clock = [t0]
@@ -12724,9 +12725,11 @@ def _held_sweep(p, monkeypatch):
             db.x("UPDATE events SET status='handled' WHERE id=?", (ev["id"],))
         return (ev or {}).get("id"), db.kv(sweepskip.RECEIPTS_KEY) or []
 
+    ids = {"until": until, "waiting": waiting, "asked": asked, "deferred": deferred, "dep": dep, "aid": aid}
+    if before:
+        before(db, t0, ids)
     eid, recs = run(t0)
     assert eid and not recs, "no model sweep on record: the first one runs the model"
-    ids = {"until": until, "waiting": waiting, "asked": asked, "deferred": deferred, "dep": dep, "aid": aid}
     return d, db, t0, at, run, ids
 
 
@@ -12935,15 +12938,15 @@ def test_blocker_sweep_skip_still_sweeps_a_coordinator_pause_with_no_model_free_
     assert not got["skip"] and "no model-free end: resource:board-c" in got["why"], (case, got["why"])
 
 
-@pytest.mark.parametrize("change", [_reason_changed, _end_changed])
-def test_blocker_sweep_skip_sweeps_a_coordinator_pause_changed_since_the_model_sweep(env, monkeypatch, change):
+@pytest.mark.parametrize("change, field", [(_reason_changed, "reason"), (_end_changed, "end")])
+def test_blocker_sweep_skip_sweeps_a_coordinator_pause_changed_since_the_model_sweep(env, monkeypatch, change, field):
     """A coordinator pause whose reason or end changed since the model sweep is judged by a turn, even
-    when its new end is model-free."""
+    when its new end is model-free; the reason names the pause and the field."""
     p = make(env)
     d, db, t0, again = _coordinator_pause_sweep(p, monkeypatch, {"end_when": "test -e out/c"})
     assert again()["skip"], "the control skips"
     got = again(change)
-    assert not got["skip"] and "items changed" in got["why"], got["why"]
+    assert not got["skip"] and got["why"] == f"items changed: resource:board-c {field}", got["why"]
 
 
 def test_blocker_sweep_skip_keeps_an_unchanged_user_pause_beside_a_coordinator_pause(env, monkeypatch):
@@ -12958,6 +12961,128 @@ def test_blocker_sweep_skip_keeps_an_unchanged_user_pause_beside_a_coordinator_p
     assert got["skip"], got["why"]
     assert got["ends"]["resource:board-v"] == "user pause"
     assert got["ends"]["resource:board-c"] == "probe: end_when `test -e out/c`"
+
+
+def _resleep_sweep(p, monkeypatch):
+    """_held_sweep plus what the daemon re-writes between sweeps while nothing changes: a time-deferred task
+    (its start_after long past, kept asleep by a retry_when that still says not yet) whose not_before moves
+    on each hourly probe, and "; next try <time>" in its and the waiting task's reasons. `resleep(ts)` is one
+    such probe at `ts`."""
+    from ttp import timefmt
+
+    def resleep(db, ts, ids):
+        nb = ts + 3600
+        for k in ("timed", "waiting"):
+            db.update_task(ids[k], blocked_reason=f"waiting for the user's sign-in; its probe says not yet; next "
+                                                  f"try {timefmt.short(nb, None)}")
+        db.update_task(ids["timed"], not_before=nb)
+
+    def before(db, t0, ids):
+        ids["timed"] = db.add_task("verify the tool once the user signs in",
+                                   labels=[f"start_after:{t0 - 3 * 86400}", f"deferred_since:{t0 - 3 * 86400 - 3600}"])
+        resleep(db, t0, ids)
+    d, db, t0, at, run, ids = _held_sweep(p, monkeypatch, before)
+    return d, db, t0, at, run, ids, lambda ts: resleep(db, ts, ids)
+
+
+def test_blocker_sweep_skip_ignores_the_times_the_daemon_rewrites_between_sweeps(env, monkeypatch):
+    """Two sweeps over an unchanged stuck set skip the second: a time-deferred task's not_before, which the
+    daemon pushes on at each still-failing hourly probe (its "starts after" reason and end with it), a
+    reason's "; next try" time, and a review that came and went between the sweeps change nothing a turn
+    judges."""
+    from ttp import sweep, sweepskip
+    p = make(env)
+    d, db, t0, at, run, ids, resleep = _resleep_sweep(p, monkeypatch)
+    timed = f"task:{ids['timed']}"
+    first = sweep.items(db, t0, d.cfg)
+    assert {i["key"]: i["ends"] for i in first}[timed] == "time"
+    r = db.add_task("a change to review")   # a short-lived review item between the sweeps
+    db.update_task(r, status="review")
+    db.update_task(r, status="done")
+    for h in range(1, 7):
+        resleep(t0 + h * 3600)
+    t1 = t0 + 6 * 3600 + 60
+    at(t1)
+    live = sweep.items(db, t1, d.cfg)
+    was = {i["key"]: i["reason"] for i in first}
+    assert {i["key"]: i["reason"] for i in live}[timed] != was[timed], "the not_before moved"
+    got = sweepskip.check(db, d.cfg, live, t1, d._probe_rc.get)
+    assert got["skip"], got["why"]
+    eid, recs = run(t1)
+    assert eid is None and len(recs) == 1
+    assert dict(recs[0]["items"])[timed].startswith("starts after ")
+
+
+def test_blocker_sweep_fingerprint_drops_only_the_times_the_daemon_writes(env):
+    """The fingerprint ignores a time-only deferral's not_before (its "starts after <time>" reason and end) and
+    a reason's "; next try <time>" tail, in the daemon's own formats only: a reason or end a turn wrote that
+    reads alike still counts."""
+    from ttp import sweepskip
+    p = make(env)
+    db, now = p.db, time.time()
+    t = p.db.add_task("verify once the user signs in", labels=[f"start_after:{int(now) - 86400}"])
+    db.update_task(t, not_before=now + 3600)
+
+    def fp(reason, e="", ends="time"):
+        i = {"key": f"task:{t}", "kind": "deferred", "task": t, "status": "queued", "spec_sha": "s",
+             "reason": reason, "ends": ends}
+        return sweepskip._fp(db, i, e)
+    assert fp("starts after 2026-10-24 20:52 UTC", "starts after 2026-10-24 20:52 UTC") == \
+        fp("starts after 2026-10-25 01:52 PDT", "starts after 2026-10-25 01:52 PDT")
+    assert fp("waiting for sign-in; its probe says not yet; next try 16:52 PDT") == \
+        fp("waiting for sign-in; its probe says not yet; next try Sat 09:10 PDT")
+    assert fp("starts after the lab opens") != fp("starts after the vendor ships")
+    assert fp("held; next try after the vendor replies") != fp("held; next try after the lab opens")
+    assert fp("waiting; its probe says not yet; next try 16:52 PDT") != \
+        fp("waiting; its probe says host unreachable; next try 16:52 PDT")
+    assert fp("r", "until 2026-10-24 20:52 UTC", ends=None) != fp("r", "until 2026-10-25 20:52 UTC", ends=None)
+    was = fp("r")
+    db.update_task(t, labels=[f"start_after:{int(now) - 3600}"])   # a deliberate re-deferral counts
+    assert fp("r") != was
+
+
+def _real_change(case, p, d, db, ts, ids):
+    from ttp import anchors
+    if case == "status":
+        db.update_task(ids["deferred"], status="waiting", labels=[], result=json.dumps(
+            {"status": "waiting", "summary": "bench", "retry_when": "test -e out/d", "waiting_since": ts - 60}))
+        d._probe_rc[ids["deferred"]] = (1, ts - 60, "test -e out/d")
+        return f"task:{ids['deferred']} kind/status/"
+    if case == "spec":
+        db.update_task(ids["until"], spec="blocked until the window, on the second bench")
+        return f"task:{ids['until']} spec"
+    if case == "dependency state":
+        db.update_task(ids["dep"], status="queued")
+        return f"task:{ids['until']} deps"
+    if case == "new item":
+        n = db.add_task("another window")
+        db.update_task(n, status="blocked", blocked_reason="later", labels=[anchors.label("until", str(ts + 86400))])
+        return f"+task:{n}"
+    if case == "removed item":
+        db.update_task(ids["asked"], status="cancelled")
+        return f"-task:{ids['asked']}"
+    if case == "re-deferred":   # a deliberate start_after again ahead: a planned deferral, no longer stuck
+        db.update_task(ids["timed"], labels=[f"start_after:{ts + 86400}"], not_before=ts + 86400)
+        return f"-task:{ids['timed']}"
+    raise AssertionError(case)
+
+
+@pytest.mark.parametrize("case", ["status", "spec", "dependency state", "new item", "removed item", "re-deferred"])
+def test_blocker_sweep_skip_still_turns_on_a_real_change_and_names_it(env, monkeypatch, case):
+    """With the daemon's re-written times ignored, a real change since the model sweep still starts a turn,
+    and its reason names the item and what changed ("task:12 spec", "+task:13", "-task:9")."""
+    from ttp import sweep, sweepskip
+    p = make(env)
+    d, db, t0, at, run, ids, resleep = _resleep_sweep(p, monkeypatch)
+    t1 = t0 + 6 * 3600 + 60
+    at(t1)
+    resleep(t1)
+    assert sweepskip.check(db, d.cfg, sweep.items(db, t1, d.cfg), t1, d._probe_rc.get)["skip"], "the control skips"
+    want = _real_change(case, p, d, db, t1, ids)
+    got = sweepskip.check(db, d.cfg, sweep.items(db, t1, d.cfg), t1, d._probe_rc.get)
+    assert not got["skip"] and got["why"].startswith("items changed: ") and want in got["why"], got["why"]
+    eid, recs = run()
+    assert eid and recs == [], f"{case}: a model sweep, no receipt"
 
 
 def test_task_add_of_a_review_of_an_accepted_head_is_refused_unless_forced_with_a_reason(env, monkeypatch):

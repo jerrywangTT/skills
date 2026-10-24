@@ -20,15 +20,16 @@ without a turn (end()):
 - a review younger than coordinator.review_backlog_h whose review task is queued or running.
 
 The turn is skipped only when every item has such an end, the items and each one's status, spec,
-reason and end are what they were at the last sweep a turn ran (MODEL_KEY), that sweep was less than
-MAX_AGE_H ago, and nothing else needs a turn: no signal() request pending, no re-check a sweep
-outcome asked for came due (its `next` or the daily re-check, which the receipt's clock would
-otherwise pass), no inbound message unhandled, no other queued event but routine ones
-(quietgate.routine_kinds), no task pushing past coordinator.review_backlog_h, no loop and no ask
-held past ask_rethink_h. A new or changed item (a pause: its reason, `until` or `end_when`), a
-broken or stale probe, a deferral past defer_max_days, a pause the coordinator set with none of those
-ends or past its end, a dependency or probe task that failed, was cancelled or does not exist, a
-review past its expected time, or an item with no model-free end starts the sweep turn as before.
+reason and end are what they were at the last sweep a turn ran (MODEL_KEY; less the times the daemon
+re-writes when it puts a task back to sleep, _parts), that sweep was less than MAX_AGE_H ago, and
+nothing else needs a turn: no signal() request pending, no re-check a sweep outcome asked for came due
+(its `next` or the daily re-check, which the receipt's clock would otherwise pass), no inbound message
+unhandled, no other queued event but routine ones (quietgate.routine_kinds), no task pushing past
+coordinator.review_backlog_h, no loop and no ask held past ask_rethink_h. A new or changed item (a pause:
+its reason, `until` or `end_when`), a broken or stale probe, a deferral past defer_max_days, a pause the
+coordinator set with none of those ends or past its end, a dependency or probe task that failed, was
+cancelled or does not exist, a review past its expected time, or an item with no model-free end starts
+the sweep turn as before; its reason names the items changed and their fields.
 
 A skip writes a receipt (RECEIPTS_KEY: each item and what ends it, with the estimated saving, the
 quiet gate's mean coordinator turn) and sets sweep.STATE_KEY `receipt`, which the sweep's clock counts
@@ -39,19 +40,24 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import time
 from typing import Any, Callable
 
 from . import anchors, ends, holdloops, landed, quietgate, sweep, timefmt
 from .db import DB, dependency_ids, deferral, load_result
 
-MODEL_KEY = "blocker_sweep_model"        # kv: {ts, n, fps: {key: fp}}: the last sweep a turn ran
+MODEL_KEY = "blocker_sweep_model"        # kv: {ts, n, fps: {key: fp}, parts: {key: {field: h}}}: the last sweep a turn ran
 RECEIPTS_KEY = "blocker_sweep_receipts"  # kv: [{ts, model, why, items: [[key, end]], usd}]
 MAX_AGE_H = 24.0
 KEEP_S = 8 * 86400
 DEFER_MAX_DAYS = 14.0
 MAX_HOLD_S = 6 * 3600.0
 DEAD = ("failed", "cancelled")
+# What the daemon writes when it puts a task back to sleep: a reason's "; next try <timefmt.short>" tail, and a
+# time-only deferral's "starts after <timefmt.long of not_before>" (sweep.items).
+NEXT_TRY = re.compile(r"; next try ([A-Z][a-z]{2} )?\d{2}:\d{2} \S+$")
+STARTS_AT = re.compile(r"^starts after \d{4}-\d{2}-\d{2} \d{2}:\d{2} \S+$")
 RECHECKS = ("next check due", "daily re-check due")   # sweep._signals lines for a re-check a turn asked for
 
 Probe = Callable[[int], Any]   # task id -> (rc, ts, probe) of its last probe answer, or None
@@ -174,17 +180,45 @@ def end(db: DB, cfg: dict, i: dict, now: float, probe_of: Probe | None = None, a
     return f"open ask #{a['id']}" if a.get("id") in (asks or {}) else None
 
 
-def _fp(db: DB, i: dict, e: str | None, paused: dict | None = None) -> str:
-    """The item as a turn would judge it: its kind, status, spec, reason, end and its dependencies' states.
+def _parts(db: DB, i: dict, e: str | None, paused: dict | None = None) -> dict[str, Any]:
+    """The item as a turn would judge it, by field: its kind, status, spec, reason, end and its dependencies' states.
     A coordinator pause counts its row's own ends (`until`, `end_when`) instead of the end found now: a dated end
-    comes within the next sweep, and a probe first answers, as time passes, not as the pause changes."""
+    comes within the next sweep, and a probe first answers, as time passes, not as the pause changes. Text the daemon
+    re-writes each time it puts a task back to sleep is left out: a reason's "; next try <time>" tail, and a time-only
+    deferral's `not_before` (its "starts after <time>" reason and end), which a still-failing retry_when pushes on each
+    hour; the deliberate start_after counts instead."""
     t = db.task(i["task"]) if i.get("task") else None
     deps = [[d, (db.task(d) or {}).get("status")] for d in dependency_ids(t) if isinstance(d, int)] if t else []
     row = (paused or {}).get(i["resource"]) if i["kind"] == "paused" else None
     if isinstance(row, dict) and i.get("ends") != "user":   # a user pause keeps its end as before
         e = [row.get(k) for k in ("by", "since", "until", "end_when")]
-    return hashlib.sha256(json.dumps([i["key"], i["kind"], i["status"], i["spec_sha"], i["reason"], e, deps],
-                                     default=str).encode()).hexdigest()[:16]
+    reason = NEXT_TRY.sub("", str(i["reason"] or ""))
+    if t and i.get("ends") == "time":
+        e = ["time", deferral(t).get("after")]
+        reason = STARTS_AT.sub("starts after", reason)
+    return {"kind": i["kind"], "status": i["status"], "spec": i["spec_sha"], "reason": reason, "end": e, "deps": deps}
+
+
+def _h(v: Any) -> str:
+    return hashlib.sha256(json.dumps(v, default=str).encode()).hexdigest()[:16]
+
+
+def _fp(db: DB, i: dict, e: str | None, paused: dict | None = None) -> str:
+    """The item's fingerprint: its key and _parts()."""
+    return _h([i["key"], *_parts(db, i, e, paused).values()])
+
+
+def _changed(model: dict, fps: dict, parts: dict) -> list[str]:
+    """What changed since the model sweep: "key field/field" for a changed item (the key alone when the model
+    sweep kept no fields), "+key" for a new one, "-key" for one gone."""
+    old, was = model.get("fps") or {}, model.get("parts") or {}
+    out = []
+    for k in sorted(fps.keys() & old.keys()):
+        if fps[k] != old[k]:
+            prev = was.get(k) if isinstance(was.get(k), dict) else {}
+            fields = [f for f, v in parts[k].items() if prev and prev.get(f) != v]
+            out.append(f"{k} {'/'.join(fields)}" if fields else k)
+    return out + [f"+{k}" for k in sorted(fps.keys() - old.keys())] + [f"-{k}" for k in sorted(old.keys() - fps.keys())]
 
 
 def check(db: DB, cfg: dict, live: list[dict], now: float, probe_of: Probe | None = None,
@@ -194,8 +228,9 @@ def check(db: DB, cfg: dict, live: list[dict], now: float, probe_of: Probe | Non
     asks = sweep._open_asks(db)
     paused = db.paused_resources() if any(i["kind"] == "paused" for i in live) else {}
     got = {i["key"]: end(db, cfg, i, now, probe_of, asks, paused, project) for i in live}
+    parts = {i["key"]: {f: _h(v) for f, v in _parts(db, i, got[i["key"]], paused).items()} for i in live}
     fps = {i["key"]: _fp(db, i, got[i["key"]], paused) for i in live}
-    out = {"skip": False, "why": "", "ends": got, "fps": fps}
+    out = {"skip": False, "why": "", "ends": got, "fps": fps, "parts": parts}
     model = db.kv(MODEL_KEY) or {}
     state = db.kv(sweep.STATE_KEY, {}) or {}
     prev = state.get("items") or {}
@@ -205,7 +240,7 @@ def check(db: DB, cfg: dict, live: list[dict], now: float, probe_of: Probe | Non
         (lambda: [k for k, e in got.items() if not e], "no model-free end: {}"),
         (lambda: not isinstance(model, dict) or not model.get("fps"), "no model sweep on record"),
         (lambda: now - _f(model.get("ts"), 0) >= MAX_AGE_H * 3600, "the last model sweep is 24 h old"),
-        (lambda: model.get("fps") != fps, "items changed since the last model sweep"),
+        (lambda: _changed(model, fps, parts), "items changed: {}"),
         (lambda: bool(db.kv(sweep.SIGNAL_KEY, [])), "a signal is pending"),
         # A re-check a turn asked for (an outcome's `next`, a daily re-check) came due since the clock:
         # a receipt would move the clock past it and lose it.
@@ -221,7 +256,8 @@ def check(db: DB, cfg: dict, live: list[dict], now: float, probe_of: Probe | Non
     )
     for test, why in checks:
         if hit := test():
-            out["why"] = why.format(", ".join(hit[:5])) if isinstance(hit, list) else why
+            out["why"] = why.format(", ".join(hit[:5]) + (f", +{len(hit) - 5} more" if len(hit) > 5 else "")) \
+                if isinstance(hit, list) else why
             return out
     out["skip"] = True
     return out
@@ -230,7 +266,7 @@ def check(db: DB, cfg: dict, live: list[dict], now: float, probe_of: Probe | Non
 def swept(db: DB, got: dict, now: float) -> None:
     """A sweep turn was queued: what later skips must match."""
     n = int((db.kv(sweep.STATE_KEY, {}) or {}).get("n") or 0)
-    db.set_kv(MODEL_KEY, {"ts": now, "n": n, "fps": got["fps"]})
+    db.set_kv(MODEL_KEY, {"ts": now, "n": n, "fps": got["fps"], "parts": got.get("parts") or {}})
 
 
 def skip(db: DB, got: dict, why: str, now: float) -> dict:
