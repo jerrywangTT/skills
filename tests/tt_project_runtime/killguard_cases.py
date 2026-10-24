@@ -91,6 +91,27 @@ def test_kill_guard_signal_zero_probes_pass_and_real_signals_are_refused(kill_tr
         assert _kill_refusal(cmd, t) is None, cmd
 
 
+
+def test_kill_guard_kill_signal_zero_scans_every_word_for_signal_words(kill_tree):
+    # /bin/kill parses with getopt (abbreviated long options, options after the pid), so kill's signal-0
+    # exemption scans every word like pkill's: -<signal>, -s/-n (joined or with the next word) and --s...--signal
+    # must all mean 0, and --ti...--timeout (util-linux kill sends a second signal) never passes.
+    t = kill_tree
+    o = t.outside
+    for cmd in (f"/bin/kill -0 --sig KILL {o}", f"/bin/kill -0 {o} -s KILL", f"env kill -0 -q 1 -s KILL {o}",
+                f"kill -0 {o} -s", f"kill -0 --sig=KILL {o}", f"kill -0 --s 9 {o}", f"kill -0 {o} -9",
+                f"kill -0 {o} -sKILL", f"kill -0 {o} -n9", f"kill -0 {o} --signal", f"sudo /bin/kill -0 {o} -TERM",
+                f"timeout 5 /bin/kill -0 {o} --si=TERM", f"kill -s 0 {o} -- -KILL", f"kill -0 --timeout 100 KILL {o}",
+                f"kill -0 --time=100 KILL {o}", f"echo {o} | xargs kill -0 -s KILL",
+                # accepted false refusal: a negative process group after kill -0 reads as a signal word
+                f"kill -0 -- -{t.outside_group}"):
+        assert _kill_refusal(cmd, t) is not None, cmd
+    for cmd in (f"kill -0 {o}", f"/bin/kill -0 {o}", f"kill -s 0 {o}", f"kill --signal=0 {o}", f"env kill -0 {o}",
+                f"/bin/kill -0 {o} -s 0", f"kill -s0 {o}", f"kill -0 --sig=SIG0 {o}", f"env kill -0 -q 1 {o}",
+                f"/bin/kill -s KILL {t.child}", f"kill -0 --signal KILL {t.child}",
+                f"env kill -0 -s 9 -- -{t.group}", f"kill -0 -sKILL {t.child}"):
+        assert _kill_refusal(cmd, t) is None, cmd
+
 def test_kill_guard_allows_kill_of_own_tree_only(kill_tree):
     t = kill_tree
     for cmd in (f"kill {t.child}", f"kill -9 {t.child}", f"kill -s TERM {t.child}", f"kill -- -{t.group}",

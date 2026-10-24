@@ -307,7 +307,7 @@ class _Guard:
         scope, i = [], 0
         if args and re.fullmatch(r"-(?:\d+|(?:SIG)?[A-Z]{3}[A-Z0-9+-]*)", args[0]):   # -9, -TERM: a signal
             i = 1
-            if re.fullmatch(r"-(?:SIG)?0+", args[0], re.I) and self._pkill_signal_zero(args):
+            if re.fullmatch(r"-(?:SIG)?0+", args[0], re.I) and _signal_zero(args):
                 return   # signal 0 sends nothing: a liveness probe
         while i < len(args):
             a = args[i]
@@ -342,28 +342,6 @@ class _Guard:
                     if not ok:
                         raise Refused(f"{name} -{opt} {self._show(v)}: {n} is not this task's own process, group or session")
 
-    @staticmethod
-    def _pkill_signal_zero(args: list[str]) -> bool:
-        """Whether pkill surely sends signal 0. Its options are not parsed: which word an option takes as its value
-        differs between procps versions (`--r` is --runstates in one and ambiguous in another, and a value can be
-        `--`), so every word counts, before and after `--`. Signal words are -<number> or -<name> (with or without
-        SIG, any case: pkill takes the first one anywhere in argv) and --s, --si ... --signal with its value after
-        `=` or in the next word. All of them must mean 0; a --signal with no value does not.
-        Accepted false refusals (probe with pgrep instead): `pkill -0 -- --signal`, and a pattern or option
-        cluster that looks like a signal word (`pkill -0 -- -HUP`, `pkill -0 -io x`)."""
-        for k, a in enumerate(args):
-            head, eq, value = a.partition("=")
-            if len(head) >= 3 and "--signal".startswith(head):
-                if not eq:
-                    if k + 1 >= len(args):
-                        return False
-                    value = args[k + 1]
-                if not SIGNAL_ZERO_RE.fullmatch(value):
-                    return False
-            elif SIGNAL_TOKEN_RE.fullmatch(a) and not SIGNAL_ZERO_RE.fullmatch(a[1:]):
-                return False
-        return True
-
     def _kill(self, args: list[str], remote: bool, stdin: bool) -> None:
         if args[:1] and re.fullmatch(r"-[lL]|--list(?:=.*)?|--table", args[0]):
             return
@@ -386,8 +364,8 @@ class _Guard:
                 sig, rest = rest[0].split("=", 1)[1] if rest[0].startswith("--") else rest[0][2:], rest[1:]
         if rest[:1] == ["--"]:
             rest = rest[1:]
-        if sig is not None and re.fullmatch(r"(?:SIG)?0", sig, re.I):   # signal 0 sends nothing: a liveness probe
-            return
+        if sig is not None and re.fullmatch(r"(?:SIG)?0", sig, re.I) and _signal_zero(args, kill=True):
+            return   # signal 0 sends nothing: a liveness probe
         if stdin:
             raise Refused("kill run by xargs (or find, parallel) takes its pids from input the hook cannot see "
                           "before the command runs")
@@ -451,6 +429,36 @@ class _Guard:
             raise cant
         lines = [line.split() for line in text.splitlines()][:1 if first_line else None]
         return lines
+
+
+def _signal_zero(args: list[str], kill: bool = False) -> bool:
+    """Whether pkill (kill, with `kill`) surely sends signal 0. Options are not parsed: which word an option takes
+    as its value differs between procps versions and between the shell builtin and /bin/kill (getopt takes
+    abbreviated long options and options after the pid; `--r` is --runstates in one pkill and ambiguous in
+    another, and a value can be `--`), so every word counts, before and after `--`. Signal words are
+    -<number> or -<name> (with or without SIG, any case: pkill takes the first one anywhere in argv) and --s,
+    --si ... --signal with its value after `=` or in the next word; for kill also -s and -n, with the value
+    joined (-sKILL) or in the next word, and any --ti... --timeout (util-linux kill sends its signal after the
+    first). All of them must mean 0; one with no value does not.
+    Accepted false refusals (probe with pgrep, or kill -0 on a plain pid): `pkill -0 -- --signal`, a pattern or
+    option cluster that looks like a signal word (`pkill -0 -- -HUP`, `pkill -0 -io x`), and a negative process
+    group written after kill -0 (`kill -0 -- -4242` reads as signal 4242)."""
+    for k, a in enumerate(args):
+        head, eq, value = a.partition("=")
+        if kill and len(head) >= 4 and "--timeout".startswith(head):
+            return False   # util-linux kill --timeout <ms> <signal> sends a second signal
+        if kill and a[:2] in ("-s", "-n"):
+            head, eq, value = a[:2], len(a) > 2, a[2:]
+        if len(head) >= 3 and "--signal".startswith(head) or kill and head in ("-s", "-n"):
+            if not eq:
+                if k + 1 >= len(args):
+                    return False
+                value = args[k + 1]
+            if not SIGNAL_ZERO_RE.fullmatch(value):
+                return False
+        elif SIGNAL_TOKEN_RE.fullmatch(a) and not SIGNAL_ZERO_RE.fullmatch(a[1:]):
+            return False
+    return True
 
 
 def _command(argv: list[str]) -> tuple[list[str], list[str]]:
