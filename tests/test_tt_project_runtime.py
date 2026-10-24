@@ -21078,6 +21078,59 @@ def test_set_when_refuses_an_always_passing_probe_while_the_hand_offs_on_pass_cm
     assert res["retry_when"] == "true" and res.get("on_pass_cmd") is None, res
 
 
+def test_an_on_pass_cmd_waits_for_its_probe_and_runs_exactly_once(env, monkeypatch, tmp_path):
+    """The on_pass_cmd runs only after the hand-off's own probe passes, and once: later ticks never rerun it."""
+    p = make(env)
+    from ttp import daemon as dmod
+    monkeypatch.setattr(dmod, "PROBE_EVERY_S", 0)
+    d = dmod.Daemon(p.base)
+    marker, count = tmp_path / "job.rc", tmp_path / "count"
+    cmd = f"echo x >> {count}; printf '{{\"status\":\"done\",\"summary\":\"verified\"}}' > \"$TTP_RESULT\""
+    tid, _ = _on_pass_cmd_task(p, tmp_path, cmd, probe=f"test -e {marker}")
+    for _ in range(2):
+        _settle_on_pass(d, tid)
+        assert p.db.task(tid)["status"] == "queued" and not count.exists() and not _ready(p, tid)
+    marker.write_text("0\n")
+    for _ in range(3):   # a probe started before the marker existed may still answer "not yet" once
+        _settle_on_pass(d, tid)
+        if p.db.task(tid)["status"] == "done":
+            break
+    assert p.db.task(tid)["status"] == "done", p.db.task(tid)["result"]
+    for _ in range(3):
+        d.tick()
+        _settle_on_pass(d, tid)
+    assert count.read_text() == "x\n" and p.db.task(tid)["status"] == "done"
+
+
+def test_a_hand_off_retry_when_that_is_no_shell_command_is_refused_not_stored(env, monkeypatch, tmp_path):
+    """A hand-off's JSON `"retry_when": true` is never stored (nor read as passed): the task keeps no probe,
+    says so in an event, and its on_pass_cmd never runs; a string probe is stored exactly as written."""
+    p = make(env)
+    from ttp import daemon as dmod
+    monkeypatch.setattr(dmod, "PROBE_EVERY_S", 0)
+    d = dmod.Daemon(p.base)
+    flag = tmp_path / "ran"
+    probe = f"ttp detach --check {tmp_path}/drv  &&  test -e '{tmp_path}/a b'"
+    for retry_when in (True, probe):
+        monkeypatch.setenv("TTP_FAKE_RESULT", json.dumps({
+            "status": "waiting", "summary": "job running", "waiting_for": "the job", "retry_after_s": 900,
+            "retry_when": retry_when, "on_pass_cmd": f"touch {flag}"}))
+        tid = p.db.add_task(f"waits on {retry_when!r}", "s", kind="work", tier="light", origin="user")
+        assert _run_until(d, p, lambda: p.db.one("SELECT id FROM events WHERE kind='task_waiting' AND task=?",
+                                                 (tid,)))
+        res = json.loads(p.db.task(tid)["result"])
+        refused = p.db.q("SELECT text FROM events WHERE kind='handoff_probe_refused' AND task=?", (tid,))
+        if retry_when is True:
+            assert "retry_when" not in res and res["retry_when_refused"] == "true", res
+            assert len(refused) == 1 and "on_pass_cmd" in refused[0]["text"], refused
+            for _ in range(3):
+                d.tick()
+                _settle_on_pass(d, tid)
+            assert p.db.task(tid)["status"] == "queued" and not flag.exists()
+        else:
+            assert res["retry_when"] == probe and "retry_when_refused" not in res and not refused, res
+
+
 @pytest.mark.parametrize("change", ["probe", "cmd", "both", "unrelated"])
 def test_an_on_pass_cmd_runs_model_free_after_set_when_rewrites_the_hand_off(env, monkeypatch, tmp_path, capsys,
                                                                             change):

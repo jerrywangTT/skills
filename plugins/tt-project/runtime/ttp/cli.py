@@ -7888,7 +7888,8 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--start-after", help="add: a delay (2h, 3d) or ISO time before which it does not start")
     s.add_argument("--why", help="add: plain words for --start-when, shown instead of the probe")
     s.add_argument("--on-pass-cmd", help="set-when: a waiting task's model-free completion command, run once its "
-                   "retry_when passes (\"\" clears it); without a probe its retry_when stays")
+                   "retry_when passes (\"\" clears it); without a probe its retry_when stays; an "
+                   "always-passing probe alone is refused while the hand-off's on_pass_cmd stays")
     s.set_defaults(fn=cmd_task)
 
     s = sub.add_parser("obligation", help="urgent deliverables owed to the user: add, attach owner tasks, "
