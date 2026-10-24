@@ -270,6 +270,10 @@ def validate(run_dir: pathlib.Path) -> tuple[list[str], list[str], dict[str, tup
                                 "(measured-source.md, step 1)")
             elif build not in BUILD_TYPES:
                 errors.append(f"run.json {key} build '{build}' not in {BUILD_TYPES}")
+    for item, record in (run.get("measurements") or {}).items():
+        if item.startswith("source:") and record.get("state") == "failed" and "cause" not in record:
+            warnings.append(f"run.json measurements {item} failed without a cause; mark it again with --cause "
+                            "test, tool or not-run (measured-source.md)")
     issues = run.get("entry_test_issues")
     if issues is None:
         warnings.append("run.json has no entry_test_issues; search the open issues of the entry test "

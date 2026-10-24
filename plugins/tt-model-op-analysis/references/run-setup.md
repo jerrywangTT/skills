@@ -190,7 +190,7 @@ costs no extra run. One job through `tt-device-mcp`. Then:
 - **Failed.** Show the failure line and ask: another entry test (step 6), another commit (step 4),
   or the static phase anyway. For the last, record the failure with `graph_report.py ... --build <type> --entry-fail "<failure line>"`
   when the capture file was written, otherwise with
-  `python3 <plugin-root>/scripts/measurements.py mark <run dir> source:graph failed --note "<failure line>"`.
+  `python3 <plugin-root>/scripts/measurements.py mark <run dir> source:graph failed --cause test --note "<failure line>"`.
   For another test or commit, delete this `run.json` and the capture and cache with the user's
   approval, and set the run up again.
 
@@ -252,7 +252,8 @@ as ⚠️ even after a local pass; remove an issue once it is closed, and update
 `analysed_by`: one entry per agent session that changed the run, `{"agent", "model", "work",
 "date"}`, for example `{"agent": "Claude Code", "model": "claude-opus-5-5", "work": "static trace,
 quasar-bf16 destination", "date": "2026-10-21"}` or `{"agent": "Codex", ...}`. Append, never rewrite
-another agent's entry. The Info tab lists them under "Analysed by".
+another agent's entry. For earlier work whose agent or model nobody recorded, write `not recorded`
+in that field. The Info tab lists them under "Analysed by".
 
 `entry_test_failure` (`{"by", "date", "result", "build"}`) records a failed local run of the entry test
 (`--entry-fail` of `merge_measured.py` or `graph_report.py`); a later recorded pass removes it.

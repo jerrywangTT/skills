@@ -189,8 +189,21 @@ another host, or open the cache in the extension ("Cache API Analyzer: Analyze a
 
 When an item cannot run or its output is unusable (no device, no profiler build, no elfray engine,
 test failure), record it with
-`python3 <plugin-root>/scripts/measurements.py mark <run dir> <item> failed --note "<reason>"`
-so the next session shows why. A successful script run marks its item done by itself.
+`python3 <plugin-root>/scripts/measurements.py mark <run dir> <item> failed --cause <cause> --note "<reason>"`
+so the next session shows why. A successful script run marks its item done by itself. `--cause` says
+what the failure means for the entry test:
+
+- `test`: the entry test itself hung, failed or missed its PCC in this run (a device hang on a
+  blocking read, a TT_FATAL, a PCC below threshold), even when another run passed. The sheet then
+  shows the end-to-end test as ⚠️ "passed in 1 of N runs", not ✅: a pass that does not repeat is not
+  a reliable pass.
+- `tool`: the instrument stopped a run the test would otherwise finish (Tracy's instrumented cold
+  compilation running past the timeout, an unwritable capture file, an elfray error). Listed on the
+  end-to-end row, without downgrading it.
+- `not-run`: the run never started (no device, no profiler build, no engine).
+
+Decide `test` versus `tool` from where it stopped: a run that stopped inside the model's forward on a
+device wait, with nothing of the tool's own on the stack, is `test`.
 
 Silicon numbers come from the scripts, never from reading a CSV by eye. Do not claim a host
 percentage or footprint the scripts did not produce.

@@ -29,7 +29,7 @@ import sys
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from kernel_tests import plan_rows, read_plan  # noqa: E402
 from opa_schema import (  # noqa: E402
-    LAUNCH_PROFILES, METHOD_ITEMS, TEST_TARGETS, UNDECIDED_RESULTS, read_csv, read_results, run_targets,
+    FAILURE_CAUSES, LAUNCH_PROFILES, METHOD_ITEMS, TEST_TARGETS, UNDECIDED_RESULTS, read_csv, read_results, run_targets,
 )
 
 STATUS_ORDER = ("❌", "⚠️", "✅")
@@ -101,15 +101,20 @@ def items(run_dir: pathlib.Path) -> list[dict]:
     return out
 
 
-def mark(run_dir: pathlib.Path, item: str, state: str, note: str) -> int:
+def mark(run_dir: pathlib.Path, item: str, state: str, note: str, cause: str = "") -> int:
     path = run_dir / "run.json"
     run = json.loads(path.read_text(encoding="utf-8"))
     known = [i["item"] for i in _derived(run_dir, run)]
     if item not in known:
         print(f"ERROR: unknown item '{item}'; this run has {known}")
         return 2
-    run.setdefault("measurements", {})[item] = {
-        "state": state, "date": datetime.date.today().isoformat(), "note": note}
+    if cause and state != "failed":
+        print("ERROR: --cause applies to a failed item only")
+        return 2
+    record = {"state": state, "date": datetime.date.today().isoformat(), "note": note}
+    if cause:
+        record["cause"] = cause
+    run.setdefault("measurements", {})[item] = record
     path.write_text(json.dumps(run, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     print(f"{item}: {state}")
     return 0
@@ -127,9 +132,12 @@ def main() -> int:
     p_mark.add_argument("item")
     p_mark.add_argument("state", choices=MARK_STATES)
     p_mark.add_argument("--note", default="")
+    p_mark.add_argument("--cause", choices=FAILURE_CAUSES,
+                        help="for a failed source item: test (the entry test hung, failed or missed its PCC in "
+                             "this run), tool (the instrument stopped it), not-run (it could not start)")
     args = parser.parse_args()
     if args.cmd == "mark":
-        return mark(args.run_dir, args.item, args.state, args.note)
+        return mark(args.run_dir, args.item, args.state, args.note, args.cause or "")
     out = [i for i in items(args.run_dir) if not (args.pending and i["state"] == "done")]
     if args.json:
         print(json.dumps(out, ensure_ascii=False))

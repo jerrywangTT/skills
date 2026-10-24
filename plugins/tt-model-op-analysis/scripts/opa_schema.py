@@ -127,6 +127,10 @@ LLK_GAPS_COLUMNS = ("id", "kind", "name", "quasar_status", "review", "review_not
                     "configs", "cache_rows", "kernels")
 
 
+# Why a source measurement item failed. Only `test` says something about the entry test itself; `tool`
+# (a profiler timeout from instrumented compilation, an unreadable capture) and `not-run` do not.
+FAILURE_CAUSES = ("test", "tool", "not-run")
+
 # The source measurement item of each measured method and the run.json key its script records.
 METHOD_ITEMS = {"tracy": ("source:tracy", "measured_ops"), "graph": ("source:graph", "graph_capture"),
                 "cache": ("source:cache", "kernel_cache")}

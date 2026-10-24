@@ -528,8 +528,16 @@ def entry_test_state(run: dict) -> str:
             parts.append(f"CI: {ci_job(run)}")
         issues = open_issues(run)
         where = " locally" if passes.get("result") and not ci_job(run) else ""
-        # A pass does not close an open issue that reports the test failing, for example in another build.
-        mark = f"⚠️ passed{where}" if issues else f"✅ passed{where}"
+        failed_runs = [(item, m) for item, m in (run.get("measurements") or {}).items()
+                       if item.startswith("source:") and m.get("state") == "failed" and m.get("cause") in ("test", "tool")]
+        test_failures = [f for f in failed_runs if f[1]["cause"] == "test"]
+        # A pass does not close an open issue that reports the test failing, nor a hang or failure of the same test
+        # in another run of this analysis.
+        mark = f"⚠️ passed{where}" if issues or test_failures else f"✅ passed{where}"
+        if failed_runs:
+            parts.append(f"passed in 1 of {1 + len(failed_runs)} runs: " + ", ".join(
+                f"{item} {'failed in the test' if m['cause'] == 'test' else 'stopped by its tool'} ({m.get('date', '')})"
+                for item, m in failed_runs) + " (Analysis methods)")
         if issues:
             parts.append("open " + ", ".join(issue_ref(i) for i in issues) + " reports it failing (Entry test issues)")
         return f"{mark}: " + "; ".join(parts)
@@ -547,12 +555,18 @@ def issues_state(run: dict) -> str:
     return f"⚠️ {len(issues)} open (searched {record.get('checked', '')}): {listed}"
 
 
+NOT_RECORDED = "not recorded"
+
+
 def analysed_by_state(run: dict) -> str:
     entries = run.get("analysed_by") or []
     if not entries:
         return "not recorded"
-    return "; ".join(f"{e.get('agent', '')} ({e.get('model', '')}): {e.get('work', '')}, {e.get('date', '')}"
-                     for e in entries)
+    def who(e: dict) -> str:
+        model = e.get("model", "")
+        return e.get("agent", "") + (f" ({model})" if model and model != NOT_RECORDED else "")
+
+    return "; ".join(f"{who(e)}: {e.get('work', '')}, {e.get('date', '')}" for e in entries)
 
 
 HOST_SHARE_WARN = 5.0

@@ -53,7 +53,8 @@ resolve every `<plugin-root>/...` path against it.
    source items `source:tracy`, `source:graph` and `source:cache` come from two runs of the entry
    test (graph and cache together, Tracy alone). For an unavailable item offer to leave it pending
    or record it with
-   `python3 <plugin-root>/scripts/measurements.py mark <run dir> <item> failed --note "<reason>"`.
+   `python3 <plugin-root>/scripts/measurements.py mark <run dir> <item> failed --cause <test|tool|not-run> --note "<reason>"`
+   (measured-source.md says which cause).
    Then run `python3 <plugin-root>/scripts/measurements.py list <run dir> --pending` and offer the
    destination items the same way, never ones already done.
    Source items follow `<plugin-root>/references/measured-source.md`

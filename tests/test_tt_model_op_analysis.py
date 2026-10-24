@@ -2768,3 +2768,26 @@ def test_analysed_by_on_info_and_validated(tmp_path):
     (run / "run.json").write_text(json.dumps(data))
     out = validate(run).stdout
     assert "has no analysed_by" in out and "has no entry_test_issues" in out and "entry_test_passes has no build" in out
+
+
+def test_failed_runs_of_the_entry_test_are_shown_and_a_test_failure_downgrades_the_pass(tmp_path):
+    run = make_static_run(tmp_path, [op_row(1, 1)], [trace_row(1, 1, 1)])
+    data = json.loads((run / "run.json").read_text())
+    data["entry_test_passes"] = {"by": "source:graph on a local p150 device", "date": "2026-10-23",
+                                 "result": "PCC 0.99", "build": "Release"}
+    data["graph_capture"] = {"date": "2026-10-23"}
+    (run / "run.json").write_text(json.dumps(data))
+    assert run_script("measurements.py", "mark", str(run), "source:tracy", "failed", "--cause", "tool",
+                      "--note", "timeout").returncode == 0
+    e2e = info_rows(sheet(run))["End-to-end test"]
+    assert e2e.startswith("✅ passed locally") and "passed in 1 of 2 runs: source:tracy stopped by its tool" in e2e
+    assert run_script("measurements.py", "mark", str(run), "source:cache", "failed", "--cause", "test",
+                      "--note", "hung on a blocking read").returncode == 0
+    e2e = info_rows(sheet(run))["End-to-end test"]
+    assert e2e.startswith("⚠️ passed locally") and "source:cache failed in the test" in e2e
+    assert "passed in 1 of 3 runs" in e2e
+    assert run_script("measurements.py", "mark", str(run), "source:cache", "done", "--cause", "test").returncode == 2
+    data = json.loads((run / "run.json").read_text())
+    del data["measurements"]["source:cache"]["cause"]
+    (run / "run.json").write_text(json.dumps(data))
+    assert "source:cache failed without a cause" in validate(run).stdout
