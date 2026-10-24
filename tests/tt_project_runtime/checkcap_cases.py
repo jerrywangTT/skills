@@ -697,3 +697,19 @@ def test_the_host_wide_grants_log_is_bounded_and_never_costs_a_slot(env, monkeyp
     assert not list(checkcap.slot_dir().glob("*grants*")), "the slot directory holds only slots and the queue"
     monkeypatch.setattr(checkcap, "grants_dir", lambda: d / checkcap.GRANTS_LOG / "not-a-dir")
     checkcap.acquire("unwritable log").close()
+
+
+def test_checks_log_records_each_check_commands_wall_clock_seconds_and_exit(env, tmp_path, monkeypatch):
+    # Each check command's seconds go to checks.log, a failing one's too, so a slow suite shows there.
+    import re
+    from ttp import cli
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    p.set_config("delivery.push_checks", ["sleep 0.3", "exit 4"])
+    try:
+        cli.main(["checks", "--fresh"])
+    except SystemExit:
+        pass
+    log = (run / "checks.log").read_text()
+    took = re.search(r"^ttp checks: sleep 0\.3 took (\d+\.\d) s \(exit 0\)$", log, re.M)
+    assert took and float(took.group(1)) >= 0.3, log
+    assert re.search(r"^ttp checks: exit 4 took \d+\.\d s \(exit 4\)$", log, re.M), log

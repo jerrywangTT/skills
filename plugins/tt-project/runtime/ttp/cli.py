@@ -2569,6 +2569,7 @@ def cmd_checks(a) -> None:
                     out.write(f"ttp checks: {line}\n")
                     out.flush()
                     check_start = out.tell()
+                began = time.monotonic()
                 rc = scriptwatch.rerun(
                     lambda: _run_check(_low_priority(push.check_argv(c, cwd, env)), group, cwd=cwd, stdout=out,
                                        stderr=subprocess.STDOUT, env=env,
@@ -2583,7 +2584,9 @@ def cmd_checks(a) -> None:
                             output = f.read().decode("utf-8", errors="replace")
                         if clean_note := cleantree.hint(cleantree.authoring_only(top, cwd, str(c), output)):
                             out.write(f"ttp checks: {clean_note}\n")
+                    out.write(_check_took(c, rc, began))
                     break
+                out.write(_check_took(c, rc, began))
         finally:
             if clean is not None:
                 clean.close()
@@ -2982,6 +2985,11 @@ def _checks_stop(sig, _frame):
         _CHECK_STOP["pending"] = 128 + sig
         return
     raise SystemExit(128 + sig)
+
+
+def _check_took(c, rc: int, began: float) -> str:
+    """checks.log's line for one check's wall-clock seconds, so a slow suite shows in the log."""
+    return f"ttp checks: {c} took {time.monotonic() - began:.1f} s (exit {rc})\n"
 
 
 def _run_check(argv: list, group: bool, **kw) -> int:
