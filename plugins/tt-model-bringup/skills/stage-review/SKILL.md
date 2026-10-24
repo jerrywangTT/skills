@@ -230,6 +230,11 @@ For generation or serving stages, also inspect:
   When the only remedy for a finding is a plugin change that needs human
   authorization, set its `Required next step` to `human authorization` and name
   the `proposed` record; do not ask the stage owner to implement the change.
+  Treat a served-default change that only an operator can accept (for example a
+  generation-config override that keeps the default recipe on the device
+  sampler) the same way: `Required next step: operator decision`, with the
+  work-log record named. When every remaining finding is of these two kinds,
+  say so in the verdict so the stage can end `blocked` instead of looping.
 - declared `model_capabilities`: every key in `tt/generator_vllm.py` is
   documented by the pinned plugin, and each declared value has evidence.
 

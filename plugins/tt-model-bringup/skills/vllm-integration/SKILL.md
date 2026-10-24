@@ -214,6 +214,10 @@ The runner enforces on-device sampling (`sample_on_device_mode: all` in the TT p
 
 If shared tests require host-side sampling, expose it as an explicit compatibility mode and label metrics from that mode separately. The optimized serving path still uses on-device traced sampling and `sample_on_device_mode=all`.
 
+The served default recipe must stay on the device sampler. vLLM applies the checkpoint's `generation_config.json` sampling defaults to every request that does not override them; compare those defaults (`top_k`, `top_p`, `temperature`) against the declared `max_device_top_k` and the device sampler's real candidate width. The shared `ttnn.sampling` path draws from one 32-candidate tile per user whatever `k` says, so a declared ceiling above 32 can emit token ids outside the candidates. If the default recipe would route to the host sampler, either raise the device ceiling with a probe that proves the wider draw or serve with `--override-generation-config` and record that as an operator decision in the work log. During the sampling and burst stages, scan sampled token ids for out-of-vocabulary values and count host-sampled steps from the server log; a measured path that silently fell back to host sampling is not the optimized path.
+
+Runner notes: `--additional-server-args` is split with `shlex`, so a JSON value inside it needs its own quoting; the packaged runner writes to `readiness_vllm/` directly and the gates read only that root.
+
 ## No Tracy Or Perf-Report In vLLM Stages
 
 Do not collect Tracy, `tt-perf-report`, or `TT_METAL_DEVICE_PROFILER` metrics from vLLM integration or optimized-vLLM serving runs. Do not set profiler env vars for the live server, do not run `python -m tracy` around `run_vllm_server`, do not run a serving-adapter profile just to produce a profiler table, and do not call `ttnn.ReadDeviceProfiler(mesh)` as part of vLLM-stage closure.
