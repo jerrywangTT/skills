@@ -951,7 +951,8 @@ project with `ttp config <name> jev.enabled false`. Without a key, screening is 
   them too when they pass. A failed pytest check first reruns only its failing tests once at the
   same head (at most 10, each once per batch, within `push_rerun_s`, default 600): when they pass
   the failure was flaky, the batch goes on and the coordinator is told once per test so a
-  deterministic fix gets queued; a test that fails twice never passes. When the first change is
+  deterministic fix gets queued; a test that fails twice never passes. A check that did not exit 1,
+  or that pytest stopped early (`-x`, `--maxfail`, an interrupt), is never rerun. When the first change is
   blamed, its failing tests are rerun once on the tip alone: failing there too, the tip is reported
   broken instead of the change. Keys, all under `delivery`: `push_batch_s` (default 900: a
   batch starts once the oldest approval waited this long; 0 = at once), `push_batch_max`

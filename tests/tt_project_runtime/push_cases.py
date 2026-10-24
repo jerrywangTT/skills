@@ -11545,10 +11545,11 @@ _FLAKY_ID = "tests/test_a.py::test_waits_on_a_clock"
 _FLAKY_CHECK = "python3 -m pytest -q tests"
 
 
-def _rerun_stub(monkeypatch, tip, plan):
+def _rerun_stub(monkeypatch, tip, plan, fail_out=None):
     """batch._stream stubbed as the check runner, no real test run: `plan(where, selected)` gives the exit
     code at the tip ("tip") or another head ("head"), `selected` the rerun's TTP_PYTEST_SELECT (None for
-    the full check). A failure prints pytest's lines for _FLAKY_ID. Returns the calls (where, selected)."""
+    the full check). A failure prints pytest's lines for _FLAKY_ID (`fail_out`: these lines instead).
+    Returns the calls (where, selected)."""
     from ttp import batch
     calls = []
 
@@ -11558,7 +11559,7 @@ def _rerun_stub(monkeypatch, tip, plan):
         calls.append((where, selected))
         rc = plan(where, selected)
         out = (f"F...\nFAILED {_FLAKY_ID} - AssertionError: took too long\n1 failed, 3 passed in 0.50s"
-               if rc == 1 else "....\n4 passed in 0.50s")
+               if rc == 1 else "....\n4 passed in 0.50s") if fail_out is None or rc == 0 else fail_out
         return rc, out, False
 
     monkeypatch.setattr(batch, "_stream", fake)
@@ -11590,6 +11591,27 @@ def test_a_push_batch_reruns_a_failing_test_once_at_the_same_head_and_goes_on_wh
     assert _FLAKY_ID in evs[0]["text"] and "b1" in evs[0]["text"] and "deterministic" in evs[0]["text"]
     pushq._flaky_told(p.db, st, {"id": "b3"}, m, now + pushq.FLAKY_TOLD_S + 1)
     assert len(p.db.q("SELECT * FROM events WHERE kind=?", (pushq.FLAKY_EVENT,))) == 2, "told again after a day"
+
+
+@pytest.mark.parametrize("rc,out", [
+    (1, f"F\nFAILED {_FLAKY_ID} - AssertionError: took too long\n!!!!! stopping after 1 failures !!!!!\n1 failed in 0.03s"),
+    (2, f"F\nFAILED {_FLAKY_ID} - AssertionError: took too long\n!!!!! KeyboardInterrupt !!!!!\n"
+        "/x/test_a.py:3: KeyboardInterrupt\n(to show a full traceback on KeyboardInterrupt use --full-trace)\n"
+        "1 failed, 1 passed in 0.50s"),
+    (2, f"F\nFAILED {_FLAKY_ID} - AssertionError: took too long\n1 failed in 0.50s"),
+], ids=["stopped-after-1", "interrupted", "exit-2"])
+def test_a_push_batch_never_reruns_a_check_pytest_stopped_early_or_that_did_not_exit_1(env, monkeypatch, rc, out):
+    """A check pytest stopped early (-x, --maxfail: later tests never ran) or interrupted, or one that did
+    not exit 1, names only the failures before the stop: a passing rerun of those would pass a suite that
+    never ran in full. No rerun, at the head or on the tip: the entry ends check_failed, nothing flaky."""
+    p, repo, origin, other = _push_setup(env, monkeypatch, [_FLAKY_CHECK])
+    tip = _git_out(origin, "rev-parse", "proj")
+    calls = _rerun_stub(monkeypatch, tip, lambda where, sel: 0 if where == "tip" else rc, fail_out=out)
+    rc_, m = _run_batch(p, _batch_marker(p, [_entry(repo, "e1", {"f1.txt": "1\n"})]), monkeypatch)
+    assert _statuses(m) == ["check_failed"] and m["outcome"] != "tip_failed", m
+    assert not m.get("flaky_tests") and m["checks"]["flaky"] is False and not m["checks"].get("reruns"), m
+    assert all(sel is None for _, sel in calls), calls
+    assert _git_out(origin, "rev-parse", "proj") == tip
 
 
 def test_a_push_batch_reports_the_tip_broken_when_the_failing_tests_fail_on_the_tip_alone_too(env, monkeypatch):

@@ -642,6 +642,7 @@ class Batch:
         self.rescues = 0                       # such checks in the batch: at most RESCUES
         self.reran: dict[str, set[str]] = {"head": set(), "tip": set()}   # failing test ids rerun: once each per batch
         self.flaky: list[dict] = []            # failures whose tests passed on that rerun: {ids, head, cmd}
+        self.fail_rc: dict[str, int] = {}      # a failed check's output tail -> its exit code (_tip_ids)
 
     # results
 
@@ -1154,7 +1155,8 @@ class Batch:
                     raise envfault.Fault(fault)   # the check host, not this head: push_phase holds the batch
                 if rc != 0:
                     say(f"check failed on {head[:10]}: {cmd}{push.where(cmd)}")
-                    if self._flaky(head, cmd, tail, env, slot.env()):
+                    self.fail_rc[tail] = rc
+                    if self._flaky(head, cmd, rc, tail, env, slot.env()):
                         if resume:
                             resume.unlink(missing_ok=True)
                         continue
@@ -1173,12 +1175,16 @@ class Batch:
             say(f"suite cost not recorded: {e}")
         return None
 
-    def _rerun_ids(self, cmd, tail: str, where: str) -> list[str]:
+    def _rerun_ids(self, cmd, rc: int | None, tail: str, where: str) -> list[str]:
         """The failing pytest ids of a failed check to rerun once at `where` ("head" or "tip"): none when
-        the check is not one plain local pytest run (pushpass.resumable), its list of failing ids is
-        incomplete (sharedchecks.failing_ids), it names more than RERUN_IDS, or one of them was rerun
-        there in this batch already."""
+        the check is not one plain local pytest run (pushpass.resumable), it did not exit 1 (tests
+        failed; `rc` None: not known) or pytest stopped early (-x, --maxfail, an interrupt:
+        sharedchecks.stopped_early, so later tests never ran), its list of failing ids is incomplete
+        (sharedchecks.failing_ids), it names more than RERUN_IDS, or one of them was rerun there in this
+        batch already."""
         if cmd == STALE or push.remote_host(cmd) or not pushpass.resumable(str(cmd)):
+            return []
+        if rc not in (1, None) or sharedchecks.stopped_early(tail):
             return []
         ids, complete = sharedchecks.failing_ids(tail)
         if not complete or not ids or len(ids) > RERUN_IDS or self.reran[where] & set(ids):
@@ -1199,13 +1205,13 @@ class Batch:
                                  pass_fds=checkdirs.inherited())
         return (None if late else rc), tail
 
-    def _flaky(self, head: str, cmd, tail: str, env: dict, slot_env: dict) -> bool:
+    def _flaky(self, head: str, cmd, rc: int, tail: str, env: dict, slot_env: dict) -> bool:
         """A failed check's failing tests (_rerun_ids) run once more at the same `head`. True when they all
         pass: the failure was flaky. It is recorded (the marker's flaky_tests: ids, head, command; the
         queue tells the coordinator once per test) and the check counts as passed in this batch only: no
         pass is recorded for the tree. A test that fails again, or a rerun that runs out of time, keeps
         the failure."""
-        ids = self._rerun_ids(cmd, tail, "head")
+        ids = self._rerun_ids(cmd, rc, tail, "head")
         if not ids:
             return False
         say(f"rerunning the {len(ids)} failing test(s) once on {head[:10]}: {' '.join(ids)}")
@@ -1224,7 +1230,7 @@ class Batch:
         pass (the entry's own failure), None when that cannot tell (no such ids, a rerun out of time or
         one pytest ends with neither: the tip is checked alone in full)."""
         cmd = fail[0]
-        ids = self._rerun_ids(cmd, fail[1], "tip")
+        ids = self._rerun_ids(cmd, self.fail_rc.get(fail[1]), fail[1], "tip")
         if not ids:
             return None
         say(f"rerunning the {len(ids)} failing test(s) once on the tip {tip[:10]} alone: {' '.join(ids)}")

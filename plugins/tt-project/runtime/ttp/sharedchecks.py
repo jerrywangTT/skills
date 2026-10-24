@@ -91,6 +91,16 @@ def failing_ids(output: str) -> tuple[list[str], bool]:
     return ids, n == len(lines)
 
 
+# pytest stopped before the end (-x/--maxfail, an interrupt or collection errors): the tests after the
+# stop never ran, so the failing ids are not all the failures there are.
+_STOPPED = re.compile(r"^!+ (?:stopping after \d+ failures?|.*KeyboardInterrupt.*) !+$|^Interrupted: |^KeyboardInterrupt$", re.M)
+
+
+def stopped_early(output: str) -> bool:
+    """True when pytest's output shows it stopped before running every test."""
+    return bool(_STOPPED.search(output or ""))
+
+
 _HEADER = re.compile(r"^_{3,} (?:ERROR at (?:setup|teardown) of )?(\S.*?) _{3,}$", re.M)
 _BLOCK_END = re.compile(r"^(?:_{3,} \S.*? _{3,}|={3,}.*)$", re.M)
 _SUMMARY_MSG = re.compile(r"^(?:FAILED|ERROR) (\S+::[^\s\[]*(?:\[.*?\])?) - (.*)$", re.M)
