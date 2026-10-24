@@ -61,7 +61,7 @@ class Cursor(Provider):
                                              got[1], re.I)
 
     def build(self, *, role, model, effort, cwd, budget_usd, read_only, schema, restrictions,
-              disallowed_tools=(), denied_reads=()):
+              disallowed_tools=(), denied_reads=(), web=True):
         exe = self.binary() or "agent"
         help_text = cli_output(exe, "--help")
         fmt = "stream-json" if "stream-json" in help_text else "json"

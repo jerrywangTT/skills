@@ -5004,9 +5004,10 @@ def test_claude_workers_get_the_update_hook_but_decisions_do_not(env):
     assert "--settings" not in turn
 
 
-def test_claude_workers_get_a_lean_context_but_keep_plugin_skills(env):
-    from ttp.providers import get_provider
+def test_claude_workers_get_a_lean_context_but_keep_plugin_skills(env, monkeypatch):
+    from ttp.providers import claude, get_provider
     build = get_provider("claude").build
+    monkeypatch.setattr(claude, "_FLAGS", {claude.TOOLS: False})   # a CLI without --tools: the denylist
     worker, _ = build(role="worker", model="opus", effort="low", cwd=".", budget_usd=None, read_only=False,
                       schema=None, restrictions={"no_internet": True})
     settings = json.loads(worker[worker.index("--settings") + 1])
@@ -5026,9 +5027,11 @@ def test_claude_workers_get_a_lean_context_but_keep_plugin_skills(env):
     online, _ = build(role="worker", model="opus", effort="low", cwd=".", budget_usd=None, read_only=False,
                       schema=None, restrictions={})
     assert "WebFetch" not in online and "Workflow" in online
-    # Plugin-dir skills are namespaced by their plugin and never overridden.
+    # Plugin skills (tt-project's own, a project's plugin dirs) are never overridden; of the namespaced
+    # ones only the Anthropic skills a claude.ai account brings are.
     argv = online + get_provider("claude").plugin_args(["/p/plugin"])
-    assert all(":" not in name for name in skills) and "--plugin-dir" in argv
+    assert all(":" not in name or name.startswith("anthropic-skills:") for name in skills) and "--plugin-dir" in argv
+    assert not any(name.startswith(("tt-", "setup-box")) for name in skills)
     turn, _ = build(role="coordinator", model="opus", effort="low", cwd=".", budget_usd=1.0, read_only=True,
                     schema=None, restrictions={})
     assert "Workflow" not in turn and "skillOverrides" not in " ".join(turn)
@@ -5692,7 +5695,7 @@ def test_worker_prompt_drops_placeholders_and_keeps_restrictions_verbatim(env):
     assert "\nNever push to main (the user merges).\n  - (and never force-push)\n" in system
 
 
-def _dispatch_claude_worker(p, monkeypatch, flags, kind="work"):
+def _dispatch_claude_worker(p, monkeypatch, flags, kind="work", spec="TASK-SPEC-MARKER"):
     from ttp import daemon as dmod
     from ttp.providers import claude
 
@@ -5700,12 +5703,12 @@ def _dispatch_claude_worker(p, monkeypatch, flags, kind="work"):
         pid = 4242
     real = subprocess.Popen
     monkeypatch.setattr(claude, "_FLAGS", {claude.EXCLUDE_DYNAMIC: True, claude.APPEND_SYSTEM_FILE: True,
-                                           claude.APPEND_SYSTEM: True, **flags})
+                                           claude.APPEND_SYSTEM: True, claude.TOOLS: True, **flags})
     # Only the runner is not launched; git still runs.
     monkeypatch.setattr(dmod.subprocess, "Popen",
                         lambda argv, *a, **k: Proc() if "ttp.runner" in argv else real(argv, *a, **k))
     p.set_config("core_provider", "claude")
-    tid = p.db.add_task("tidy docs", "TASK-SPEC-MARKER", kind=kind, tier="light", origin="user")
+    tid = p.db.add_task("tidy docs", spec, kind=kind, tier="light", origin="user")
     dmod.Daemon(p.base).dispatch()
     run = p.db.one("SELECT dir FROM runs WHERE task=?", (tid,))
     assert run, p.db.task(tid)["blocked_reason"]
@@ -5916,8 +5919,9 @@ def test_a_claude_worker_is_denied_reading_the_web_token(env, monkeypatch):
         assert out is None or "web token" not in str(out), cmd
 
 
-def test_disallowed_tools_extend_the_workers_denylist_and_never_the_coordinators(env):
+def test_disallowed_tools_extend_the_workers_denylist_and_never_the_coordinators(env, monkeypatch):
     from ttp.providers import claude, get_provider
+    monkeypatch.setattr(claude, "_FLAGS", {claude.TOOLS: False})   # a CLI without --tools
     kw = dict(role="worker", model="opus", effort="low", cwd=".", budget_usd=None, schema=None,
               restrictions={"no_internet": True})
 
@@ -5935,6 +5939,10 @@ def test_disallowed_tools_extend_the_workers_denylist_and_never_the_coordinators
     assert "mcp__mail__*" not in turn
     for name in ("codex", "cursor", "fake"):
         get_provider(name).build(read_only=False, disallowed_tools=["mcp__mail__*"], **kw)
+    # With the --tools allowlist, only the project's own list is denied (MCP tools are not built-in).
+    monkeypatch.setattr(claude, "_FLAGS", {claude.TOOLS: True})
+    worker, _ = get_provider("claude").build(read_only=False, disallowed_tools=["mcp__mail__*"], **kw)
+    assert denied(worker) == ["mcp__mail__*"]
 
 
 def test_doctor_scheduler_checks_the_watcher_lifecycle_in_fresh_processes(env, capsys, monkeypatch):

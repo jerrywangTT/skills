@@ -1172,6 +1172,13 @@ project with `ttp config <name> jev.enabled false`. Without a key, screening is 
   Listing a server approves it for workers. A name your config does not define is skipped: the
   run still starts, and `ttp doctor` and a low alert name it. Servers that come from a Claude plugin
   are not in those files, so they cannot be listed; add the server with `claude mcp add` to list it.
+- Claude workers and reviewers get only the built-in tools workers use (`--tools`): Bash, Read,
+  Edit, Write, Skill (the plugin skills) and ToolSearch (it loads MCP tools on demand). WebFetch and
+  WebSearch come with every task kind but a review; a review gets them only when its title or spec
+  links a page outside GitHub, and the `no_internet` restriction takes them from every task. MCP
+  servers (your own, or the project's `mcp_servers`) stay usable. Claude Code's bundled skills are
+  listed by name only and stay callable; plugin skills stay fully listed. A Claude Code without
+  `--tools` gets a denylist instead. Coordinator turns, Codex and Cursor are not changed by this.
 - `providers.claude.disallowed_tools: ["mcp__<server>__<tool>", "mcp__<server>__*", ...]` lists tools
   Claude workers and reviewers may not call, on top of the tools the harness always denies them; a
   trailing `*` covers every tool whose name starts so, e.g. every tool of one server. Use it to keep

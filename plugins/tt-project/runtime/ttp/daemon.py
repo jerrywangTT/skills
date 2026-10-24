@@ -203,6 +203,20 @@ REVIEW_CHECK_LINE = ("Check that it does what its spec asks, is correct, keeps t
 INHERITED_COMMITS_MAX = 10   # commits per task an auto review's spec lists, as the queue's refusal does
 
 
+# A link a review's spec gives outside GitHub (which `gh` reads): the review may need to open it.
+_WEB_LINK = re.compile(r"https?://(?!(?:api\.)?github\.com\b)[\w.-]+", re.I)
+
+
+def web_needed(role: str, task: dict | None) -> bool:
+    """Whether a worker run gets the web tools (where the agent can take them away). Every kind of
+    task but a review does: workers looked up third-party docs and APIs in code and question tasks.
+    A review checks a diff and its tests (no review used the web in 14 days, ~1,300 runs), so it
+    gets them only when its spec links a page outside GitHub. The no_internet restriction wins."""
+    if role != "reviewer" and (task or {}).get("kind") != "review":
+        return True
+    return bool(_WEB_LINK.search(f"{(task or {}).get('title') or ''}\n{(task or {}).get('spec') or ''}"))
+
+
 def task_env(tid) -> dict[str, str]:
     """The task id every run, check and model-free command sees: TTP_TASK, and TTP_TASK_ID as
     specs and scripts also spell it (empty for the coordinator, never an inherited value)."""
@@ -1929,7 +1943,8 @@ class Daemon:
         from .web import token_path
         argv, env = prov.build(role=role, model=model, effort=effort, cwd=cwd, budget_usd=budget_usd,
                                read_only=read_only, schema=schema, restrictions=restrictions,
-                               disallowed_tools=denied, denied_reads=[str(token_path(self.p).resolve())])
+                               disallowed_tools=denied, denied_reads=[str(token_path(self.p).resolve())],
+                               web=role == "coordinator" or web_needed(role, task))
         cache_fp = None
         if role != "coordinator" and not cache_ttl:
             cache_ttl = cachettl.worker_setting(self.cfg.get("budget") or {})

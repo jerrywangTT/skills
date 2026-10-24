@@ -489,3 +489,77 @@ def test_a_slot_wake_runs_the_hand_offs_on_pass_cmd_model_free(env, monkeypatch,
     finally:
         drain(d)
         assert reap_tmp_processes(tmp_path) == [], "a stand-in run outlived the test"
+
+
+def _claude_tools(argv):
+    return argv[argv.index("--tools") + 1].split(",") if "--tools" in argv else None
+
+
+def _dispatch_one(p, monkeypatch, flags, **kw):
+    """_dispatch_claude_worker, the earlier stand-in runs ended first so the next task starts."""
+    p.db.x("UPDATE runs SET status='done' WHERE status='running'")
+    p.db.x("UPDATE tasks SET status='done' WHERE status='running'")
+    return _dispatch_claude_worker(p, monkeypatch, flags, **kw)
+
+
+def test_claude_workers_get_a_tool_allowlist_with_web_tools_only_where_the_task_needs_them(env, monkeypatch, tmp_path):
+    """Workers and reviewers on Claude run with --tools (the built-in tools workers use, Skill for the
+    plugin skills, ToolSearch so MCP tools stay deferred) instead of the long denylist. The web tools
+    come with every kind but a review; a review gets them only when its spec links a page off GitHub."""
+    from ttp.providers import claude
+    lean = ["Bash", "Read", "Edit", "Write", "Skill", "ToolSearch"]
+    p = make(env)
+    # Default worker (a code task): the allowlist with the web tools, and no built-in denylist.
+    argv, _, _ = _dispatch_one(p, monkeypatch, {}, kind="code")
+    assert _claude_tools(argv) == [*lean, "WebFetch", "WebSearch"]
+    assert argv.count("--tools") == 1 and "--disallowedTools" not in argv, "nothing left to deny"
+    assert argv[argv.index("--tools") + 2].startswith("--"), "--tools takes several values: a flag must follow"
+    # Review: no web tools.
+    argv, run_dir, _ = _dispatch_one(p, monkeypatch, {}, kind="review")
+    assert p.db.one("SELECT role FROM runs WHERE dir=?", (str(run_dir),))["role"] == "reviewer"
+    assert _claude_tools(argv) == lean
+    argv, _, _ = _dispatch_one(p, monkeypatch, {}, kind="review",
+                                         spec="Check https://github.com/o/r/pull/1 and https://api.github.com/x")
+    assert _claude_tools(argv) == lean, "GitHub links are read with gh"
+    # A web-needing review: its spec links a page elsewhere.
+    argv, _, _ = _dispatch_one(p, monkeypatch, {}, kind="review",
+                                         spec="Check the flag against https://docs.example.com/cli")
+    assert _claude_tools(argv) == [*lean, "WebFetch", "WebSearch"]
+    # The no_internet restriction wins over the task's kind.
+    p.set_config("restrictions.no_internet", True)
+    argv, _, _ = _dispatch_one(p, monkeypatch, {}, kind="question")
+    assert _claude_tools(argv) == lean and "WebFetch" not in argv
+    p.set_config("restrictions.no_internet", False)
+    # A project with MCP servers for its workers: they come through --mcp-config; --tools only limits
+    # built-in tools, and ToolSearch keeps their schemas deferred. The project's own denylist stays.
+    _claude_mcp_config(tmp_path, monkeypatch, p)
+    p.set_config("providers.claude.worker_isolation", True)
+    p.set_config("providers.claude.mcp_servers", ["docs"])
+    p.set_config("providers.claude.disallowed_tools", ["mcp__docs__write_page"])
+    argv, _, _ = _dispatch_one(p, monkeypatch, {}, kind="work")
+    assert _claude_tools(argv) == [*lean, "WebFetch", "WebSearch"]
+    assert "--strict-mcp-config" in argv and "--mcp-config" in argv
+    assert argv[argv.index("--disallowedTools") + 1:argv.index("--settings")] == ["mcp__docs__write_page"]
+    pathlib.Path(argv[argv.index("--mcp-config") + 1]).unlink()
+    # A CLI without --tools keeps the old denylist, the web tools on it where the task does not need them.
+    argv, _, _ = _dispatch_one(p, monkeypatch, {claude.TOOLS: False}, kind="review")
+    assert "--tools" not in argv
+    denied = argv[argv.index("--disallowedTools") + 1:argv.index("--settings")]
+    assert denied == [*claude.WORKER_DENIED_TOOLS, "WebFetch", "WebSearch", "mcp__docs__write_page"]
+    pathlib.Path(argv[argv.index("--mcp-config") + 1]).unlink()
+
+
+def test_the_tool_allowlist_leaves_coordinator_turns_codex_and_cursor_alone(env, monkeypatch):
+    from ttp import daemon as dmod
+    from ttp.providers import claude, get_provider
+    monkeypatch.setattr(claude, "_FLAGS", {claude.TOOLS: True})
+    kw = dict(model="opus", effort="low", cwd=".", budget_usd=1.0, schema=None, restrictions={})
+    turn, _ = get_provider("claude").build(role="coordinator", read_only=True, web=False, **kw)
+    assert "--tools" not in turn and turn[turn.index("--disallowedTools") + 1:] == ["Edit", "Write", "NotebookEdit"]
+    for name in ("codex", "cursor"):
+        for role, read_only in (("worker", False), ("reviewer", False), ("coordinator", True)):
+            with_web = get_provider(name).build(role=role, read_only=read_only, web=True, **kw)
+            assert get_provider(name).build(role=role, read_only=read_only, web=False, **kw) == with_web, name
+    assert dmod.web_needed("worker", None) and dmod.web_needed("worker", {"kind": "code", "spec": ""})
+    assert not dmod.web_needed("reviewer", {"kind": "review", "title": "review #1", "spec": "diff"})
+    assert dmod.web_needed("reviewer", {"kind": "review", "title": "see http://example.org/a", "spec": ""})

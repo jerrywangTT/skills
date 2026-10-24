@@ -49,10 +49,28 @@ CACHE_TTLS = ("5m", "1h")
 _FLAGS: dict[str, bool] = {}   # CLI flag support, probed once per daemon from `claude --help`
 USAGE_KEYS = ("input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
 # Claude Code's bundled skills, which workers have never used: listed by name only (still callable),
-# which saves ~2.1k tokens a call. "off" and disableBundledSkills both add tokens instead.
+# which saves ~2.1k tokens a call. "off" and disableBundledSkills both add tokens instead. Then the
+# skills of its built-in plugins, and the Anthropic skills a claude.ai account brings: by name only
+# they cut a worker's first call by another ~2.1k tokens (CLI 2.1.296). No worker called Skill in
+# the 14 days to 2026-10-24. Plugin skills (tt-project's own, a project's plugin_dirs) stay listed.
+# --disable-slash-commands is no way out: it drops the Skill tool, and every plugin skill with it.
 BUNDLED_SKILLS = ("dataviz", "update-config", "keybindings-help", "code-review", "simplify",
                   "fewer-permission-prompts", "loop", "schedule", "claude-api", "workflow-authoring", "run",
-                  "init", "security-review")
+                  "init", "security-review", "deep-research", "design", "design-sync", "verify", "debug",
+                  "batch", "doctor", "run-skill-generator", "plugin-authoring",
+                  *(f"anthropic-skills:{name}" for name in ("docs", "docx", "google-workspace", "import-memory",
+                                                            "morning", "pdf", "pptx", "skill-creator", "xlsx")))
+# What a worker or reviewer may use, passed as --tools: the built-in tools workers called in the
+# 14 days to 2026-10-24 (~4,500 runs: Bash, Read, Edit, Write, the web tools in 8 runs; never Monitor,
+# TaskStop, NotebookEdit, subagents or scheduling), Skill for the plugin skills, and ToolSearch, which
+# loads MCP tools on demand: without it every MCP tool's full schema is sent on every call (measured:
+# 13.7k -> 28.3k tokens with three user servers). With nothing to defer it added no tokens
+# (measured), so it costs a worker without MCP servers nothing. MCP tools are not built-in, so --tools never
+# drops them; StructuredOutput comes with --json-schema. The allowlist replaces the old denylist
+# (WORKER_DENIED_TOOLS, kept for a CLI without --tools) and cuts ~0.6k tokens a call.
+TOOLS = "--tools"
+WORKER_TOOLS = ("Bash", "Read", "Edit", "Write", "Skill", "ToolSearch")
+WEB_TOOLS = ("WebFetch", "WebSearch")
 # Scheduling, remote and orchestration tools a headless worker must not use; their definitions
 # alone are ~3.7k tokens a call. Then tools no worker used in ~1,000 runs, or that would step outside
 # the harness (its own worktrees, other sessions). Measured on the first call of a 'reply OK' worker
@@ -96,7 +114,7 @@ class Claude(Provider):
             return rc == 0
 
     def build(self, *, role, model, effort, cwd, budget_usd, read_only, schema, restrictions,
-              disallowed_tools=(), denied_reads=()):
+              disallowed_tools=(), denied_reads=(), web=True):
         argv = [self.binary() or "claude", "-p", "--output-format", "stream-json", "--verbose", "--no-chrome"]
         if model:
             argv += ["--model", model]
@@ -113,11 +131,15 @@ class Claude(Provider):
         if schema:
             argv += ["--json-schema", json.dumps(strict_schema(schema))]
         if not read_only:
-            denied = list(WORKER_DENIED_TOOLS)
-            if restrictions.get("no_internet"):
-                denied += ["WebFetch", "WebSearch"]
+            web = web and not restrictions.get("no_internet")
+            if self.supports(TOOLS):
+                argv += [TOOLS, ",".join([*WORKER_TOOLS, *(WEB_TOOLS if web else ())])]
+                denied = []
+            else:
+                denied = list(WORKER_DENIED_TOOLS) + ([] if web else list(WEB_TOOLS))
             denied += [t for t in disallowed_tools if t not in denied]   # the project's own denylist
-            argv += ["--disallowedTools", *denied]
+            if denied:
+                argv += ["--disallowedTools", *denied]
             argv += ["--settings", json.dumps(worker_settings(denied_reads))]
             # Workers start in many different worktrees; with the per-directory sections out of the
             # system prompt, it stays cached across them (measured: ~30% fewer cache-write tokens).

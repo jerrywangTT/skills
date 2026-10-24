@@ -3336,7 +3336,7 @@ def test_disallowed_tools_are_validated_and_reach_dispatched_workers(env, monkey
     argv, _, _ = _dispatch_claude_worker(p, monkeypatch, {})
     assert argv.count("--disallowedTools") == 1
     tail = argv[argv.index("--disallowedTools"):]
-    assert {"mcp__mail__*", "mcp__docs__write_page", "Workflow"} <= set(tail[:tail.index("--settings")])
+    assert ["mcp__mail__*", "mcp__docs__write_page"] == tail[1:tail.index("--settings")]
     # A malformed entry written into project.json by hand is skipped, and named.
     from ttp.project import config_problems
     p.set_config("providers.claude.disallowed_tools", ["mcp__mail__*", "bad name"])
