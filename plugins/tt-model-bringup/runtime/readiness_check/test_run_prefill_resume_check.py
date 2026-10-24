@@ -159,7 +159,7 @@ def test_control_that_cannot_fail_is_reported_as_a_check_defect():
     assert not case["controls"]["no_history"]["failed_as_expected"]
     status, reasons = summarize([case])
     assert status == "fail"
-    assert "did not fail" in reasons[0]
+    assert "passed the gates" in reasons[0]
 
 
 class _WordTokenizer:
@@ -167,17 +167,39 @@ class _WordTokenizer:
         return [hash(w) % 1000 for w in text.split()]
 
 
-def test_natural_tokens_are_deterministic_and_exact_length():
+def test_natural_tokens_are_deterministic_and_exact_length(capsys):
     from readiness_check.run_prefill_resume_check import natural_tokens
 
-    pieces = ["alpha beta gamma", "delta epsilon"]
-    first = natural_tokens(_WordTokenizer(), pieces, 7)
-    second = natural_tokens(_WordTokenizer(), pieces, 7)
-    assert first == second
-    assert len(first) == 7
-    assert first[:3] == [hash(w) % 1000 for w in ["alpha", "beta", "gamma"]]
-    with pytest.raises(RuntimeError, match="no prompt pieces"):
-        natural_tokens(_WordTokenizer(), [], 3)
+    text = "alpha beta gamma delta epsilon zeta eta theta"
+    first = natural_tokens(_WordTokenizer(), text, 5)
+    assert first == natural_tokens(_WordTokenizer(), text, 5)
+    assert first == [hash(w) % 1000 for w in ["alpha", "beta", "gamma", "delta", "epsilon"]]
+    repeated = natural_tokens(_WordTokenizer(), "one two", 5)
+    assert len(repeated) == 5
+    assert "repeated" in capsys.readouterr().out
+    with pytest.raises(RuntimeError, match="no text"):
+        natural_tokens(_WordTokenizer(), "  ", 3)
+
+
+def test_load_natural_text_prefers_explicit_file_then_book_then_prompts(tmp_path, monkeypatch):
+    import bz2
+
+    from readiness_check.run_prefill_resume_check import BOOK_RELPATH, load_natural_text
+
+    prompts = tmp_path / "prompts.txt"
+    prompts.write_text("prompt text")
+    monkeypatch.chdir(tmp_path)
+    assert load_natural_text(None, prompts) == "prompt text"
+    book = tmp_path / BOOK_RELPATH
+    book.parent.mkdir(parents=True)
+    with bz2.open(book, "wt", encoding="utf-8") as handle:
+        handle.write("book text")
+    assert load_natural_text(None, prompts) == "book text"
+    explicit = tmp_path / "corpus.txt"
+    explicit.write_text("explicit text")
+    assert load_natural_text(explicit, prompts) == "explicit text"
+    with pytest.raises(RuntimeError, match="no natural text"):
+        load_natural_text(tmp_path / "missing.txt", tmp_path / "also-missing.txt")
 
 
 def test_controls_are_skipped_for_narrow_windows():

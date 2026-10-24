@@ -8,10 +8,15 @@ Validates that a generator can resume prefill at a nonzero absolute start
 position over an existing KV cache, which is what a vLLM prefix-cache hit,
 a chunked-prefill continuation, and a preemption resume all require.
 
-Prompts are deterministic natural text by default. Random token ids give
-near-flat next-token distributions on which argmax flips under BF16 drift, so
-top-1 agreement stops measuring the resume path; use ``--prompt-source random``
-only as a stress variant.
+Prompts are deterministic natural text by default: the readiness book in the
+target checkout, or ``--text-file``. Random token ids give near-flat next-token
+distributions on which argmax flips under BF16 drift, so top-1 agreement stops
+measuring the resume path; use ``--prompt-source random`` only as a stress
+variant. Short repeated text makes the suffix predictable without its prefix, so
+the controls stop failing; the text must be long and non-repeating.
+
+A control counts as failed when it misses any of the gates the candidate must
+pass; a control that passes them means the check cannot see a broken resume.
 
 For each prompt length and each resume point ``s`` the check compares:
 
@@ -58,9 +63,9 @@ DEFAULT_THRESHOLDS: Dict[str, float] = {
     "pcc_mean_min": 0.99,
     "pcc_min_min": 0.98,
     "top1_min": 0.98,
-    "control_top1_max": 0.6,
     "control_min_window": 64,
 }
+BOOK_RELPATH = Path("models/tt_transformers/tests/tale-of-two-cities.txt.bz2")
 CONTROL_NAMES: tuple[str, ...] = ("no_history", "fresh_suffix")
 STATUS_PASS = "pass"
 STATUS_FAIL = "fail"
@@ -151,8 +156,8 @@ def evaluate_case(stats: Dict[str, Any], thresholds: Dict[str, float]) -> List[s
 
 
 def evaluate_control(stats: Dict[str, Any], thresholds: Dict[str, float]) -> bool:
-    """True when the control failed the agreement gate, which is the expected outcome."""
-    return stats["top1_agreement"] < thresholds["control_top1_max"]
+    """True when the control fails the same gates the candidate must pass, which is the expected outcome."""
+    return bool(evaluate_case(stats, thresholds))
 
 
 def _select_positions(logits: torch.Tensor, start: int, positions: List[int], length: int) -> torch.Tensor:
@@ -233,7 +238,8 @@ def summarize(cases: List[Dict[str, Any]]) -> tuple[str, List[str]]:
         for name, control in case["controls"].items():
             if not control["failed_as_expected"]:
                 reasons.append(
-                    f"{label}: control {name} did not fail (top1_agreement {control['top1_agreement']:.3f}); "
+                    f"{label}: control {name} passed the gates (pcc_mean {control['pcc_mean']:.4f}, "
+                    f"top1_agreement {control['top1_agreement']:.3f}); "
                     "the check cannot distinguish a correct resume from a broken one"
                 )
     return (STATUS_PASS if not reasons else STATUS_FAIL), reasons
@@ -244,22 +250,35 @@ def _random_tokens(length: int, vocab_size: int, seed: int) -> List[int]:
     return torch.randint(1, max(2, vocab_size - 1), (length,), generator=rng).tolist()
 
 
-def natural_tokens(tokenizer: Any, pieces: Sequence[str], length: int) -> List[int]:
-    """Deterministic natural text of exactly `length` tokens, built from the prompt pieces."""
-    if not pieces:
-        raise RuntimeError("no prompt pieces available for natural text")
-    text = ""
-    index = 0
-    ids: List[int] = []
+def natural_tokens(tokenizer: Any, text: str, length: int) -> List[int]:
+    """The first `length` tokens of `text`; the text is repeated only when it is too short."""
+    if not text.strip():
+        raise RuntimeError("no text available for natural prompts")
+    ids = list(tokenizer.encode(text))
+    if not ids:
+        raise RuntimeError("the tokenizer produced no tokens for the natural text")
+    repeats = 1
     while len(ids) < length:
-        text = (text + "\n\n" if text else "") + pieces[index % len(pieces)]
-        index += 1
-        ids = list(tokenizer.encode(text))
+        repeats += 1
+        ids = list(tokenizer.encode("\n\n".join([text] * repeats)))
+    if repeats > 1:
+        print(f"warning: natural text repeated {repeats} times to reach {length} tokens; controls may stop failing")
     return ids[:length]
 
 
-def _prompt_pieces(prompts_file: Path) -> List[str]:
-    return [p.strip() for p in prompts_file.read_text().split("\n\n") if p.strip()]
+def load_natural_text(text_file: Optional[Path], prompts_file: Path) -> str:
+    """Long non-repeating text: an explicit file, else the readiness book in the target checkout, else the prompt file."""
+    candidates = [text_file] if text_file else [Path.cwd() / BOOK_RELPATH, prompts_file]
+    for path in candidates:
+        if path is None or not path.is_file():
+            continue
+        if path.suffix == ".bz2":
+            import bz2
+
+            with bz2.open(path, "rt", encoding="utf-8") as handle:
+                return handle.read()
+        return path.read_text(encoding="utf-8")
+    raise RuntimeError(f"no natural text found; pass --text-file (looked for {[str(c) for c in candidates if c]})")
 
 
 def _prompt_tokens(
@@ -267,13 +286,13 @@ def _prompt_tokens(
     *,
     length: int,
     source: str,
-    prompts_file: Path,
+    text: str,
     vocab_size: Optional[int],
     seed: int,
 ) -> List[int]:
     tokenizer = getattr(generator, "tokenizer", None)
     if source == "natural" and tokenizer is not None and hasattr(tokenizer, "encode"):
-        return natural_tokens(tokenizer, _prompt_pieces(prompts_file), length)
+        return natural_tokens(tokenizer, text, length)
     if source == "natural":
         raise RuntimeError("--prompt-source natural needs a generator tokenizer with encode(); pass --prompt-source random")
     return _random_tokens(length, _vocab_size(generator, vocab_size), seed)
@@ -306,14 +325,17 @@ def run_prefill_resume_check(
     seed: int,
     prompt_source: str = "natural",
     prompts_file: Optional[Path] = None,
+    text_file: Optional[Path] = None,
     build_kwargs: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     build_generator = _import_build_generator(model_dir)
     generator: Generator = build_generator(model_dir=model_dir, mesh_device=mesh_device, **(build_kwargs or {}))
     prompts_file = prompts_file or (Path(__file__).parent / "vllm_prompts.txt")
+    text = load_natural_text(text_file, prompts_file) if prompt_source == "natural" else ""
     record: Dict[str, Any] = {
         "model_dir": str(model_dir),
         "prompt_source": prompt_source,
+        "text_file": str(text_file) if text_file else (str(BOOK_RELPATH) if (Path.cwd() / BOOK_RELPATH).is_file() else str(prompts_file)),
         "lengths": list(lengths),
         "block_sizes": list(block_sizes),
         "sliding_window": sliding_window,
@@ -329,7 +351,7 @@ def run_prefill_resume_check(
                 generator,
                 length=length,
                 source=prompt_source,
-                prompts_file=prompts_file,
+                text=text,
                 vocab_size=vocab_size,
                 seed=seed,
             )
@@ -391,6 +413,15 @@ def _main(argv: Optional[Sequence[str]] = None) -> int:
         help="natural: deterministic text from --prompts-file through the generator tokenizer; random: uniform token ids.",
     )
     parser.add_argument("--prompts-file", type=Path, default=Path(__file__).parent / "vllm_prompts.txt")
+    parser.add_argument(
+        "--text-file",
+        type=Path,
+        default=None,
+        help=(
+            "Long non-repeating text for natural prompts (.txt or .bz2). Default: "
+            f"{BOOK_RELPATH} under the current directory, else --prompts-file."
+        ),
+    )
     for key, value in DEFAULT_THRESHOLDS.items():
         parser.add_argument(f"--{key.replace('_', '-')}", type=float, default=value)
     add_mesh_device_args(parser)
@@ -420,6 +451,7 @@ def _main(argv: Optional[Sequence[str]] = None) -> int:
             seed=args.seed,
             prompt_source=args.prompt_source,
             prompts_file=args.prompts_file.resolve(),
+            text_file=args.text_file.resolve() if args.text_file else None,
         )
     finally:
         close_readiness_mesh_device(mesh_device, args.fabric_config)
