@@ -920,8 +920,9 @@ _WORKER_WORD = re.compile(r"\bworkers?\b", re.I)
 
 def worker_memory(e: dict) -> int:
     """Where memory entry `e` stands in a worker's prompt: 1, pinned (tagged for workers,
-    restrictions, resources, standing entries; worker_always says which of them no limit drops); 2, shown first while they fit (entries that speak of
-    workers); 3, then the newest facts that fit; 0, never (the rest, written for the coordinator:
+    restrictions, resources, standing entries; worker_always says which of them no limit drops); 2,
+    shown first while they fit (entries that speak of workers); 3, then the newest facts that fit; 0,
+    never (the rest, written for the coordinator:
     decisions and preferences that are not standing, and anything tagged for the coordinator but a
     restriction)."""
     if e.get("audience") in MEMORY_AUDIENCES:
