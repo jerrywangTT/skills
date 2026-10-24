@@ -304,6 +304,17 @@ def op_support_text(verdict: str, evidence: str) -> str:
     return f"{text}: {tidy(evidence)}" if evidence else text
 
 
+YELLOW, ORANGE, RED = ({"red": 1.0, "green": 0.95, "blue": 0.7}, {"red": 1.0, "green": 0.8, "blue": 0.55},
+                       {"red": 0.96, "green": 0.75, "blue": 0.75})
+# Background of a non-zero row count by the device op's verdict and the count's status. When the destination runs the
+# op, an untested call may need no change (yellow) and a failing one needs moving to a supported variant (orange). An
+# untested call of an untested op may still need nothing once the op's tests pass (orange); a failing call of it, or
+# any call of an op the destination lacks, needs work on the op first (red).
+GAP_COLORS = {("✅", "rows_untested"): YELLOW, ("✅", "rows_failing"): ORANGE,
+              ("⚠️", "rows_untested"): ORANGE, ("⚠️", "rows_failing"): RED,
+              ("❌", "rows_untested"): RED, ("❌", "rows_failing"): RED}
+
+
 def device_ops_view(device_ops: list[dict], targets: tuple[str, ...]) -> tuple[dict, dict[str, int]]:
     """One row per device op: per destination, its ttnn call rows by status and whether the destination
     runs the op at all. Returns the tab and the totals its formulas must read back as."""
@@ -323,6 +334,7 @@ def device_ops_view(device_ops: list[dict], targets: tuple[str, ...]) -> tuple[d
             summed.append(f"{t}:{f}")
         columns.append((f"{label(t)}: device op supported", 420, "op_support", f"{t}:op_support"))
     values = [[c[0] for c in columns]]
+    backgrounds = []
     for k in device_ops:
         row = []
         for _, _, _, column in columns:
@@ -335,6 +347,11 @@ def device_ops_view(device_ops: list[dict], targets: tuple[str, ...]) -> tuple[d
             else:
                 row.append(cell(k[column].replace("; ", "\n")))
         values.append(row)
+        for t in destinations:
+            for n, c in enumerate(columns):
+                color = GAP_COLORS.get((k[f"{t}:op_support"], c[2])) if c[3].startswith(f"{t}:") else None
+                if color and int(k[c[3]] or 0):
+                    backgrounds.append((len(values) - 1, n, color))
     total = ["Total"] + [""] * (len(columns) - 1)
     expected = {}
     for column in summed:
@@ -345,6 +362,7 @@ def device_ops_view(device_ops: list[dict], targets: tuple[str, ...]) -> tuple[d
     values.append(total)
     tab = new_tab(DEVICE_OPS_TAB, "device_ops.csv", values, [c[1] for c in columns], [0, len(values) - 1])
     tab["notes"] = [column_note(DEVICE_OPS_TAB, c[2]) for c in columns]
+    tab["backgrounds"] = backgrounds
     return tab, expected
 
 
@@ -933,6 +951,11 @@ def spec(run_dir: pathlib.Path, info_id: int = 0, first_id: int = 1, max_tab_kb:
             "range": {"sheetId": tab["sheetId"], "startRowIndex": r, "endRowIndex": r + 1,
                       "startColumnIndex": c, "endColumnIndex": c + 1},
             "rows": [{"values": [{"note": note}]}], "fields": "note"}} for r, c, note in tab.pop("cell_notes", [])]
+        requests += [{"repeatCell": {
+            "range": {"sheetId": tab["sheetId"], "startRowIndex": r, "endRowIndex": r + 1,
+                      "startColumnIndex": c, "endColumnIndex": c + 1},
+            "cell": {"userEnteredFormat": {"backgroundColorStyle": {"rgbColor": color}}},
+            "fields": "userEnteredFormat.backgroundColorStyle"}} for r, c, color in tab.pop("backgrounds", [])]
     return {"tabs": tabs, "requests": requests, "expected": expected}
 
 

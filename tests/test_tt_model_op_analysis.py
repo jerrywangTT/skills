@@ -2791,3 +2791,27 @@ def test_failed_runs_of_the_entry_test_are_shown_and_a_test_failure_downgrades_t
     del data["measurements"]["source:cache"]["cause"]
     (run / "run.json").write_text(json.dumps(data))
     assert "source:cache failed without a cause" in validate(run).stdout
+
+
+def test_device_op_support_colours_gap_counts_by_verdict(tmp_path):
+    rows = [op_row(1, 1, device_op="prim::a", port="⚠️"), op_row(2, 1, device_op="prim::a", port="❌", port_ev="x"),
+            op_row(3, 1, device_op="prim::b", port="❌", port_ev="x"), op_row(4, 1, device_op="prim::c", port="✅",
+                                                                            port_ev="t"),
+            op_row(5, 1, device_op="prim::d", port="⚠️"), op_row(6, 1, device_op="prim::d", port="❌", port_ev="x")]
+    run = make_static_run(tmp_path, rows, [trace_row(1, 1, 6)])
+    write_support(run, [("prim::a", "✅", "runs elsewhere"), ("prim::b", "❌", "no factory"), ("prim::c", "✅", "t"),
+                        ("prim::d", "⚠️", "fork, no test")])
+    assert run_script("kernel_ops.py", str(run)).returncode == 0
+    spec = sheet(run)
+    sid = next(t["sheetId"] for t in spec["tabs"] if t["title"] == "Device op support")
+    painted = {(r["repeatCell"]["range"]["startRowIndex"], r["repeatCell"]["range"]["startColumnIndex"]):
+               r["repeatCell"]["cell"]["userEnteredFormat"]["backgroundColorStyle"]["rgbColor"]
+               for r in spec["requests"] if "repeatCell" in r and r["repeatCell"]["range"].get("sheetId") == sid
+               and "backgroundColorStyle" in r["repeatCell"]["cell"]["userEnteredFormat"]
+               and r["repeatCell"]["range"].get("startRowIndex", 0) > 0 and r["repeatCell"]["range"].get("endRowIndex") ==
+               r["repeatCell"]["range"].get("startRowIndex", 0) + 1 and r["repeatCell"]["range"].get("endColumnIndex") ==
+               r["repeatCell"]["range"].get("startColumnIndex", 0) + 1}
+    yellow, orange = {"red": 1.0, "green": 0.95, "blue": 0.7}, {"red": 1.0, "green": 0.8, "blue": 0.55}
+    red = {"red": 0.96, "green": 0.75, "blue": 0.75}
+    # Columns: G ✅ rows (6), H ⚠️ rows (7), I ❌ rows (8).
+    assert painted == {(1, 7): yellow, (1, 8): orange, (2, 8): red, (4, 7): orange, (4, 8): red}

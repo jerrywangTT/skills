@@ -104,7 +104,10 @@ is empty). Whether the destination runs the op at all, for any arguments; define
 destination `<t>:rows_ok`, `<t>:rows_untested`, `<t>:rows_failing`, `<t>:rows_na` (op-table rows
 with `✅`, `⚠️`, `❌`, `n/a`), `<t>:op_support` and `<t>:op_evidence` from `device_op_support.csv`
 (`⏳` and empty when it has no verdict). Written by `kernel_ops.py`; the spreadsheet shows it as the
-Device op support tab, second after Info.
+Device op support tab, second after Info. There a non-zero row count is coloured by the device op's
+verdict: with `✅`, ⚠️ rows yellow (an untested call may run as it is) and ❌ rows orange (the call moves to
+a supported variant); with `⚠️`, ⚠️ rows orange (they may need nothing once the op's tests pass) and ❌ rows
+red; with `❌`, both red (the op needs work on the destination first).
 
 ## graph_ops.csv and graph_host_transfers.csv (graph capture)
 

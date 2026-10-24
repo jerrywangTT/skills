@@ -85,15 +85,19 @@ FIELD_NOTES = {
     "program_factories": "Program factories the model's calls of this device op select.",
     "rows_ok": "Rows of the ttnn calls tab for this device op with ✅ on this destination: a test or recorded run "
                "on the destination covers that exact call.",
-    "rows_untested": "Rows with ⚠️ on this destination: the code path exists, but no test or run covers that call.",
-    "rows_failing": "Rows with ❌ on this destination: that call is shown not to work (failing check, xfail, hang "
-                    "reproducer). Says nothing about other arguments of the op.",
+    "rows_untested": ("Model calls of this device op that no test on this destination covers. Yellow: the op runs "
+                      "here, so these calls may work as they are. Orange: the op has code here but no test, so they "
+                      "may work once it is tested. Red: the op does not run here."),
+    "rows_failing": ("Model calls of this device op that fail on this destination (failing check, xfail, hang). "
+                     "Orange: the op runs here with other arguments, so these calls must move to a supported variant. "
+                     "Red: the op itself needs work here first."),
     "rows_na": "Rows with n/a on this destination: the destination never launches that call.",
     "op_support": "Whether the destination runs this device op at all, for any arguments, not only the model's. "
                   "✅ supported: a test on the destination runs the op (any parameters). ⚠️ untested: the op has "
                   "code for the destination but no test of any variant. ❌ not supported: a check that fails "
                   "whatever the arguments (no factory or fork, every factory stops on this architecture). n/a: the "
-                  "destination never executes it. ⏳ not checked. After the icon: how this was decided.",
+                  "destination never executes it. ⏳ not checked. After the icon: how this was decided. The icon sets the colour "
+                  "of the ⚠️ and ❌ row counts.",
     "sources": "Methods that saw this device op and factory. tracy (op code): Tracy saw the op code, which several "
                "rows here share, so it does not confirm this factory.",
     "op_table_ids": "The rows of the ttnn calls tab this device op and factory cover.",
