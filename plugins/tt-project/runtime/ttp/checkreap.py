@@ -49,6 +49,15 @@ def _stat(pid: int) -> tuple[str, int] | None:
         return None
 
 
+def _start(pid: int) -> int | None:
+    """The start time of `pid` in clock ticks since boot, or None when it is gone: with the pid,
+    it names one process, even after the process stops showing its environment as it exits."""
+    try:
+        return int((PROC / str(pid) / "stat").read_text().rsplit(")", 1)[1].split()[19])
+    except (OSError, IndexError, ValueError):
+        return None
+
+
 def _ancestors() -> set[int]:
     out, pid = set(), os.getpid()
     while pid > 1 and pid not in out:
@@ -107,10 +116,18 @@ def members(tok: str, pgids=(), root: str = "") -> list[int]:
 
 def reap(tok: str, pgids=(), root: str = "", grace_s: float = GRACE_S) -> tuple[int, int]:
     """End every process tied to run `tok`: SIGTERM, up to `grace_s` for them to go, then SIGKILL
-    those still tied. Returns (processes found, processes still there, e.g. stuck in D state)."""
-    found = members(tok, pgids, root)
+    those still there. Returns (processes found, processes still there, e.g. stuck in D state).
+    A found process counts as there until it is gone or a zombie, by its pid and start time: one
+    that is exiting no longer shows its environment, yet still runs."""
+    found = {pid: _start(pid) for pid in members(tok, pgids, root)}
+
+    def there(pid: int) -> bool:
+        st = _stat(pid)
+        return st is not None and st[0] not in ("Z", "X") and _start(pid) == found[pid]
+
+    left = list(found)
     for sig, wait in ((signal.SIGTERM, grace_s), (signal.SIGKILL, min(grace_s, 2.0))):
-        left = [pid for pid in found if tied(pid, tok, pgids, root)]
+        left = [pid for pid in left if there(pid)]
         for pid in left:
             try:
                 os.kill(pid, sig)
@@ -119,12 +136,12 @@ def reap(tok: str, pgids=(), root: str = "", grace_s: float = GRACE_S) -> tuple[
         deadline = time.monotonic() + wait
         while left and time.monotonic() < deadline:
             # A zombie has ended: never reaped here, so whoever started it still gets its exit code.
-            left = [pid for pid in left if tied(pid, tok, pgids, root)]
+            left = [pid for pid in left if there(pid)]
             if left:
                 time.sleep(0.05)
         if not left:
             return len(found), 0
-    return len(found), len([pid for pid in found if tied(pid, tok, pgids, root)])
+    return len(found), len(left)
 
 
 def said(procs: int, trees: int) -> str:
@@ -134,9 +151,8 @@ def said(procs: int, trees: int) -> str:
 
 
 def _write(path: Path, data: dict) -> None:
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    tmp.write_text(json.dumps(data))
-    os.replace(tmp, path)
+    from .project import durable_write
+    durable_write(path, json.dumps(data))
 
 
 class Record:

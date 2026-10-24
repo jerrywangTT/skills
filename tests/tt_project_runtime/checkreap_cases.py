@@ -155,3 +155,17 @@ def test_a_stop_or_timeout_of_the_runner_ends_what_the_check_left_even_outside_i
     assert e.value.code == 143
     assert not _reap_live(pid), "a process the stopped check left kept running"
     assert cli._REAPED["procs"] >= 1 and "the check left running" in log.read_text()
+
+
+def test_a_reaped_process_counts_until_it_is_gone_not_until_it_stops_showing_its_token(monkeypatch):
+    """A process that is exiting no longer shows its environment, yet still runs: the reap waits
+    for it (and kills it) by its pid and start time, so none is left when it returns."""
+    from ttp import checkreap
+    proc = subprocess.Popen(["sleep", "60"], start_new_session=True)
+    try:
+        monkeypatch.setattr(checkreap, "members", lambda *a, **k: [proc.pid])
+        monkeypatch.setattr(checkreap, "tied", lambda *a, **k: False)
+        assert checkreap.reap("tok", grace_s=0.2) == (1, 0)
+        assert proc.wait(timeout=10) == -signal.SIGTERM
+    finally:
+        _reap_kill(proc)
