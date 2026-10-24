@@ -9,7 +9,9 @@ details; the bring-up checks: end-to-end test, host fallback, test hardware, pea
 a smaller grid, configurable grid and layer count; the four analysis methods with their state and
 the run's confidence; counts as formulas over the ttnn calls tab; `summary.md`; the op-table columns that
 hold one value in every row; and a list of every tab with what it holds and the method that fills
-it, `schemas.md`), Device ops by factory (one row per device op and program factory, evidence de-duplicated across its
+it, `schemas.md`), Device op support (only with destinations: one row per device op, its ttnn call rows
+counted by status per destination, and whether the destination runs the op at all, icon and reason),
+Device ops by factory (one row per device op and program factory, evidence de-duplicated across its
 rows, with the methods that saw it), ttnn calls (one row per launching variant, device op and factory
 merged, constant columns dropped, source paths shortened), then TTsim: tests, Launch order, Port
 blockers, Host work in code, the Tracy, graph-capture and kernel-cache tables and any other CSV of the run.
@@ -35,7 +37,7 @@ configurability settings and each status count. Never assemble a tab's values by
 4. Write each entry of `tabs` with one `update_formulas` call on `'<title>'!A1` with its `values`
    as given: formulas stay formulas, numbers stay numbers, and text the sheet would parse already
    carries a leading `'`.
-5. Sheet row = CSV `id` + 1 on the Device ops by factory, ttnn calls and CSV tabs (header is row 1). Before any
+5. Sheet row = CSV `id` + 1 on the Device op support, Device ops by factory, ttnn calls and CSV tabs (header is row 1). Before any
    targeted cell write, read the rows and confirm the `id` column; after writing, read the range
    again and check it.
 6. Read back every cell in `expected` and compare it with the value given there; then read the Op

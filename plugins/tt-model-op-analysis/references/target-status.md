@@ -109,6 +109,39 @@ several cores, `in0_num_blocks_w > 1`).
 - A failure applies to every row with the same kernel op key. A failure for another factory,
   layout or dtype does not.
 
+## Device op support (destinations)
+
+Row statuses judge the model's own calls. When none of a device op's rows is `✅` on a destination,
+that alone cannot say whether the destination lacks the op or only these arguments: the model's
+calls are a sample. For every destination, decide per device op (`op_table.csv` `device_op`, or
+`op_code` when it is empty) whether the destination runs the op at all, for any arguments, and
+write it to `device_op_support.csv`:
+
+| `<t>:op_support` | When | `<t>:op_evidence` names |
+|---|---|---|
+| `✅` | A test on this destination runs this device op with any parameters and passes, or has no marker, hang reproducer or failure comment; or a row of the op is `✅` | the test node and how its parameters differ from the model's calls |
+| `⚠️` | No test of any variant runs the op on this destination, but the destination has code for it (a factory, for Quasar a Metal 2.0 ProgramSpec factory or fork, whose validate accepts some input) | the factory and that no test was found, with where was searched |
+| `❌` | A check fails whatever the arguments: no binding, no factory or fork for this architecture, every factory of the op stops on it (legacy `CreateKernel` factories on Quasar) | the check with `<file>:<line>`, or the `port_blockers.csv` id that states it |
+| `n/a` | Every row of the op is `n/a` on this destination | why |
+
+- Search the whole repository at the pinned SHA, not only tests matched to the model's rows: for
+  Quasar `tests/ttnn/**/quasar/`, `tests/scripts/quasar/*.yaml` and the release documents; for a
+  profile, the op's unit tests and the CI workflows that run them on that profile. Say what was
+  searched when nothing was found ("no test under tests/ttnn/**/quasar/ or tests/scripts/quasar/
+  calls ttnn.experimental.quasar.conv2d").
+- A failure tied to arguments (a dtype, a layout, `in0_num_blocks_w > 1`, an `xfail` on one
+  parametrization) is a row status, never `❌` here. A check whose condition reads any tensor
+  attribute or op argument is tied to arguments.
+- Absence of a test is `⚠️`, never `❌`.
+- A device op with several factories is `✅` when any factory runs on the destination; the
+  evidence names the factories that do not.
+- A TTsim pass of any test of the op gives `✅`; update the verdict after `kernel_tests.py apply`.
+  When that result is withdrawn, decide the verdict again from the remaining evidence.
+- Leave a verdict empty only while it is not decided; the sheet shows it as `⏳ not checked` and
+  the validator warns.
+- `validate_static.py` rejects `⚠️` or `❌` for an op with a `✅` row, `❌` unless every launched
+  row is `❌` (a failure for any arguments fails every call), and `n/a` unless every row is `n/a`.
+
 ## Sources of evidence
 
 Strongest first; a stronger source decides over a weaker one for the same kernel op key:

@@ -27,7 +27,7 @@ def test_plugin_skills_and_phase_references():
 def test_manifest_versions_match():
     claude = json.loads((PLUGIN / ".claude-plugin" / "plugin.json").read_text())
     codex = json.loads((PLUGIN / ".codex-plugin" / "plugin.json").read_text())
-    assert claude["version"] == codex["version"] == "0.9.1"
+    assert claude["version"] == codex["version"] == "0.10.0"
 
 
 def test_shared_setup_is_step_by_step():
@@ -154,9 +154,51 @@ def validate(run: pathlib.Path) -> subprocess.CompletedProcess[str]:
 def test_valid_static_run_passes_and_prints_range(tmp_path):
     rows = [op_row(1, 12), op_row(2, 1, launch_condition="skipped when the buffer does not move")]
     run = make_static_run(tmp_path, rows, [trace_row(1, 12, 1), trace_row(2, 1, 1)])
+    write_support(run, [("prim::op1", "⚠️", "fork x, no test"), ("prim::op2", "⚠️", "fork y, no test")])
     result = validate(run)
     assert result.returncode == 0, result.stdout
     assert result.stdout.splitlines() == ["OK", "p150: 13 launches per inference, 1 of them conditional (12-13); 0 measured-only launches"]
+
+
+SUPPORT_FIELDS = ["device_op", "quasar-bf16:op_support", "quasar-bf16:op_evidence"]
+
+
+def write_support(run: pathlib.Path, verdicts: list[tuple[str, str, str]]) -> None:
+    write_rows(run / "device_op_support.csv", [dict(zip(SUPPORT_FIELDS, v)) for v in verdicts], SUPPORT_FIELDS)
+
+
+def test_device_op_support_missing_or_undecided_warns(tmp_path):
+    run = make_static_run(tmp_path, [op_row(1, 1), op_row(2, 1)], [trace_row(1, 1, 2)])
+    result = validate(run)
+    assert result.returncode == 0 and "WARNING: device_op_support.csv missing" in result.stdout
+    write_support(run, [("prim::op1", "", "")])
+    out = validate(run).stdout
+    assert "no row for prim::op2" in out and "no verdict for prim::op1 on quasar-bf16" in out and "ERROR" not in out
+
+
+def test_device_op_support_must_agree_with_row_statuses(tmp_path):
+    rows = [op_row(1, 1, port="✅", port_ev="test a"), op_row(2, 1, port="⚠️"), op_row(3, 1, port="❌", port_ev="xfail"),
+            op_row(4, 1, port="❌", port_ev="xfail")]
+    run = make_static_run(tmp_path, rows, [trace_row(1, 1, 4)])
+    write_support(run, [("prim::op1", "❌", "x"), ("prim::op2", "❌", "x"), ("prim::op3", "n/a", "x"),
+                        ("prim::op4", "❌", ""), ("prim::nope", "✅", "x")])
+    out = validate(run).stdout
+    assert "row 1: quasar-bf16:op_support '❌' but a row of the op is ✅" in out
+    assert "row 2: quasar-bf16:op_support '❌' but rows of the op are ['⚠️']" in out
+    assert "row 3: quasar-bf16:op_support 'n/a' with row statuses ['❌']" in out
+    assert "row 4: quasar-bf16:op_support without quasar-bf16:op_evidence" in out
+    assert "row 5: device_op 'prim::nope' is in no op_table row" in out
+    # A verdict for the op as a whole may be ✅ where none of the model's calls is.
+    write_support(run, [("prim::op1", "✅", "test a"), ("prim::op2", "⚠️", "fork, no test"),
+                        ("prim::op3", "✅", "t.py::other_shape passes"), ("prim::op4", "❌", "no factory: f.cpp:3")])
+    assert validate(run).returncode == 0
+
+
+def test_device_op_support_short_row_is_reported_not_crashing(tmp_path):
+    run = make_static_run(tmp_path, [op_row(1, 1)], [trace_row(1, 1, 1)])
+    (run / "device_op_support.csv").write_text(",".join(SUPPORT_FIELDS) + "\nprim::op1,⚠️\n", encoding="utf-8")
+    result = validate(run)
+    assert "device_op_support.csv row 1: field count differs from the header" in result.stdout, result.stderr
 
 
 def test_legacy_targets_list_is_rejected(tmp_path):
@@ -1125,7 +1167,7 @@ def test_sheet_spec_kernel_ops_tab_groups_evidence(tmp_path):
     run = make_static_run(tmp_path, rows, [trace_row(1, 1, 4)])
     assert run_script("kernel_ops.py", str(run)).returncode == 0
     spec = sheet(run)
-    assert [t["title"] for t in spec["tabs"]][:3] == ["Info", "Device ops by factory", "ttnn calls"]
+    assert [t["title"] for t in spec["tabs"]][:4] == ["Info", "Device op support", "Device ops by factory", "ttnn calls"]
     kernel = tab(spec, "Device ops by factory")
     row = dict(zip(kernel[0], kernel[1]))
     assert row["Device op / program factory"] == "prim::a / F"
@@ -1134,6 +1176,46 @@ def test_sheet_spec_kernel_ops_tab_groups_evidence(tmp_path):
     assert "P150: evidence and gap" not in kernel[0]
     assert kernel[-1][0] == "Total" and kernel[-1][4] == "=SUM(E2:E2)"
     assert spec["expected"]["'Device ops by factory'!E3"] == 4
+
+
+def test_device_op_support_tab_counts_rows_and_shows_verdicts(tmp_path):
+    rows = [op_row(1, 2, device_op="prim::a", program_factory="F", op_code="A", port="❌", port_ev="xfail"),
+            op_row(2, 3, device_op="prim::a", program_factory="G", op_code="A", port="⚠️"),
+            op_row(3, 1, device_op="prim::b", program_factory="F", op_code="B", port="✅", port_ev="t")]
+    run = make_static_run(tmp_path, rows, [trace_row(1, 1, 6)])
+    write_support(run, [("prim::a", "✅", "tests/ttnn/unit_tests/quasar/test_a.py::test_other_shape passes")])
+    result = run_script("kernel_ops.py", str(run))
+    assert result.returncode == 0 and "2 device ops, 1 destination verdicts not checked yet" in result.stdout
+    got = read(run / "device_ops.csv")
+    assert [(r["device_op"], r["program_factories"], r["op_table_ids"], r["p150:launches"]) for r in got] == [
+        ("prim::a", "F; G", "1,2", "5"), ("prim::b", "F", "3", "1")]
+    assert [(r["quasar-bf16:rows_ok"], r["quasar-bf16:rows_untested"], r["quasar-bf16:rows_failing"],
+             r["quasar-bf16:op_support"]) for r in got] == [("0", "1", "1", "✅"), ("1", "0", "0", "⏳")]
+    spec = sheet(run)
+    assert [t["title"] for t in spec["tabs"]][:2] == ["Info", "Device op support"]
+    support = tab(spec, "Device op support")
+    assert "Quasar, BF16 projection: n/a rows" not in support[0]
+    first, second = (dict(zip(support[0], r)) for r in support[1:3])
+    assert first["Device op"] == "prim::a" and first["Program factories"] == "F\nG"
+    assert (first["Quasar, BF16 projection: ✅ rows"], first["Quasar, BF16 projection: ❌ rows"]) == (0, 1)
+    assert first["Quasar, BF16 projection: device op supported"] == "✅ supported: quasar/test_a.py::test_other_shape passes"
+    assert second["Quasar, BF16 projection: device op supported"] == "⏳ not checked"
+    total = dict(zip(support[0], support[-1]))
+    assert total["#"] == "Total" and total["Launches (P150)"] == "=SUM(F2:F3)"
+    assert spec["expected"]["'Device op support'!F4"] == 6
+    assert spec["expected"]["'Device op support'!I4"] == 1
+
+
+def test_device_op_support_tab_needs_a_destination(tmp_path):
+    rows = [op_row(1, 1)]
+    for col in ("quasar-bf16:tests", "quasar-bf16:test_result", "quasar-bf16:status", "quasar-bf16:evidence"):
+        del rows[0][col]
+    run = make_static_run(tmp_path, rows, [trace_row(1, 1, 1)], destination=None)
+    assert run_script("kernel_ops.py", str(run)).returncode == 0
+    assert not (run / "device_ops.csv").exists()
+    info = tab(sheet(run), "Info")
+    start = info.index(["Tabs", "What it holds", "Filled by", "In this sheet"])
+    assert {r[0]: r[3] for r in info[start + 1:]}["Device op support"] == "not produced: the run has no destination"
 
 
 # Final-review fixes

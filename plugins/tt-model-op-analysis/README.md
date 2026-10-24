@@ -60,6 +60,8 @@ Outputs in the run directory:
 
 - `kernel_ops.csv`: one row per kernel op (device op and program factory) with launches and
   statuses per target; the summary starts with it;
+- `device_ops.csv` (with destinations): one row per device op with its rows counted by status per
+  destination and whether the destination runs the op at all, decided in `device_op_support.csv`;
 - `op_table.csv`: one row per launching device-op variant, marked `static`, `measured` or
   `static+measured`;
 - `call_trace.csv`, `port_blockers.csv`, `host_ops.csv`, `summary.md`;

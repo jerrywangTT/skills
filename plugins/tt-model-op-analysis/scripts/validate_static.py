@@ -17,8 +17,9 @@ from opa_schema import (  # noqa: E402
     ALWAYS, CALL_SITE, CALL_TRACE_COLUMNS, CI_KEY, CI_VALUES, CONFIDENCE_VALUES, CONFIG_KEYS, CONFIG_VALUES,
     GRID_KEYWORDS,
     latest_entry_failure, HOST_OP_VALUES, HOST_OPS_COLUMNS, LAUNCH_PROFILES,
-    LEGACY_RESULTS, NOT_TRACED, ORIGIN_VALUES, PORT_BLOCKERS_COLUMNS, RESULT_STATUS, ROW_PREFIX,
-    SOURCE_TARGETS, STATUS_VALUES, TARGETS, TEST_RESULT_VALUES, TEST_TARGETS, op_table_columns, read_csv, read_header, run_targets, split_evidence,
+    LEGACY_RESULTS, NOT_CHECKED, NOT_TRACED, OP_SUPPORT_VALUES, ORIGIN_VALUES, PORT_BLOCKERS_COLUMNS, RESULT_STATUS, ROW_PREFIX,
+    SOURCE_TARGETS, STATUS_VALUES, TARGETS, TEST_RESULT_VALUES, TEST_TARGETS, device_op_support_columns, op_key,
+    op_table_columns, read_csv, read_header, run_targets, split_evidence,
 )
 
 # Evidence is the decisive fact and its <file>:<line>; longer text is a walkthrough, not evidence.
@@ -74,6 +75,68 @@ def _check_ids(name: str, rows: list[dict], errors: list[str]) -> None:
     for n, row in enumerate(rows, 1):
         if row["id"] != str(n):
             errors.append(f"{name} row {n} has id {row['id']}")
+
+
+def _check_device_op_support(path: pathlib.Path, ops: list[dict], destinations: list[str], errors: list[str],
+                             warnings: list[str]) -> None:
+    """Per-device-op verdicts (target-status.md, "Device op support") against the row statuses."""
+    name = path.name
+    if not path.exists():
+        warnings.append(f"{name} missing; the Device op support tab shows every destination as not checked "
+                        "(target-status.md, \"Device op support\")")
+        return
+    header = read_header(path)
+    required = device_op_support_columns(destinations)
+    bad = [f"{name} missing column {c}" for c in required if c not in header]
+    bad += [f"{name} unexpected column {c}" for c in header if c not in required]
+    if bad:
+        errors.extend(bad)
+        return
+    members: dict[str, list[dict]] = {}
+    for r in ops:
+        members.setdefault(op_key(r), []).append(r)
+    seen = set()
+    unchecked = []
+    for n, row in enumerate(read_csv(path), 1):
+        where = f"{name} row {n}"
+        if None in row or None in row.values():
+            errors.append(f"{where}: field count differs from the header")
+            continue
+        op = row["device_op"]
+        if op not in members:
+            errors.append(f"{where}: device_op '{op}' is in no op_table row (device_op, or op_code when it is empty)")
+            continue
+        if op in seen:
+            errors.append(f"{where}: device_op '{op}' repeats")
+        seen.add(op)
+        for t in destinations:
+            verdict, evidence = row[f"{t}:op_support"], row[f"{t}:op_evidence"].strip()
+            statuses = {m[f"{t}:status"] for m in members[op]}
+            if verdict in ("", NOT_CHECKED):
+                unchecked.append(f"{op} on {t}")
+                continue
+            if verdict not in OP_SUPPORT_VALUES:
+                errors.append(f"{where}: {t}:op_support '{verdict}' not in {OP_SUPPORT_VALUES}")
+                continue
+            if not evidence:
+                errors.append(f"{where}: {t}:op_support without {t}:op_evidence")
+            elif len(evidence) > MAX_EVIDENCE_CHARS:
+                warnings.append(f"{where}: {t}:op_evidence exceeds {MAX_EVIDENCE_CHARS} characters")
+            if (verdict == "n/a") != (statuses == {"n/a"}):
+                errors.append(f"{where}: {t}:op_support '{verdict}' with row statuses {sorted(statuses)};"
+                              " n/a exactly when every row of the op is n/a")
+            elif verdict in ("⚠️", "❌") and "✅" in statuses:
+                errors.append(f"{where}: {t}:op_support '{verdict}' but a row of the op is ✅, so the destination"
+                              " runs it; the verdict is ✅")
+            elif verdict == "❌" and statuses - {"❌", "n/a"}:
+                # A check that fails whatever the arguments fails every call; a ⚠️ row has a factory for its call.
+                errors.append(f"{where}: {t}:op_support '❌' but rows of the op are {sorted(statuses - {'❌', 'n/a'})};"
+                              " a failure for any arguments makes every row ❌")
+    missing = [op for op in members if op not in seen]
+    if missing:
+        warnings.append(f"{name} has no row for {', '.join(missing)}; the sheet shows them as not checked")
+    if unchecked:
+        warnings.append(f"{name}: no verdict for {', '.join(unchecked)}; the sheet shows them as not checked")
 
 
 def validate(run_dir: pathlib.Path) -> tuple[list[str], list[str], dict[str, tuple[int, int, int]]]:
@@ -229,6 +292,8 @@ def validate(run_dir: pathlib.Path) -> tuple[list[str], list[str], dict[str, tup
     for n, row in enumerate(rows["host_ops.csv"], 1):
         if row["counts_as_host_op"] not in HOST_OP_VALUES:
             errors.append(f"host_ops.csv row {n}: counts_as_host_op '{row['counts_as_host_op']}' not in {HOST_OP_VALUES}")
+    if destinations:
+        _check_device_op_support(run_dir / "device_op_support.csv", ops, destinations, errors, warnings)
 
     trace = rows["call_trace.csv"]
     for n, row in enumerate(trace, 1):

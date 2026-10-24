@@ -59,7 +59,9 @@ Quasar source's entry test is its own item (measured-source.md).
    again. `apply` warns about every row whose status still rests on a TTsim result the results
    file no longer decides. A results file from plugin 0.5.0 may hold `hang`: it is read as
    `timeout`, so the node runs again and the row is withdrawn as above.
-7. Rerun `validate_static.py` and `kernel_ops.py`. In `summary.md`, state which statuses rest on a
-   TTsim run and which on test markers only.
+7. A TTsim pass of any test of a device op makes its `device_op_support.csv` verdict `✅`
+   (target-status.md, "Device op support"); update it. Rerun `validate_static.py` and
+   `kernel_ops.py`. In `summary.md`, state which statuses rest on a TTsim run and which on test
+   markers only.
 
 TTsim proves execution and correctness on the simulated architecture, never performance.

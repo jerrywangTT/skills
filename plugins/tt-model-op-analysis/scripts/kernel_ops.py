@@ -4,6 +4,9 @@ Measured counts come from Tracy, which reports op codes but not program factorie
 given per op code and repeated on every kernel op that shares it. Graph launches come from
 graph_ops.csv, which names the factory, so they are per kernel op; a factory only the graph
 capture saw gets its own row. `sources` lists the methods that saw each kernel op.
+
+With destinations it also writes device_ops.csv: one row per device op with its op-table rows
+counted by status per destination and the verdict from device_op_support.csv, or ⏳ without one.
 """
 
 from __future__ import annotations
@@ -15,7 +18,10 @@ import pathlib
 import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-from opa_schema import TEST_TARGETS, kernel_ops_columns, read_csv, run_targets, write_csv  # noqa: E402
+from opa_schema import (  # noqa: E402
+    NOT_CHECKED, STATUS_COUNT_FIELDS, TEST_TARGETS, device_ops_columns, kernel_ops_columns, op_key, read_csv,
+    run_targets, write_csv,
+)
 
 STATUS_ORDER = ("✅", "⚠️", "❌", "n/a")
 
@@ -146,6 +152,32 @@ def aggregate(rows: list[dict], source: str, destinations: list[str], measured: 
     return out
 
 
+def device_ops(rows: list[dict], source: str, destinations: list[str], support: list[dict]) -> list[dict]:
+    """One row per device op: its op-table rows counted by status per destination, and the
+    agent's verdict from device_op_support.csv on whether the destination runs the op at all."""
+    verdicts = {r["device_op"]: r for r in support}
+    groups: dict[str, list[dict]] = {}
+    for row in rows:
+        groups.setdefault(op_key(row), []).append(row)
+    out = []
+    for n, (device_op, members) in enumerate(groups.items(), 1):
+        entry = {
+            "id": str(n), "device_op": device_op,
+            "program_factories": "; ".join(dict.fromkeys(m["program_factory"] for m in members if m["program_factory"])),
+            "ttnn_apis": "; ".join(dict.fromkeys(m["ttnn_api"] for m in members if m["ttnn_api"])),
+            "op_table_ids": ",".join(m["id"] for m in members),
+            f"{source}:launches": str(sum(int(m[f"{source}:launches"] or 0) for m in members)),
+        }
+        verdict = verdicts.get(device_op, {})
+        for t in destinations:
+            statuses = collections.Counter(m[f"{t}:status"] for m in members)
+            entry |= {f"{t}:{f}": str(statuses[s]) for s, f in STATUS_COUNT_FIELDS.items()}
+            entry[f"{t}:op_support"] = verdict.get(f"{t}:op_support") or NOT_CHECKED
+            entry[f"{t}:op_evidence"] = verdict.get(f"{t}:op_evidence", "")
+        out.append(entry)
+    return out
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("run_dir", type=pathlib.Path)
@@ -167,6 +199,14 @@ def main() -> int:
     write_csv(args.run_dir / "kernel_ops.csv", kernel_ops_columns(source, destinations), out)
     graph_only = sum(e["origin"] == "graph" for e in out)
     print(f"{len(out)} kernel ops" + (f", {graph_only} seen only by the graph capture" if graph_only else ""))
+    if destinations:
+        support_path = args.run_dir / "device_op_support.csv"
+        support = read_csv(support_path) if support_path.exists() else []
+        ops = device_ops(rows, source, destinations, support)
+        write_csv(args.run_dir / "device_ops.csv", device_ops_columns(source, destinations), ops)
+        unchecked = sum(o[f"{t}:op_support"] == NOT_CHECKED for o in ops for t in destinations)
+        print(f"{len(ops)} device ops" + (f", {unchecked} destination verdicts not checked yet "
+                                          "(device_op_support.csv)" if unchecked else ""))
     return 0
 
 

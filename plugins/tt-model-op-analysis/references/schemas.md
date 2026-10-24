@@ -91,6 +91,21 @@ measured count is per op code and repeats on every kernel op that shares it), `g
 its rows), and for Quasar targets `<t>:tests` and `<t>:test_results`. Written by `kernel_ops.py`;
 `summary.md` starts with this table and the spreadsheet shows it as the Device ops by factory tab.
 
+## device_op_support.csv (destinations, written by the agent)
+
+`device_op`, then per destination `<t>:op_support` (`✅`, `⚠️`, `❌`, `n/a`) and `<t>:op_evidence`
+(at most 300 characters). One row per device op of `op_table.csv` (`device_op`, or `op_code` when it
+is empty). Whether the destination runs the op at all, for any arguments; defined in
+`target-status.md`, "Device op support". Only runs with destinations have it.
+
+## device_ops.csv (one row per device op, destinations only)
+
+`id`, `device_op`, `program_factories`, `ttnn_apis`, `op_table_ids`, `<source>:launches`, then per
+destination `<t>:rows_ok`, `<t>:rows_untested`, `<t>:rows_failing`, `<t>:rows_na` (op-table rows
+with `✅`, `⚠️`, `❌`, `n/a`), `<t>:op_support` and `<t>:op_evidence` from `device_op_support.csv`
+(`⏳` and empty when it has no verdict). Written by `kernel_ops.py`; the spreadsheet shows it as the
+Device op support tab, second after Info.
+
 ## graph_ops.csv and graph_host_transfers.csv (graph capture)
 
 Written by `graph_report.py` for the `source:graph` item. `graph_ops.csv`: `id`, `op_code` (the

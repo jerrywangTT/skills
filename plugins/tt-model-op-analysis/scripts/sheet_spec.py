@@ -4,8 +4,9 @@ The sheet is a view of the run's files for human readers. Nothing is invented: t
 op-table columns that hold one value in every row (listed once on Info), merges device op and
 program factory, shortens source paths to their last two components, strips row-number prefixes
 from evidence and orders columns reader-first. Tabs: Info (run, counts, summary.md, constant
-columns), Device ops by factory (one row per device op and program factory), ttnn calls (one row per launching variant), then the
-other CSVs.
+columns), Device op support (with destinations: one row per device op, its rows by status and
+whether each destination runs it), Device ops by factory (one row per device op and program
+factory), ttnn calls (one row per launching variant), then the other CSVs.
 
 Prints JSON with `tabs` (sheetId, title, source file, values: a 2D array for one write from A1;
 formulas start with `=`, text the sheet would parse is prefixed with `'`), `requests` (one
@@ -28,8 +29,9 @@ import sys
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from sheet_notes import CI_NOTE, CONFIDENCE_NOTE, METHOD_NOTES, STATUS_NOTES, column_note, tab_description  # noqa: E402
 from opa_schema import (  # noqa: E402
-    ALWAYS, CALL_SITE, CALL_TRACE_TAB, CI_KEY, ci_job, LLK_GAPS_TAB, CONFIDENCE_DISPLAY, GRID_KEYWORDS, KERNEL_OPS_TAB, LAUNCH_PROFILES,
-    METHOD_ITEMS, METHOD_LABELS, NOT_TRACED, OP_TABLE_TAB, ROW_PREFIX, SHEET_TABS, SOURCE_METHODS, STATUS_VALUES,
+    ALWAYS, CALL_SITE, CALL_TRACE_TAB, CI_KEY, ci_job, LLK_GAPS_TAB, CONFIDENCE_DISPLAY, DEVICE_OPS_TAB, GRID_KEYWORDS,
+    KERNEL_OPS_TAB, LAUNCH_PROFILES, METHOD_ITEMS, METHOD_LABELS, NOT_CHECKED, NOT_TRACED, OP_SUPPORT_LABELS, OP_TABLE_TAB,
+    ROW_PREFIX, SHEET_TABS, SOURCE_METHODS, STATUS_COUNT_FIELDS, STATUS_VALUES,
     TAB_METHOD, TARGET_LABELS, TEST_TARGETS, TTSIM_TESTS_TAB, column_width, confidence, display_header,
     latest_entry_failure, methods_used, read_csv, read_header, run_targets, split_evidence,
 )
@@ -293,6 +295,57 @@ def kernel_ops_view(kernel_ops: list[dict], ops: list[dict], targets: tuple[str,
     tab = new_tab(KERNEL_OPS_TAB, "kernel_ops.csv", values, widths, [0, len(values) - 1])
     tab["notes"] = [column_note(KERNEL_OPS_TAB, c[2]) for c in columns]
     return tab
+
+
+def op_support_text(verdict: str, evidence: str) -> str:
+    if verdict == NOT_CHECKED:
+        return f"{NOT_CHECKED} not checked"
+    text = f"{verdict} {OP_SUPPORT_LABELS.get(verdict, verdict)}"
+    return f"{text}: {tidy(evidence)}" if evidence else text
+
+
+def device_ops_view(device_ops: list[dict], targets: tuple[str, ...]) -> tuple[dict, dict[str, int]]:
+    """One row per device op: per destination, its ttnn call rows by status and whether the destination
+    runs the op at all. Returns the tab and the totals its formulas must read back as."""
+    source, destinations = targets[0], targets[1:]
+    # (header, width, note field, device_ops.csv column or None for the fixed columns)
+    columns = [("#", 40, "id", "id"), ("Device op", 220, "device_op", "device_op"),
+               ("Program factories", 260, "program_factories", "program_factories"),
+               ("ttnn API", 180, "ttnn_apis", "ttnn_apis"), ("ttnn call rows", 120, "op_table_ids", "op_table_ids"),
+               (f"Launches ({label(source)})", 90, "launches", f"{source}:launches")]
+    summed = [f"{source}:launches"]
+    for t in destinations:
+        for status, f in STATUS_COUNT_FIELDS.items():
+            # n/a is shown only where the destination skips some op.
+            if status == "n/a" and not any(int(k[f"{t}:{f}"] or 0) for k in device_ops):
+                continue
+            columns.append((f"{label(t)}: {status} rows", 80, f, f"{t}:{f}"))
+            summed.append(f"{t}:{f}")
+        columns.append((f"{label(t)}: device op supported", 420, "op_support", f"{t}:op_support"))
+    values = [[c[0] for c in columns]]
+    for k in device_ops:
+        row = []
+        for _, _, _, column in columns:
+            if column.endswith(":op_support"):
+                row.append(cell(op_support_text(k[column], k[column.replace(":op_support", ":op_evidence")])))
+            elif column == "device_op":
+                row.append(short_op(k[column]))
+            elif column == "op_table_ids":
+                row.append(cell(k[column].replace(",", ", ")))
+            else:
+                row.append(cell(k[column].replace("; ", "\n")))
+        values.append(row)
+    total = ["Total"] + [""] * (len(columns) - 1)
+    expected = {}
+    for column in summed:
+        i = next(n for n, c in enumerate(columns) if c[3] == column)
+        letter = col_letter(i)
+        total[i] = f"=SUM({letter}2:{letter}{len(device_ops) + 1})"
+        expected[f"{quote(DEVICE_OPS_TAB)}!{letter}{len(device_ops) + 2}"] = sum(int(k[column] or 0) for k in device_ops)
+    values.append(total)
+    tab = new_tab(DEVICE_OPS_TAB, "device_ops.csv", values, [c[1] for c in columns], [0, len(values) - 1])
+    tab["notes"] = [column_note(DEVICE_OPS_TAB, c[2]) for c in columns]
+    return tab, expected
 
 
 REVIEW_MARK = {"gap": "❌ gap", "renamed": "✅ renamed", "not a gap": "✅ not a gap"}
@@ -731,6 +784,11 @@ def spec(run_dir: pathlib.Path, info_id: int = 0, first_id: int = 1, max_tab_kb:
     info_tab, expected = info_view(run_dir, run, targets, op_columns, constant, ops)
 
     tabs = [info_tab]
+    device_ops_path = run_dir / "device_ops.csv"
+    if destinations and device_ops_path.exists():
+        device_tab, device_expected = device_ops_view(read_csv(device_ops_path), targets)
+        tabs.append(device_tab)
+        expected |= device_expected
     kernel_ops_path = run_dir / "kernel_ops.csv"
     if kernel_ops_path.exists():
         kernel_ops = read_csv(kernel_ops_path)
@@ -743,7 +801,12 @@ def spec(run_dir: pathlib.Path, info_id: int = 0, first_id: int = 1, max_tab_kb:
     directory += [(t["title"], t, "") for t in tabs[1:]]
     ran = set(methods_used(run))
     for name, title in SHEET_TABS:
-        if name in ("op_table", "kernel_ops"):
+        if name == "device_ops" and not any(t["title"] == DEVICE_OPS_TAB for t in tabs):
+            why = ("not produced: the run has no destination" if not destinations else
+                   "not produced in this run (device_ops.csv is missing; kernel_ops.py writes it)")
+            directory.append((DEVICE_OPS_TAB, None, why))
+            continue
+        if name in ("op_table", "kernel_ops", "device_ops"):
             continue
         if name == "kernel_test_results":
             quasar = [t for t in targets if t in TEST_TARGETS]

@@ -275,6 +275,7 @@ On request, two runs can be compared table by table:
 | `host_fallback.csv` | `scope` |
 | `footprint.csv` | `op_code` |
 | `kernel_ops.csv` | `device_op,program_factory,op_code` |
+| `device_ops.csv` | `device_op` |
 | `kernel_test_results_<target>.csv` | `node_id` |
 
 `measured_ops.csv` is not compared: per-op timings change every run. `compare_runs.py` exits 2 if a

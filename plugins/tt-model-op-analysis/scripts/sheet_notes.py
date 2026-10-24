@@ -12,6 +12,9 @@ STATIC, TRACY, GRAPH, CACHE, TTSIM = ("static trace", "Tracy", "graph capture", 
 # Tab title (or prefix for tabs with a target suffix) -> (what it holds, the methods that fill it).
 TAB_DESCRIPTIONS = {
     "Info": ("Run identity, bring-up checks, analysis methods and confidence, counts and the summary.", "all"),
+    "Device op support": ("One row per device op: per destination, how many of the model's calls are supported, "
+                          "untested or failing, and whether the destination runs the op at all, with the reason.",
+                          f"{STATIC} and a search of the destination's tests; {TTSIM} results update it"),
     "Device ops by factory": ("One row per device op and the program factory it selected (the kernels that run): "
                               "launches, the methods that saw it, and its status and evidence per target.", f"{STATIC}; {TRACY} and {GRAPH} confirm launches"),
     "ttnn calls": ("One row per launching variant of a ttnn call: call site, dispatch, grid dependency, shapes and "
@@ -79,6 +82,18 @@ FIELD_NOTES = {
     "test_result": "Simulator result of those tests: pass, fail, xfail, timeout, error, skip, or not run.",
     "statuses": "Number of rows in the ttnn calls tab with each status. " + STATUS_NOTE,
     "test_results": "Simulator result of each kernel-op test.",
+    "program_factories": "Program factories the model's calls of this device op select.",
+    "rows_ok": "Rows of the ttnn calls tab for this device op with ✅ on this destination: a test or recorded run "
+               "on the destination covers that exact call.",
+    "rows_untested": "Rows with ⚠️ on this destination: the code path exists, but no test or run covers that call.",
+    "rows_failing": "Rows with ❌ on this destination: that call is shown not to work (failing check, xfail, hang "
+                    "reproducer). Says nothing about other arguments of the op.",
+    "rows_na": "Rows with n/a on this destination: the destination never launches that call.",
+    "op_support": "Whether the destination runs this device op at all, for any arguments, not only the model's. "
+                  "✅ supported: a test on the destination runs the op (any parameters). ⚠️ untested: the op has "
+                  "code for the destination but no test of any variant. ❌ not supported: a check that fails "
+                  "whatever the arguments (no factory or fork, every factory stops on this architecture). n/a: the "
+                  "destination never executes it. ⏳ not checked. After the icon: how this was decided.",
     "sources": "Methods that saw this device op and factory. tracy (op code): Tracy saw the op code, which several "
                "rows here share, so it does not confirm this factory.",
     "op_table_ids": "The rows of the ttnn calls tab this device op and factory cover.",
@@ -177,6 +192,9 @@ FIELD_NOTES = {
 # Fields whose meaning differs on one tab.
 TAB_FIELD_NOTES = {
     "Graph: launches": {"launches": "Launches in the whole capture."},
+    "Device op support": {"launches": "Launches per inference on the source over all rows of this device op, "
+                                      "measured-only rows included, as in the Info counts.",
+                          "op_table_ids": "The rows of the ttnn calls tab of this device op, all factories."},
     "Tracy: resource counts": {"launches": "Launches of this op code in the Tracy window."},
     "Cache: kernels": {"kind": "compute or data_movement."},
     "LLK gaps (Quasar)": {"kind": "llk_api or data_format."},

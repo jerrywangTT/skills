@@ -25,6 +25,14 @@ CONFIDENCE_VALUES = ("verified", "unverified")
 # How the sheet shows `confidence`: whether the code alone fixes the factory a call selects.
 CONFIDENCE_DISPLAY = {"verified": "fixed by the code", "unverified": "decided at run time"}
 KERNEL_OPS_TAB = "Device ops by factory"
+DEVICE_OPS_TAB = "Device op support"
+# Whether a destination runs a device op at all, for any arguments (target-status.md, "Device op
+# support"), as opposed to the row statuses, which judge the model's own calls.
+OP_SUPPORT_VALUES = ("✅", "⚠️", "❌", "n/a")
+OP_SUPPORT_LABELS = {"✅": "supported", "⚠️": "untested", "❌": "not supported", "n/a": "not executed"}
+NOT_CHECKED = "⏳"
+# device_ops.csv row-count field per row status.
+STATUS_COUNT_FIELDS = {"✅": "rows_ok", "⚠️": "rows_untested", "❌": "rows_failing", "n/a": "rows_na"}
 ALWAYS = "always"
 ORIGIN_VALUES = ("static", "measured", "static+measured")
 NOT_TRACED = "not traced"
@@ -179,6 +187,26 @@ def kernel_ops_columns(source: str, destinations: list[str]) -> list[str]:
     return columns
 
 
+def op_key(row: dict) -> str:
+    """Device op of an op-table row; a measured-only row without one is keyed by its op code."""
+    return row["device_op"] or row["op_code"]
+
+
+def device_op_support_columns(destinations: list[str]) -> list[str]:
+    columns = ["device_op"]
+    for target in destinations:
+        columns += [f"{target}:op_support", f"{target}:op_evidence"]
+    return columns
+
+
+def device_ops_columns(source: str, destinations: list[str]) -> list[str]:
+    columns = ["id", "device_op", "program_factories", "ttnn_apis", "op_table_ids", f"{source}:launches"]
+    for target in destinations:
+        columns += [f"{target}:{f}" for f in STATUS_COUNT_FIELDS.values()]
+        columns += [f"{target}:op_support", f"{target}:op_evidence"]
+    return columns
+
+
 # Spreadsheet presentation: tab order, readable headers and column widths in pixels.
 # Tabs from the static trace have plain names; tabs from a measurement start with the method's name.
 OP_TABLE_TAB = "ttnn calls"
@@ -186,7 +214,8 @@ CALL_TRACE_TAB = "Launch order"
 TTSIM_TESTS_TAB = "TTsim: tests"
 LLK_GAPS_TAB = "LLK gaps (Quasar)"
 SHEET_TABS = (
-    ("op_table", OP_TABLE_TAB), ("kernel_ops", "Device ops by factory"), ("kernel_test_results", TTSIM_TESTS_TAB),
+    ("op_table", OP_TABLE_TAB), ("device_ops", DEVICE_OPS_TAB), ("kernel_ops", KERNEL_OPS_TAB),
+    ("kernel_test_results", TTSIM_TESTS_TAB),
     ("call_trace", CALL_TRACE_TAB), ("port_blockers", "Port blockers"),
     ("host_ops", "Host work in code"), ("measured_ops", "Tracy: ops"), ("host_fallback", "Tracy: host fallback"),
     ("footprint", "Tracy: resource counts"), ("diff", "Static vs Tracy"), ("graph_ops", "Graph: launches"),
@@ -195,7 +224,7 @@ SHEET_TABS = (
     ("llk_gaps_quasar", LLK_GAPS_TAB),
 )
 # The method whose run writes each tab's CSV, for saying why a tab is missing.
-TAB_METHOD = {"op_table": "static", "kernel_ops": "static", "call_trace": "static", "port_blockers": "static",
+TAB_METHOD = {"op_table": "static", "device_ops": "static", "kernel_ops": "static", "call_trace": "static", "port_blockers": "static",
               "host_ops": "static", "kernel_test_results": "TTsim", "measured_ops": "tracy", "host_fallback": "tracy",
               "footprint": "tracy", "diff": "tracy", "graph_ops": "graph", "graph_host_transfers": "graph",
               "cache_compute": "cache", "cache_dataflow": "cache", "cache_kernels": "cache", "llk_gaps_quasar": "cache"}
@@ -205,7 +234,7 @@ FIELD_LABELS = {
     "launch_condition": "Launch condition", "confidence": "Factory choice",
     "dispatch_evidence": "Dispatch evidence", "grid_dependency": "Grid dependency",
     "launches_per_repeat": "Launches per repeat", "affected_ids": "Affected ttnn call rows",
-    "required_change": "Required change", "op_table_ids": "ttnn call rows",
+    "required_change": "Required change", "op_table_ids": "ttnn call rows", "program_factories": "Program factories",
     "static_launches": "Static launches",
     "static_launches_op_code": "Static launches (all factories of this op code)",
     "measured_launches_op_code": "Measured launches (op code)", "host_work": "Host work", "counts_as_host_op": "Counts as host op",
@@ -223,6 +252,8 @@ TARGET_FIELD_LABELS = {
     "shapes": "shapes and dtypes", "launches": "launches per inference",
     "status": "status", "evidence": "evidence and gap", "tests": "kernel-op tests", "test_result": "TTsim result",
     "statuses": "statuses (rows)", "test_results": "TTsim results",
+    "rows_ok": "✅ rows", "rows_untested": "⚠️ rows", "rows_failing": "❌ rows", "rows_na": "n/a rows",
+    "op_support": "device op supported", "op_evidence": "device op evidence",
 }
 FIELD_WIDTHS = {
     "id": 40, "stage": 120, "origin": 110, "tests": 300, "test_result": 90, "ttnn_api": 180, "op_code": 200, "device_op": 200, "program_factory": 260,

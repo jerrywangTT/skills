@@ -122,4 +122,9 @@ same branch.
 3. Fill `<dest>:status` and `<dest>:evidence` (and for Quasar targets `<dest>:tests` as in step 4
    of the static phase, with `<dest>:test_result` `not run`) per target-status.md; add the
    destination's blockers to `port_blockers.csv`. Measured-only rows get the destination's status from a kernel-op lookup.
-4. Rerun `validate_static.py` and `kernel_ops.py`, then update `summary.md`.
+4. Decide per device op whether the destination runs it at all, for any arguments, and write
+   `device_op_support.csv` per target-status.md, "Device op support". Do this for every device op,
+   also those with `✅` rows; it matters most where no row is `✅`.
+5. Rerun `validate_static.py` and `kernel_ops.py`, then update `summary.md`: under `Findings`,
+   name the device ops with no `✅` row and say for each whether the op is missing on the
+   destination (`❌`), untested (`⚠️`) or runs with other arguments (`✅`).
