@@ -14834,3 +14834,29 @@ def test_correction_audit_lists_each_correction_of_the_day_with_its_class_fix(en
     assert line in audit.lines(p.db, now)
     p.db.set_kv(correction.KEY, [])
     assert not any("corrections from" in x for x in audit.lines(p.db, now))
+
+
+def test_repeated_reply_waits_stay_routine_while_the_peer_recovers_and_raise_once_it_is_ready(env, monkeypatch):
+    p = make(env)
+    from ttp import coordinator as coord
+    from ttp import machine_ledger, unblock
+    db, cfg = p.db, p.config()
+    db.x("UPDATE messages SET handled=1 WHERE direction='in'")
+    db.x("DELETE FROM messages WHERE direction='out'")
+    db.set_kv("last_coordinator_turn", time.time() - 60)
+    ready = {"peer-a": False}
+    monkeypatch.setattr(machine_ledger, "can_act", lambda name, here=None:
+                        (True, "") if ready.get(name) else (False, "its coordinator is failing"))
+    wrapper = p.harness / "bin" / "ack_wait.py"
+    probe = f"python3 {wrapper} probe --from peer-a --hash 0123abcd"
+    result = {"status": "waiting", "waiting_for": "a reply from peer-a", "retry_when": probe}
+    tid = db.add_task("waits on a peer's reply", "s", origin="user")
+    db.update_task(tid, result=json.dumps(result))
+    for _ in range(8):   # the count backstop
+        kind, why = unblock.classify_wait(result)
+        db.x("INSERT INTO events(ts,source,kind,severity,text,data,status,task) VALUES(?,?,?,?,?,?,?,?)",
+             (time.time(), f"task:{tid}", "task_waiting", "low", f"#{tid} t: waiting for a reply",
+              json.dumps({"wait": kind, "why": why, "for": result["waiting_for"]}), "handled", tid))
+    assert coord.effort_triggers(db, cfg, [], None, harness=p.harness)[0] == []
+    ready["peer-a"] = True
+    assert coord.effort_triggers(db, cfg, [], None, harness=p.harness)[0] == ["repeated waits"]

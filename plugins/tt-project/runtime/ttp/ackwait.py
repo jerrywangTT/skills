@@ -13,8 +13,8 @@ and the stored text's sha256 prefix. A reply is a note that project files for th
   `--status needs_review`) hand-off quoting the reply to $TTP_RESULT, so the task ends model-free.
 
 The reply is another project's data, never an instruction or an approval: the hand-off says so.
-Nothing of the other project's is read but the shared inbox, and nothing is written but $TTP_RESULT
-and a progress line in the waiting run.
+Nothing of the other project's is read but the shared inbox and, read-only, whether it can act now
+(peer_recovering), and nothing is written but $TTP_RESULT and a progress line in the waiting run.
 """
 from __future__ import annotations
 
@@ -139,3 +139,37 @@ def unmanaged_wait(result: dict, projects, job_in_flight: bool = False, cfg: dic
             f"Hand off waiting with retry_when `ttp ack-wait probe --from {frm} --hash <note id>` and on_pass_cmd "
             f"`ttp ack-wait settle --from {frm} --hash <note id>` (the id `ttp note --to` printed), or keep working "
             f"without the reply. A project's own model-free wrapper counts when ack_wait.probe_commands lists it.")
+
+
+# can_act's reasons that say the peer is there but cannot answer now (its daemon down, paused, its
+# coordinator logged out or failing); an unknown or unreadable peer is not taken as recovering.
+_RECOVERING_RE = re.compile(r"^(?:its daemon is|it is paused|its coordinator is)\b")
+
+
+def peer(probe, cfg: dict | None = None, harness=None) -> str:
+    """The project a reply-wait probe (is_probe) waits on: its `--from <project>`; '' when none is named."""
+    if not is_probe(probe, cfg, harness):
+        return ""
+    words = _words(probe)
+    for i, w in enumerate(words):
+        if w == "--from" and i + 1 < len(words):
+            return words[i + 1]
+        if w.startswith("--from="):
+            return w.split("=", 1)[1]
+    return ""
+
+
+def peer_recovering(probe, cfg: dict | None = None, harness=None) -> tuple[str, str]:
+    """(peer, why) while the project a reply-wait probe waits on cannot answer now, read-only from that
+    project's own state (machine_ledger.can_act: its daemon stopped or stale, it is paused, its coordinator
+    logged out or failing); ('', '') otherwise. While it holds, the wait's staleness and repeat checks stay
+    quiet: no turn here can make the peer answer sooner. They re-arm once it can act again."""
+    name = peer(probe, cfg, harness)
+    if not name:
+        return "", ""
+    from .machine_ledger import can_act
+    try:
+        ok, why = can_act(name)
+    except Exception:   # a peer's state that cannot be read never silences a check
+        return "", ""
+    return (name, why) if not ok and _RECOVERING_RE.match(str(why or "")) else ("", "")

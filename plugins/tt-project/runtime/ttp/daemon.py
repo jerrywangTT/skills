@@ -5678,7 +5678,7 @@ class Daemon:
                     if any(e["kind"] in coord.UNBLOCK_KINDS for e in evs):
                         return ["unblock kind"]
                     return coord.effort_triggers(db, self.cfg, [e["id"] for e in evs], due_now, [], gates_now,
-                                                 now, coord.charter_conflicts(self.p))[0]
+                                                 now, coord.charter_conflicts(self.p), harness=self.p.harness)[0]
                 if quietgate.quiet(db, self.cfg, evs, msgs, pre, due_now, self._quiet_fp(gates_now), now,
                                    coord.UNBLOCK_KINDS, sweep.SWEEP_KIND):
                     usd = quietgate.skip(db, evs, due_now, now)
@@ -5701,7 +5701,7 @@ class Daemon:
                 seen_now = turngate.material(db, wake_fingerprint(self.p, gates_now), [e["id"] for e in evs])
                 pre = [] if any(e["kind"] in coord.UNBLOCK_KINDS for e in evs) else \
                     coord.effort_triggers(db, self.cfg, [e["id"] for e in evs], None, [], gates_now, now,
-                                          coord.charter_conflicts(self.p))[0]
+                                          coord.charter_conflicts(self.p), harness=self.p.harness)[0]
                 match = turngate.repeat(db, self.cfg, evs, msgs, seen_now, now, sweep.SWEEP_KIND,
                                         pre, coord.UNBLOCK_KINDS)
                 if match:
@@ -5734,7 +5734,7 @@ class Daemon:
             lowered: list[str] = []
             triggers, seen = coord.effort_triggers(db, self.cfg, [e["id"] for e in evs], due,
                                                    [m["id"] for m in msgs], gates, now,
-                                                   coord.charter_conflicts(self.p), lowered)
+                                                   coord.charter_conflicts(self.p), lowered, harness=self.p.harness)
             unblock = ", ".join(triggers)
             flagged = correction.flag(db, self.cfg, msgs, now)   # likely corrections, tagged in the digest
             # Every turn sees background sections the previous turn saw as one line each.
@@ -8138,9 +8138,11 @@ class Daemon:
             held = now >= since + max_hold
             gate = time_gate(str(prev.get("retry_when") or ""))
             # A pure time gate whose epoch is still ahead is not stuck: no turn could make it pass sooner.
-            # Nor is a user pause (userpause): only the user's word lifts it.
+            # Nor is a user pause (userpause): only the user's word lifts it. Nor a reply wait while
+            # its peer is recovering (ackwait.peer_recovering): it raises once the peer can act again.
             if held and (gate is None or gate <= now) \
-                    and not userpause.is_probe(prev.get("retry_when"), self.cfg):
+                    and not userpause.is_probe(prev.get("retry_when"), self.cfg) \
+                    and not ackwait.peer_recovering(prev.get("retry_when"), self.cfg, self.p.harness)[0]:
                 self._stale_wait_event(task, prev, since, max_hold)
                 self._flag_never_passes(task, str(prev.get("retry_when") or ""), rc,
                                         (self._probe_out.get(tid) or ("",))[0], stale=True)
@@ -8283,7 +8285,8 @@ class Daemon:
         other commands of its probe follow as they are. A wait on any other probe, that probe's latest line
         and when it was read, then the hand-off's words labelled as the worker's note from its time
         (waitheal.live_note; with no line, those words marked as possibly stale). A wait with no probe, its
-        hand-off's words. Either way with the facts found about the tasks and asks they name (refwaits)."""
+        hand-off's words. Either way with the facts found about the tasks and asks they name (refwaits), and
+        for a reply wait whose peer cannot answer now, that the peer is recovering (ackwait.peer_recovering)."""
         found, rest = locks.lock_probe_parts(str(prev.get("retry_when") or ""))
         if found:
             try:   # an unwritable or corrupt shared lock dir must not break a hand-off or a tick
@@ -8301,6 +8304,9 @@ class Daemon:
         probe = str(prev.get("retry_when") or "")
         if not probe.strip():
             return said
+        peer, why = ackwait.peer_recovering(probe, self.cfg, self.p.harness)
+        if peer:
+            said = f"{said} (peer {peer} recovering: {why})"
         line, read, by = self._probe_live.get(tid) or ("", None, "")
         return waitheal.live_note(said, prev.get("waiting_since"), line if by == probe else "", read, self.p)[:400]
 

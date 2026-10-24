@@ -940,3 +940,68 @@ def test_a_start_when_probe_that_stopped_answering_is_not_judged(env):
     assert progress.check(p.db, {}, p.state, now - 8000 + 20 * 180 + 30, current_probe=lambda t: _LIVE_START)
     assert progress.check(p.db, {}, p.state, now, current_probe=lambda t: _LIVE_START) == []
     assert progress.load(p.db)["probes"] == {} and progress.load(p.db)["raised"] == {}
+
+
+def _wrapper_probe(p, frm="peer-a"):
+    """A retry_when on the project's own ack-wait wrapper (ackwait.is_probe), which says not yet."""
+    wrapper = p.harness / "bin" / "ack_wait.py"
+    wrapper.parent.mkdir(parents=True, exist_ok=True)
+    wrapper.write_text("import sys\nsys.exit(1)\n")
+    return f"python3 {wrapper} probe --from {frm} --hash 0123abcd"
+
+
+def test_a_reply_wait_on_the_projects_own_ack_wait_wrapper_raises_no_probe_stall(env):
+    """A wait on another project's reply through the project's own ack-wait wrapper is a long wait, as a
+    `ttp ack-wait probe` is: no probe stall past probe_n and probe_h, nor at rewake_h. A wrapper outside
+    the harness dir (is_probe rejects it) is still judged as before."""
+    from ttp import ackwait, progress
+    p = make(env)
+    own, other = _wrapper_probe(p), "python3 other/harness/bin/ack_wait.py probe --from peer-a --hash 0123abcd"
+    assert ackwait.is_probe(own, p.config(), p.harness) and not ackwait.is_probe(other, p.config(), p.harness)
+    now, probes = time.time(), {}
+    for probe in (own, "ttp ack-wait probe --from peer-a --hash 0123abcd", other):
+        tid = _due_waiting_task(p, probe, since_ago=5000)
+        probes[tid] = probe
+        for i in range(21):
+            progress.note_probe(p.db, tid, probe, 1, "no reply yet", now - 4000 + i * 180)
+    cur = lambda t: probes.get(t["id"])
+    flagged = next(k for k, v in probes.items() if v == other)
+    got = progress.check(p.db, p.config(), p.state, now, where=p, current_probe=cur)
+    assert [k for e in got for k in e["keys"]] == [f"probe:#{flagged}"], got
+    for dt in (13 * 3600, 26 * 3600):            # past rewake_h: only the rejected probe wakes again
+        got = progress.check(p.db, p.config(), p.state, now + dt, where=p, current_probe=cur)
+        assert {k for e in got for k in e["keys"]} <= {f"probe:#{flagged}"}, got
+    assert set(progress.load(p.db)["raised"]) == {f"stall:probe:#{flagged}"}
+
+
+def test_a_reply_wait_stays_quiet_while_its_peer_recovers_and_re_arms_once_it_is_ready(env, monkeypatch):
+    """While the project a reply wait waits on cannot act (read-only from its own state through
+    machine_ledger.can_act), the wait raises no wait_stale and its note says the peer is recovering. Once
+    the peer can act again, the same wait raises wait_stale and the note drops the state. An unknown peer,
+    or one whose state cannot be read, never silences the checks."""
+    from ttp import ackwait, machine_ledger
+    from ttp.daemon import Daemon
+    p = make(env)
+    state = {"peer-a": (False, "its daemon is stopped")}
+    monkeypatch.setattr(machine_ledger, "can_act", lambda name, here=None: state.get(name, (False, "not a project of this user")))
+    probe = _wrapper_probe(p)
+    assert ackwait.peer_recovering(probe, p.config(), p.harness) == ("peer-a", "its daemon is stopped")
+    for rw in (_wrapper_probe(p, "peer-b"), "ttp lock --probe box-a", "python3 other/harness/bin/ack_wait.py probe --from peer-a"):
+        assert ackwait.peer_recovering(rw, p.config(), p.harness) == ("", ""), rw
+    state["peer-c"] = (False, "its state cannot be read")
+    assert ackwait.peer_recovering(_wrapper_probe(p, "peer-c"), p.config(), p.harness) == ("", "")
+    assert ackwait.peer_recovering("ttp ack-wait probe --from=peer-a --hash 0123abcd")[0] == "peer-a"
+    d = Daemon(p.base)
+    tid = _due_waiting_task(p, probe, since_ago=7 * 24 * 3600)
+
+    def verdict():
+        _settle_probe(d, tid)
+        p.db.update_task(tid, not_before=time.time() - 1)
+        d.probe_waiting()
+        return p.db.q("SELECT id FROM events WHERE task=? AND kind='wait_stale'", (tid,)), p.db.task(tid)["blocked_reason"]
+
+    stale, why = verdict()
+    assert stale == [] and "(peer peer-a recovering: its daemon is stopped)" in why, why
+    state["peer-a"] = (True, "")
+    stale, why = verdict()
+    assert len(stale) == 1 and "recovering" not in why, why

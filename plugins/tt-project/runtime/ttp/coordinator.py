@@ -25,7 +25,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from . import locks
-from . import anchors, askrethink, broadcast, budgetkind, cachettl, chaincap, correction, course, credits, deploy, effort, ends, failover, forbidden, heal, hostcycle, jevuse, landed, machine_ledger, machines, mitigate, obligations, outagemsg, pauseends, prguard, progress, projpause, push, relay, responsibilities, restriction_audit, reviewcap, reviewreuse, settinghold, settled, shared, sharedchecks, sweep, timefmt, tried, unblock, upstream, verified, watchdup, worktree
+from . import ackwait, anchors, askrethink, broadcast, budgetkind, cachettl, chaincap, correction, course, credits, deploy, effort, ends, failover, forbidden, heal, hostcycle, jevuse, landed, machine_ledger, machines, mitigate, obligations, outagemsg, pauseends, prguard, progress, projpause, push, relay, responsibilities, restriction_audit, reviewcap, reviewreuse, settinghold, settled, shared, sharedchecks, sweep, timefmt, tried, unblock, upstream, verified, watchdup, worktree
 from . import overlap as file_overlap   # apply() has a local `overlap`
 from . import screen as scr
 from . import schedule as sched
@@ -2813,14 +2813,14 @@ TOOL_PATTERN_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.:-]{0,199}\*?$")
 def effort_triggers(db, cfg: dict, event_ids: list[int], wake_due: str | None,
                     msg_ids: list[int] | None = None, gates: dict | None = None,
                     now: float | None = None, conflicts: list[dict] | None = None,
-                    lowered: list[str] | None = None) -> tuple[list[str], dict]:
+                    lowered: list[str] | None = None, harness=None) -> tuple[list[str], dict]:
     """Why the coming coordinator turn is tricky or blocking, as trigger labels ([] for a routine
     one), and the state-based triggers' state for EFFORT_SEEN_KEY, saved once the turn starts so a
     lasting state raises one turn, not every turn. All the rules live here; each label names its
     rule, so turns can be counted by trigger. `conflicts`: the charter's contradicting Restrictions
     pairs (restriction_pairs); a pair not seen before raises the turn whose digest shows it.
     `lowered`, when given, gets one line per event a lowering rule kept routine (LOWERED_*), for the
-    turn's note next to its outcome."""
+    turn's note next to its outcome. `harness`: the project's harness dir (its own ack-wait wrapper)."""
     now = now or time.time()
     c = cfg.get("coordinator") or {}
     out: list[str] = []
@@ -2900,7 +2900,10 @@ def effort_triggers(db, cfg: dict, event_ids: list[int], wake_due: str | None,
             db.one("SELECT COUNT(*) n FROM events WHERE task=? AND kind='task_failed' AND ts>?", (t["task"], since))["n"]
         if fails_at and fails >= fails_at:
             add("repeated failures")
-        if wait_raises(db, t["task"], waits_seen, waits_at, now, live_max(cfg)):
+        # A reply wait whose peer is recovering is not judged until the peer can act again.
+        if not ackwait.peer_recovering(load_result((db.task(t["task"]) or {}).get("result")).get("retry_when"),
+                                       cfg, harness)[0] \
+                and wait_raises(db, t["task"], waits_seen, waits_at, now, live_max(cfg)):
             add("repeated waits")
     seen["waits"] = {k: v for k, v in waits_seen.items()   # a finished task's waits are over
                      if (db.task(int(k)) or {}).get("status") not in TERMINAL_TASK_STATES}
