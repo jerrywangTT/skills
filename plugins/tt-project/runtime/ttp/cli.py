@@ -7309,8 +7309,8 @@ def cmd_doctor(a) -> None:
         print(f"mcp servers for workers: {', '.join(names)}"
               + (f" · not defined in your Claude config: {', '.join(unknown)} (servers from a plugin "
                  "cannot be listed; add them with `claude mcp add`)" if unknown else "")
-              + ("" if claude_cfg.get("worker_isolation") else " · unused: worker_isolation is off, "
-                 "so workers load all your servers"))
+              + ("" if claude_cfg.get("worker_isolation") else " · worker_isolation is off, so workers load "
+                 "all your servers; a claude.ai name here keeps your claude.ai connectors too"))
     sec = load_secrets()
     print(f"jev: {'key saved' if (sec.get('jev') or {}).get('key') else 'no key (rules-only screening)'}"
           f" · enabled in project: {p.config()['jev'].get('enabled')}")

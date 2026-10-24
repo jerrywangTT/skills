@@ -1172,6 +1172,11 @@ project with `ttp config <name> jev.enabled false`. Without a key, screening is 
   Listing a server approves it for workers. A name your config does not define is skipped: the
   run still starts, and `ttp doctor` and a low alert name it. Servers that come from a Claude plugin
   are not in those files, so they cannot be listed; add the server with `claude mcp add` to list it.
+- With `worker_isolation` off, Claude workers and reviewers still load your own, the project's and
+  plugins' MCP servers, but not your claude.ai connectors (about 2k tokens on every call), unless
+  the project needs them: `mcp_servers` names one (`"claude.ai <name>"`), or one of its runs called
+  a connector's tool (in the 14 days before the first such worker, or any time since). Then all
+  connectors load as before.
 - Claude workers and reviewers get only the built-in tools workers use (`--tools`): Bash, Read,
   Edit, Write, Skill (the plugin skills) and ToolSearch (it loads MCP tools on demand). WebFetch and
   WebSearch come with every task kind but a review; a review gets them only when its title or spec

@@ -14974,3 +14974,88 @@ def test_repeated_reply_waits_stay_routine_while_the_peer_recovers_and_raise_onc
     assert coord.effort_triggers(db, cfg, [], None, harness=p.harness)[0] == []
     ready["peer-a"] = True
     assert coord.effort_triggers(db, cfg, [], None, harness=p.harness)[0] == ["repeated waits"]
+
+
+def _connector_stream(*tools):
+    return "\n".join(json.dumps({"type": "assistant", "message": {"id": f"m{i}", "content": [
+        {"type": "tool_use", "id": f"t{i}", "name": name, "input": {}}]}}) for i, name in enumerate(tools)) + "\n"
+
+
+def _worker_env(p, monkeypatch, **kw):
+    argv, run_dir, _ = _dispatch_claude_worker(p, monkeypatch, {}, **kw)
+    return argv, json.loads((run_dir / "run.json").read_text())["env"]
+
+
+def test_non_isolated_workers_leave_out_unused_claude_ai_connectors(env, monkeypatch, tmp_path):
+    p = make(env)
+    _claude_mcp_config(tmp_path, monkeypatch, p)
+    p.set_config("providers.claude.worker_isolation", False)
+    old = p.runs / "old"   # a recent run that called only the user's own server
+    old.mkdir(parents=True)
+    (old / "output.jsonl").write_text(_connector_stream("mcp__docs__search", "Bash"))
+    p.db.x("INSERT INTO runs(role,provider,started,status,dir) VALUES('worker','claude',?,'ok',?)",
+           (time.time() - 3600, str(old)))
+    argv, run_env = _worker_env(p, monkeypatch)
+    assert run_env.get("ENABLE_CLAUDEAI_MCP_SERVERS") == "false", "unused connectors cost ~2k tokens a call"
+    assert "--strict-mcp-config" not in argv and "--mcp-config" not in argv, "the user's own servers still load"
+    for kind in ("review", "work"):
+        assert _worker_env(p, monkeypatch, kind=kind)[1].get("ENABLE_CLAUDEAI_MCP_SERVERS") == "false", kind
+
+
+def test_claude_ai_connectors_stay_when_the_config_lists_one_or_runs_used_one(env, monkeypatch, tmp_path):
+    from ttp import coordinator as coord
+    from ttp.daemon import Daemon
+    p = make(env)
+    _claude_mcp_config(tmp_path, monkeypatch, p)
+    p.set_config("providers.claude.worker_isolation", False)
+    assert coord.apply(p, [{"type": "config_set", "key": "providers.claude.mcp_servers",
+                            "value": ["claude.ai Search"]}]) == [], "a connector's own name must be accepted"
+    assert "ENABLE_CLAUDEAI_MCP_SERVERS" not in _worker_env(p, monkeypatch)[1]
+    for bad in ("claude.ai  two", "claude.ai\ttab", "x!"):
+        assert coord.apply(p, [{"type": "config_set", "key": "providers.claude.mcp_servers", "value": [bad]}]), bad
+
+    # A run in the last 14 days called one: found by the first look, before any record.
+    old = p.runs / "old"
+    old.mkdir(parents=True)
+    (old / "output.jsonl").write_text(_connector_stream("Bash", "mcp__claude_ai_Search__search"))
+    oid = p.db.x("INSERT INTO runs(role,provider,started,status,dir) VALUES('worker','claude',?,'ok',?)",
+                 (time.time() - 86400, str(old)))
+    for listed in ([], ["docs"]):
+        p.set_config("providers.claude.mcp_servers", listed)
+        p.db.x("DELETE FROM kv WHERE key='connectors_used:claude'")
+        assert "ENABLE_CLAUDEAI_MCP_SERVERS" not in _worker_env(p, monkeypatch)[1], listed
+        assert p.db.kv("connectors_used:claude")["used"] == ["claude_ai_Search"]
+    p.db.x("UPDATE runs SET started=? WHERE id=?", (time.time() - 15 * 86400, oid))
+    p.db.x("DELETE FROM kv WHERE key='connectors_used:claude'")
+    assert _worker_env(p, monkeypatch)[1].get("ENABLE_CLAUDEAI_MCP_SERVERS") == "false", "older than 14 days"
+
+    # A run that calls one after the first look keeps them from then on.
+    tid = p.db.add_task("search", "s", kind="work", tier="light", origin="user")
+    p.db.update_task(tid, status="running")
+    rid = p.db.x("INSERT INTO runs(task,role,provider,model,started,status) VALUES(?,'worker','claude','',?,'running')",
+                 (tid, time.time() - 60))
+    run_dir = p.runs / str(rid)
+    run_dir.mkdir(parents=True)
+    (run_dir / "run.json").write_text(json.dumps({"budget_usd": 8.0, "timeout_s": 3600}))
+    (run_dir / "output.jsonl").write_text(_connector_stream("mcp__claude_ai_Search__search"))
+    Daemon(p.base).finish_run(p.db.one("SELECT * FROM runs WHERE id=?", (rid,)),
+                              {"rc": 0, "started": time.time() - 60, "ended": time.time()})
+    assert p.db.kv("connectors_used:claude")["used"] == ["claude_ai_Search"]
+    assert "ENABLE_CLAUDEAI_MCP_SERVERS" not in _worker_env(p, monkeypatch)[1]
+
+
+def test_connector_rule_leaves_isolation_no_internet_and_the_tool_allowlist_alone(env, monkeypatch, tmp_path):
+    p = make(env)
+    _claude_mcp_config(tmp_path, monkeypatch, p)
+    argv, run_env = _worker_env(p, monkeypatch)
+    assert "--strict-mcp-config" in argv and "ENABLE_CLAUDEAI_MCP_SERVERS" not in run_env, "isolated: as before"
+    assert p.db.kv("connectors_used:claude") is None, "an isolated project never scans its runs"
+    tools = argv[argv.index("--tools") + 1]
+    assert tools == "Bash,Read,Edit,Write,Skill,ToolSearch,WebFetch,WebSearch"
+    p.set_config("providers.claude.worker_isolation", False)
+    argv, run_env = _worker_env(p, monkeypatch)
+    assert argv[argv.index("--tools") + 1] == tools and "--strict-mcp-config" not in argv
+    p.set_config("restrictions.no_internet", True)
+    argv, run_env = _worker_env(p, monkeypatch)
+    assert argv[argv.index("--tools") + 1] == "Bash,Read,Edit,Write,Skill,ToolSearch"
+    assert run_env.get("ENABLE_CLAUDEAI_MCP_SERVERS") == "false"

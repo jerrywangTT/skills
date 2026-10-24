@@ -1879,6 +1879,30 @@ class Daemon:
         return any(a < end and b > start for a, b in self.p.db.kv("host_sleeps", []) or [])
 
     # runs -----------------------------------------------------------------------------------------
+    def _connectors_needed(self, prov, provider: str) -> bool:
+        """Whether a non-isolated worker keeps the user's account connectors (see Claude's
+        CONNECTORS_OFF): the project lists one in `providers.<p>.mcp_servers`, or one of its runs
+        called one (finish_run records it, for good). The first look scans the last 14 days' runs."""
+        names = coord.name_list(self.cfg["providers"].get(provider, {}).get("mcp_servers") or [])
+        if any(prov.is_connector(n) for n in names):
+            return True
+        key = f"connectors_used:{provider}"
+        seen = self.p.db.kv(key)
+        if seen is None:
+            used: list[str] = []
+            for r in self.p.db.q("SELECT id, dir FROM runs WHERE provider=? AND role!='coordinator' AND started>=?",
+                                 (provider, time.time() - 14 * 86400)):
+                out = self._run_dir(r) / "output.jsonl"
+                try:
+                    called_mcp = b'"mcp__' in out.read_bytes()   # parse only the few that did
+                except OSError:
+                    continue
+                if called_mcp:
+                    used += prov.parse(out).extra.get("connectors_used") or []
+            seen = {"used": sorted(set(used)), "since": time.time()}
+            self.p.db.set_kv(key, seen)
+        return bool(seen.get("used"))
+
     def _approved_mcp(self, prov, provider: str, cwd: str) -> dict:
         """The project's allowlisted MCP servers (`providers.<p>.mcp_servers`) for an isolated run,
         looked up for the worktree and the project root."""
@@ -2027,6 +2051,8 @@ class Daemon:
             if self.cfg["providers"].get(provider, {}).get("worker_isolation"):
                 extra += prov.isolation_args()
                 mcp_servers = self._approved_mcp(prov, provider, cwd)
+            elif prov.connector_env(False):
+                env = {**env, **prov.connector_env(self._connectors_needed(prov, provider))}
             # A continued session (see _resumable) gets the current system prompt again, below. Its
             # arguments go last: Codex takes them as a subcommand that must follow every option.
             resume_extra = prov.resume_args(resume) if resume else []
@@ -2836,6 +2862,10 @@ class Daemon:
         runner.remove_private(run_dir)   # the runner removes them too, unless it died first
         prov = get_provider(r["provider"]).use(r["model"] or "", (self.cfg.get("pricing") or {}).get(r["provider"]))
         usage = prov.parse(run_dir / "output.jsonl", run_dir / "stderr.log")
+        if usage.extra.get("connectors_used"):
+            key = f"connectors_used:{r['provider']}"
+            seen = db.kv(key) or {"since": time.time()}
+            db.set_kv(key, {**seen, "used": sorted(set(seen.get("used") or []) | set(usage.extra["connectors_used"]))})
         self._priced(r, usage)
         self._net_of_session(r, usage)
         stopped = exit_info.get("stopped")

@@ -2803,7 +2803,8 @@ def _is_dir(path: str) -> bool:
     return bool(path) and Path(os.path.expanduser(path)).is_dir()
 
 
-MCP_NAME_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,100}$")
+# Inner single spaces: a claude.ai connector's name ("claude.ai <name>") keeps the connectors (Daemon._connectors_needed).
+MCP_NAME_RE = re.compile(r"^(?=.{1,100}$)[A-Za-z0-9_.:-]+(?: [A-Za-z0-9_.:-]+)*$")
 # A tool workers may not call (providers.claude.disallowed_tools): a tool name such as
 # mcp__<server>__<tool>, or a trailing * for every tool that starts so (mcp__<server>__*).
 TOOL_PATTERN_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.:-]{0,199}\*?$")

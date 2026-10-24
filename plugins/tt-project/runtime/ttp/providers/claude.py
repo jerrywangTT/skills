@@ -69,6 +69,13 @@ BUNDLED_SKILLS = ("dataviz", "update-config", "keybindings-help", "code-review",
 # drops them; StructuredOutput comes with --json-schema. The allowlist replaces the old denylist
 # (WORKER_DENIED_TOOLS, kept for a CLI without --tools) and cuts ~0.6k tokens a call.
 TOOLS = "--tools"
+# The user's claude.ai connectors load in every run that is not isolated (--strict-mcp-config drops them
+# too): their deferred tool names and instructions, also for those that need a login. Measured on the
+# first call of a 'reply OK' worker run (CLI 2.1.296, 17 connectors, 1 logged in): 16.5k tokens -> 14.5k
+# with ENABLE_CLAUDEAI_MCP_SERVERS=false, which keeps the user's, project's and plugins' own servers.
+# In the 14 days to 2026-10-24 no worker of three projects (~6,700 runs) called a connector's tool.
+CONNECTORS_OFF = {"ENABLE_CLAUDEAI_MCP_SERVERS": "false"}
+CONNECTOR_PREFIXES = ("claude.ai", "claude_ai_", "mcp__claude_ai_")   # server name, its tools' prefix
 WORKER_TOOLS = ("Bash", "Read", "Edit", "Write", "Skill", "ToolSearch")
 WEB_TOOLS = ("WebFetch", "WebSearch")
 # Scheduling, remote and orchestration tools a headless worker must not use; their definitions
@@ -248,6 +255,12 @@ class Claude(Provider):
                     break
         return found, [n for n in names if n not in found]
 
+    def connector_env(self, keep: bool) -> dict[str, str]:
+        return {} if keep else dict(CONNECTORS_OFF)
+
+    def is_connector(self, name: str) -> bool:
+        return str(name).lower().startswith(CONNECTOR_PREFIXES)
+
     def with_mcp_config(self, argv: list[str], path: Path) -> list[str]:
         # --mcp-config takes several values, so a flag must follow it, never a positional argument.
         i = argv.index("--strict-mcp-config") if "--strict-mcp-config" in argv else len(argv)
@@ -314,6 +327,13 @@ class Claude(Provider):
                 for block in msg.get("content") or []:
                     if isinstance(block, dict) and block.get("type") == "text":
                         last_text = block.get("text") or last_text
+                    elif isinstance(block, dict) and block.get("type") == "tool_use" \
+                            and self.is_connector(str(block.get("name") or "")):
+                        # Its workers then keep the connectors (Daemon._connectors_needed).
+                        used = u.extra.setdefault("connectors_used", [])
+                        name = str(block["name"]).split("__")[1]
+                        if name not in used:
+                            used.append(name)
             elif t == "system" and ev.get("subtype") == "init":
                 u.session_id = ev.get("session_id", "")
                 u.extra["model"] = ev.get("model", "")

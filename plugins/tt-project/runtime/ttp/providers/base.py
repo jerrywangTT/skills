@@ -309,6 +309,16 @@ class Provider:
         """`argv` that also loads the MCP servers in the config file `path`; unchanged if unsupported."""
         return argv
 
+    def connector_env(self, keep: bool) -> dict[str, str]:
+        """Environment that leaves the user's account connectors (servers the agent's account adds,
+        not the user's or project's own) out of a non-isolated worker unless `keep`; {} if this
+        agent has none to leave out."""
+        return {}
+
+    def is_connector(self, name: str) -> bool:
+        """Whether `name` (an MCP server or tool name) is one of the account's connectors."""
+        return False
+
     def writable_args(self, dirs: list[str]) -> list[str]:
         """Arguments that let a sandboxed worker also write `dirs` (run dir, project state, git
         metadata); [] when the agent has no write sandbox."""
