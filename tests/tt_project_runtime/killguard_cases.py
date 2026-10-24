@@ -76,9 +76,14 @@ def test_kill_guard_signal_zero_probes_pass_and_real_signals_are_refused(kill_tr
     assert _kill_refusal(f"kill -0 -s 0 {o}", t) is None
     # pkill's getopt still reads a --signal after -0, anywhere before `--` (abbreviations too), and sends it.
     for cmd in ("pkill -0 --signal KILL sleep", "pkill -0 --signal=9 -f sleep", "pkill -SIG0 -f x --signal TERM",
-                "pkill -0 sleep --sig 9", "pkill -0 --signal 0 -f x --signal=KILL"):
+                "pkill -0 sleep --sig 9", "pkill -0 --signal 0 -f x --signal=KILL",
+                # an option that takes a value takes a `--` after it as that value, and getopt reads on
+                "pkill -0 -q -- --signal KILL sleep", "pkill -0 --queue -- --signal=KILL -f sleep",
+                "pkill -0 -F -- --signal 9 x", "pkill -0 -u -- --signal 9 x", "pkill -0 -fq -- --signal 9 x",
+                "pkill -0 --pidf -- --signal 9 x"):
         assert _kill_refusal(cmd, t) is not None, cmd
-    for cmd in ("pkill -0 --signal 0 sleep", "pkill -0 sleep", "pkill -0 --signal=SIG0 sleep", "pkill -0 -- --signal"):
+    for cmd in ("pkill -0 --signal 0 sleep", "pkill -0 sleep", "pkill -0 --signal=SIG0 sleep", "pkill -0 -- --signal",
+                "pkill -0 -q1 -- --signal 9", "pkill -0 --queue=1 -- --signal 9"):
         assert _kill_refusal(cmd, t) is None, cmd
 
 

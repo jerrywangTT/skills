@@ -43,8 +43,11 @@ RUNNERS = {"xargs", "parallel", "watch", "flock", "chroot", "nsenter", "unshare"
 STDIN_RUNNERS = {"xargs", "parallel", "find"}
 BY_NAME = re.compile(r"(?<![\w.-])(?:pgrep|pidof|ps|pstree|lsof|fuser|top|jobs)(?![\w.-])")
 SSH_VALUE_OPTS = set("bcDEeFIiJLlmOopQRSWw")
-PKILL_VALUE_OPTS = set("gGPstuUFqd")
-PKILL_LONG_VALUE = {"signal", "group", "terminal", "euid", "uid", "pidfile", "ns", "nslist", "queue", "delimiter"}
+PKILL_VALUE_OPTS = set("gGPstuUFqdOr")
+PKILL_LONG_VALUE = {"signal", "group", "terminal", "euid", "uid", "pidfile", "ns", "nslist", "queue", "delimiter",
+                    "older", "runstates", "env", "cgroup"}
+PKILL_LONG_FLAGS = {"count", "list-name", "list-full", "inverse", "lightweight", "full", "ignore-case", "newest",
+                    "oldest", "exact", "logpidfile", "require-handler", "ignore-ancestors", "echo", "help", "version"}
 OWN_WORDS = {"$!", "${!}", "$$", "${$}", "$BASHPID", "${BASHPID}"}
 SUB = "__ttpsub{}__"
 SUB_RE = re.compile(r"__ttpsub(\d+)__")
@@ -334,15 +337,25 @@ class _Guard:
     @staticmethod
     def _pkill_signal(args: list[str]) -> str:
         """The signal pkill sends: getopt reads a --signal anywhere before `--` after the leading -<sig>, and the
-        last one wins (`pkill -0 --signal KILL x` sends 9); --si, --sig... abbreviate it."""
+        last one wins (`pkill -0 --signal KILL x` sends 9); --si, --sig... abbreviate it. An option that takes a
+        value takes the next word even when it is `--` (`pkill -0 -q -- --signal 9 x` sends 9), as getopt does."""
+        longs = {"parent", "pgroup", "session", *PKILL_LONG_VALUE}
         sig, k = args[0][1:], 1
         while k < len(args) and args[k] != "--":
-            opt, eq, value = args[k].partition("=")
-            if len(opt) > 3 and "--signal".startswith(opt):
-                if not eq:
-                    value, k = (args[k + 1] if k + 1 < len(args) else ""), k + 1
-                sig = value
-            k += 1
+            a, takes = args[k], False
+            if a.startswith("--"):
+                opt, eq, value = a[2:].partition("=")
+                hits = [opt] if opt in longs | PKILL_LONG_FLAGS else [o for o in longs | PKILL_LONG_FLAGS
+                                                                       if opt and o.startswith(opt)]
+                takes = len(hits) == 1 and hits[0] in longs and not eq
+                if hits == ["signal"]:
+                    sig = args[k + 1] if takes and k + 1 < len(args) else value
+            elif a.startswith("-") and len(a) > 1:
+                for j, ch in enumerate(a[1:], 2):
+                    if ch in PKILL_VALUE_OPTS:
+                        takes = not a[j:]
+                        break
+            k += 2 if takes else 1
         return sig
 
     def _kill(self, args: list[str], remote: bool, stdin: bool) -> None:
