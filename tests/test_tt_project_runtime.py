@@ -4597,7 +4597,7 @@ def test_status_says_why_ready_work_is_not_starting_while_runs_are_active(env):
     h = health(p, p.db, now=now)
     assert h["why_idle"] == ""
     assert h["held"].startswith("1 ready task(s) not starting: "), h
-    for part in ("fake is paused until", "disk is low", "waiting on you: 1 open question(s)"):
+    for part in ("fake is paused until", "disk is low", "waiting on you: 1 (1 ask(s), 0 task(s))"):
         assert part in h["held"], h["held"]
     held = [ln for ln in status_text(p).splitlines() if ln.startswith("held: ")]
     assert held and "fake is paused until" in held[0], status_text(p)
@@ -32377,9 +32377,9 @@ def test_overview_lists_every_project_and_never_modifies_them(env, tmp_path, cap
     assert "daemon stopped" in lines["alpha"] and "v0.9.0 ·" in lines["alpha"], out
     assert "today $3.00 of $50 cap" not in lines["alpha"] and "24h $3.00 of $50 cap" in lines["alpha"], out
     assert "daemon running" in lines["beta"] and "v0.8.1 (behind installed 0.9.0)" in lines["beta"], out
-    assert "1 running" in lines["beta"] and "0 open asks" in lines["beta"], out
+    assert "1 running" in lines["beta"] and "waiting on you: 0 (0 asks, 0 tasks)" in lines["beta"], out
     assert "daemon stale (no tick for 60 min)" in lines["gamma"], out
-    assert "1 open ask ·" in lines["gamma"] and "1 waiting on you" in lines["gamma"], out
+    assert "waiting on you: 2 (1 ask, 1 task)" in lines["gamma"], out
     assert "remote, not checked" in lines["delta"], out
     assert out[-1].startswith("global daily cap $200 per 24h: claude $3.00 billed by this machine's 3 projects"), out
     main(["list", "--status"])
@@ -37797,10 +37797,10 @@ def test_waiting_on_you_counts_only_blocked_tasks_that_truly_wait_on_the_user(en
     assert waits.held_line([]) == ""
 
     h = health(p, p.db, now=now)
-    assert h["waiting_on_user"] == 3 and h["held_blocked"] == 4, h
+    assert h["waiting_on_user"] == 4 and h["held_blocked"] == 4, h   # 3 tasks + the one open ask
     p.db.x("UPDATE runs SET status='done'")
     h = health(p, p.db, now=now)
-    assert "waiting on you: 3 blocked task(s), 1 open question(s)" in h["why_idle"], h["why_idle"]
+    assert "waiting on you: 4 (1 ask(s), 3 task(s))" in h["why_idle"], h["why_idle"]
     assert "held: 4 blocked task(s) (waiting on the coordinator 3, a resource 1)" in h["why_idle"], h["why_idle"]
     # The web board's task waits agree with the count.
     st = state_payload(p, p.db)
@@ -37816,9 +37816,32 @@ def test_waiting_on_you_counts_only_blocked_tasks_that_truly_wait_on_the_user(en
     # `ttp overview` counts through the same classifier over a read-only connection.
     conn = connect_ro(p.db.path)
     try:
-        assert len(waits.blocked(_ReadOnly(conn), now, ages=False)[0]) == 3
+        assert waits.on_user(_ReadOnly(conn), now, ages=False)["count"] == 4
     finally:
         conn.close()
+
+
+def test_waiting_on_you_agrees_for_an_open_ask_and_a_task_gated_on_it(env):
+    """One open ask and one task deferred on a start gate the ask names: overview, status and the web
+    payload all say 2 waiting on you."""
+    from ttp import waits
+    from ttp.cli import status_text
+    from ttp.globalcap import connect_ro
+    from ttp.overview import _ReadOnly
+    from ttp.web import health
+    p = make(env)
+    now = time.time()
+    tid = p.db.add_task("needs the key", "s", origin="user")
+    p.db.x("UPDATE tasks SET labels=? WHERE id=?", (json.dumps(["start_when:test -e /nonexistent/key"]), tid))
+    p.db.post("out", f"Please provide the key that task #{tid} needs.", kind="ask", severity="high")
+    assert health(p, p.db, now=now)["waiting_on_user"] == 2
+    assert f"needs you (#{tid}, gated on an open ask)" in status_text(p)
+    conn = connect_ro(p.db.path)
+    try:
+        w = waits.on_user(_ReadOnly(conn), now, ages=False)
+    finally:
+        conn.close()
+    assert (w["count"], len(w["asks"]), len(w["gated"])) == (2, 1, 1)
 
 
 def _hold_task(p, title="hold me"):

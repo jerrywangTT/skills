@@ -193,6 +193,26 @@ def blocked(db, now: float | None = None, where=None, ages: bool = True) -> tupl
                  entered_map(db, tasks, now) if ages else None)
 
 
+def gated_on_ask(db, asks: list[dict] | None = None) -> list[dict]:
+    """Queued tasks deferred on a start gate (`start_when`) that an open ask names as #<id>: only the
+    user's answer can make the gate pass, so they wait on the user too."""
+    from .db import deferral
+    asks = open_asks(db) if asks is None else asks
+    if not asks:
+        return []
+    return [t for t in db.q("SELECT * FROM tasks WHERE status='queued' ORDER BY priority, id")
+            if deferral(t).get("when") and asks_for(t["id"], asks)]
+
+
+def on_user(db, now: float | None = None, where=None, ages: bool = True) -> dict:
+    """The one 'waiting on you' figure for `ttp status`, `ttp overview` and the web app: blocked tasks
+    that wait on the user + open asks + tasks gated on an open ask. {"tasks", "asks", "gated", "held", "count"}."""
+    you, held = blocked(db, now, where, ages)
+    asks = open_asks(db)
+    gated = gated_on_ask(db, asks)
+    return {"tasks": you, "asks": asks, "gated": gated, "held": held, "count": len(you) + len(asks) + len(gated)}
+
+
 def held_line(stuck: list[dict]) -> str:
     """The blocked tasks that do not wait on the user, by what holds them, in neutral words:
     'held: 3 blocked task(s) (waiting on the coordinator 2, a resource 1)'; '' for none."""

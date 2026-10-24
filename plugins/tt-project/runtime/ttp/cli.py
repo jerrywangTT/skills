@@ -1253,7 +1253,10 @@ def status_text(p: Project, verbose: bool = False) -> str:
         lines.append(f"  needs you ({what}, {since(m['ts'], now)} ago): {clip(text, 300)}")
     # Blocked tasks: those that wait on the user join the top; the rest are the project's to move.
     from . import waits
-    you, stuck = waits.blocked(db, now, tz)
+    wy = waits.on_user(db, now, tz)
+    you, stuck = wy["tasks"], wy["held"]
+    for t in wy["gated"][:6]:
+        lines.append(f"  needs you (#{t['id']}, gated on an open ask): {t['title']}")
     for t in you[:6]:
         lines.append(f"  needs you (#{t['id']}, {t['wait']['age_text']}): {t['title']} — {t['wait']['text']}")
     lines.append("budget: " + h["spend"]["headline"])

@@ -123,7 +123,10 @@ def project_status(name: str, entry: dict, now: float, here: str, lib_v: str, wi
                                        "files_version", "restart_pending")})
         row["asks"] = conn.execute("SELECT COUNT(*) FROM messages WHERE kind='ask' AND handled=0").fetchone()[0]
         from . import waits
-        row["waiting_on_user"] = len(waits.blocked(_ReadOnly(conn), now, ages=False)[0])
+        w = waits.on_user(_ReadOnly(conn), now, ages=False)
+        row["waiting_on_user"] = w["count"]
+        row["wait_asks"] = len(w["asks"])
+        row["wait_tasks"] = len(w["tasks"]) + len(w["gated"])
         row["running"] = conn.execute("SELECT COUNT(*) FROM runs WHERE status='running'").fetchone()[0]
         from . import billing
         from .db import counted_spend
@@ -192,8 +195,9 @@ def line(r: dict) -> str:
         v += f" (restart pending: running {r['running_version']})"
     elif r.get("running_version") == "unverified":
         v += " (running version unverified)"
-    return (f"{r['name']}\tdaemon {r['daemon']} · v{v} · {r['asks']} open ask{'s' if r['asks'] != 1 else ''}"
-            f" · {r['waiting_on_user']} waiting on you · {r['running']} running · {spend(r)}")
+    return (f"{r['name']}\tdaemon {r['daemon']} · v{v}"
+            f" · waiting on you: {r['waiting_on_user']} ({r['wait_asks']} ask{'s' if r['wait_asks'] != 1 else ''},"
+            f" {r['wait_tasks']} task{'s' if r['wait_tasks'] != 1 else ''}) · {r['running']} running · {spend(r)}")
 
 
 def footer(g: dict) -> str:

@@ -329,8 +329,9 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
                 and t["id"] not in held_ids)
     # Only a blocked task that truly waits on the user counts as waiting on you (waits.split);
     # the rest wait on the coordinator, a resource or a time and get a neutral 'held' line.
-    on_you, held_tasks = waits.blocked(db, now, tz, ages=False)
-    blocked = len(on_you)
+    wy = waits.on_user(db, now, tz, ages=False)
+    held_tasks = wy["held"]
+    blocked = len(wy["tasks"]) + len(wy["gated"])
     running = db.one("SELECT COUNT(*) n FROM runs WHERE status='running'")["n"]
     asks = db.q("SELECT id, ts, text FROM messages WHERE kind='ask' AND handled=0 ORDER BY id DESC LIMIT 5")
     top = db.one("SELECT source, ROUND(SUM(usd),2) usd FROM ledger WHERE ts>=? GROUP BY source ORDER BY SUM(usd) DESC "
@@ -380,9 +381,7 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
     disk = db.kv("disk_low")
     if disk:
         stops.append(f"disk is low ({disk['free_gb']} GB free), so only questions and plans start")
-    you = ("waiting on you: " + ", ".join(x for x in (f"{blocked} blocked task(s)" if blocked else "",
-                                                     f"{len(asks)} open question(s)" if asks else "") if x)
-           if blocked or asks else "")
+    you = (f"waiting on you: {wy['count']} ({len(wy['asks'])} ask(s), {blocked} task(s))" if wy["count"] else "")
     why = list(stops)
     if backoff > now:
         why.append(f"the coordinator is backing off after failed turns, next try {at(backoff, now, tz)}")
@@ -451,7 +450,7 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
         "net_held": [{k: t[k] for k in ("id", "title", "provider")} for t in net_held],
         "breakers": breakers,
         "asks": asks, "running": running, "working": working,
-        "waiting_on_user": blocked, "held_blocked": len(held_tasks),   # blocked tasks, as waits.split counts them
+        "waiting_on_user": wy["count"], "held_blocked": len(held_tasks),   # blocked tasks, as waits.split counts them
         "undelivered": undelivered,
         "why_idle": "; ".join(why) if not running else "", "held": held,
         "host": host_line(db.boots(now - DAY), tz),
