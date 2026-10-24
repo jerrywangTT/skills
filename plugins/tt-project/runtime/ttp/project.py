@@ -77,7 +77,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "compact_window_tokens": {"light": 100000, "standard": 150000, "deep": 200000},
         # A worker whose run has re-read this many context tokens (cache reads, summed over its calls)
         # is told once to finish its step and hand the rest on as a follow-up (0 = never).
-        "split_reread_tokens": {"light": 2000000, "standard": 3000000, "deep": 8000000},
+        "split_reread_tokens": {"light": 2000000, "standard": 4000000, "deep": 8000000},
         # Claude Code keeps a Bash command's output inline up to this many characters (it accepts
         # 4000-128000; its own default is 30000); longer output goes to a file, and the worker gets a
         # short preview and the path. 0 leaves the agent's default.

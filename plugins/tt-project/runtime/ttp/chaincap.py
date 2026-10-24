@@ -33,6 +33,10 @@ that waited on the split task wait on the hop. The last hop, the first that ends
 gets the chain's one review (split_hops). The notice, and a local_only notice for a branch its review
 still carries, go to the next digest (NOTICES_KEY) without waking the coordinator. Anything else
 still goes to it.
+
+The daemon appends branch_brief to the queued hop's spec, model-free: the parent branch's head and
+its changed files with their hunk line ranges against the base ref, so the hop starts with less
+orientation. It is bounded (BRIEF_MAX_LINES) and left out when the parent has no branch here.
 """
 from __future__ import annotations
 
@@ -59,6 +63,9 @@ FOLLOWS = "follows:"   # label of a task_add that `continues` a done task: a lin
 NOTICES_KEY = "chain_notices"   # kv: [{ts, text}]: hops the daemon queued, shown once in the next digest
 MAX_CHAIN = 200
 MAX_NOTICES = 30
+BRIEF_MAX_LINES = 40   # branch_brief's bound, its header and '+N more files' line included
+BRIEF_MAX_RANGES = 8   # hunk ranges listed per file before '...'
+HUNK = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
 SPLIT_LABEL = "split:"   # a done code task that ended as a split: split:<its head>
 # A split hand-off's own words: a summary that opens "Split at/here/..." or names the split line, a head
 # commit subject that says WIP.
@@ -285,6 +292,65 @@ def hop_tier(task: dict, fup: dict) -> str:
     return want if want in TIERS and TIERS.index(want) < TIERS.index(tier) else tier
 
 
+def branch_brief(p, task: dict) -> str:
+    """The block the daemon appends to a hop's spec: `task`'s branch head and its changed files, each
+    with its hunk line ranges (on the head; `-N`: lines deleted after line N) against the merge base with
+    the base ref, at most BRIEF_MAX_LINES lines. '' when the task has no branch, the branch is missing
+    or git cannot read it: the hop is queued without it."""
+    from . import landed, worktree
+    branch = str(task.get("branch") or "").strip()
+    if not branch:
+        return ""
+    try:
+        repo = p.root
+        head = landed._commit(repo, f"refs/heads/{branch}")
+        if not head:
+            return ""
+        out = [f"Parent branch {branch}, head {head} (added by the daemon)."]
+        ref = worktree.base_ref(p)
+        base = landed._git(repo, "merge-base", ref, head).stdout.strip() if ref else ""
+        if not base:
+            return out[0]
+        git = ("-c", "core.quotePath=false", "diff", "--no-renames", "--no-color", "--no-ext-diff")
+        stat = landed._git(repo, *git, "--numstat", base, head)
+        hunks = landed._git(repo, *git, "--unified=0", base, head)
+        if stat.returncode or hunks.returncode:
+            return out[0]
+        ranges: dict[str, list[str]] = {}
+        cur, header = "", False   # file names only from a file's header, never from its changed lines
+        for ln in hunks.stdout.splitlines():
+            if ln.startswith("diff --git "):
+                cur, header = "", True
+            elif header and ln.startswith(("--- a/", "+++ b/")):
+                cur = ln[6:]
+            elif (m := HUNK.match(ln)) and cur:
+                header = False
+                start, n = int(m.group(1)), int(m.group(2) if m.group(2) is not None else 1)
+                ranges.setdefault(cur, []).append("deleted" if n == start == 0 else f"-{start}" if n == 0 else
+                                                  str(start) if n == 1 else f"{start}-{start + n - 1}")
+        files = []
+        for ln in stat.stdout.splitlines():
+            parts = ln.split("\t", 2)
+            if len(parts) == 3:
+                files.append(parts)
+        if not files:
+            return out[0]
+        out.append(f"Changed against {ref} (merge base {base[:12]}), {len(files)} "
+                   f"file{'s' if len(files) > 1 else ''}, line ranges on the head:")
+        room = BRIEF_MAX_LINES - len(out)
+        shown = files if len(files) <= room else files[:room - 1]
+        for add, rm, name in shown:
+            rs = ranges.get(name, [])
+            where = ", ".join(rs[:BRIEF_MAX_RANGES]) + (", ..." if len(rs) > BRIEF_MAX_RANGES else "")
+            size = "binary" if add == "-" else f"+{add} -{rm}"
+            out.append(f"- {name} ({size})" + (f": {where}" if where else ""))
+        if len(shown) < len(files):
+            out.append(f"+{len(files) - len(shown)} more files")
+        return "\n".join(out)
+    except Exception:
+        return ""
+
+
 def auto_hop(p, cfg: dict, task: dict, fup: dict, why: str | None = None) -> tuple[int, str] | None:
     """Queue `fup` when hop_ready (`why`, when the caller checked it already): (new task id, why it
     progressed), else None. The hop of a split task (split_head) takes its branch over and starts at
@@ -296,7 +362,10 @@ def auto_hop(p, cfg: dict, task: dict, fup: dict, why: str | None = None) -> tup
         return None
     ch = chain(db, task["id"])
     title = str(fup["title"]).strip()[:200]
-    action = {"type": "task_add", "title": title, "spec": str(fup.get("spec") or ""), "kind": task["kind"],
+    spec = str(fup.get("spec") or "")
+    if brief := branch_brief(p, task):
+        spec = f"{spec.rstrip()}\n\n{brief}" if spec.strip() else brief
+    action = {"type": "task_add", "title": title, "spec": spec, "kind": task["kind"],
               "tier": hop_tier(task, fup), "priority": task["priority"], "budget_usd": task["budget_usd"],
               "continues": task["id"]}
     saved = db.kv(coord.NOTES_KEY)   # the coordinator's own notes for its next digest stay as they were

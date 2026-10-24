@@ -2782,8 +2782,10 @@ class Daemon:
         else:
             text = head + ("Finish the step you are on, commit, and hand off: `done` with a `followups` entry "
                            "(title starting `continue:`) whose spec is self-contained (what is done, the branch "
-                           "and head, what is left), or `waiting` if that fits. Do not start new large steps in "
-                           "this run.")
+                           "and head, the test ids you added or touched, what is left and the exact next "
+                           "command to run), or `waiting` if that fits. A hop the daemon queues gets the "
+                           "branch's changed files and line ranges added to its spec. Do not start "
+                           "new large steps in this run.")
         coord._append_update(Path(r["dir"]) / "steer.md", text, f"split-{r['id']}")
         # When the steer fired and the re-read then, once: `ttp stats` reports what the run re-read
         # after it and how it handed off (finish_run adds that).

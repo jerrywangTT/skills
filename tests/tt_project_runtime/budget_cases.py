@@ -2067,6 +2067,9 @@ def test_idle_slot_wake_backs_off_to_long_waits_while_every_queued_task_is_gated
 def test_a_worker_that_rereads_too_much_context_is_told_once_to_split(env, tmp_path):
     p = make(env)
     from ttp.daemon import Daemon
+    from ttp.project import DEFAULT_CONFIG
+    assert DEFAULT_CONFIG["budget"]["split_reread_tokens"] == {"light": 2_000_000, "standard": 4_000_000,
+                                                               "deep": 8_000_000}
     tid = p.db.add_task("long one", "spec", kind="code", tier="standard", origin="user")
     run_dir = tmp_path / "run"
     run_dir.mkdir()
@@ -2084,17 +2087,23 @@ def test_a_worker_that_rereads_too_much_context_is_told_once_to_split(env, tmp_p
     turn(2, 1_000_000)
     d.meter_running()
     assert p.db.one("SELECT cache_read_tokens FROM runs WHERE id=?", (rid,))["cache_read_tokens"] == 2_500_000
-    assert not (run_dir / "steer.md").exists(), "below the standard tier's 3 M line"
+    assert not (run_dir / "steer.md").exists(), "below the standard tier's 4 M line"
     assert "split" not in json.loads(p.db.one("SELECT note FROM runs WHERE id=?", (rid,))["note"] or "{}")
     stale = p.db.one("SELECT * FROM runs WHERE id=?", (rid,))
     turn(3, 1_000_000)
     d._metered.clear()
     d.meter_running()
+    assert not (run_dir / "steer.md").exists(), "3.5 M is still below the standard tier's 4 M line"
+    turn(4, 1_000_000)
+    d._metered.clear()
+    d.meter_running()
     steer = (run_dir / "steer.md").read_text()
-    assert "re-read about 3.5 M tokens" in steer and "`continue:`" in steer and "commit" in steer
+    assert "re-read about 4.5 M tokens" in steer and "`continue:`" in steer and "commit" in steer
+    # The hand-off it asks for names what a fresh hop would otherwise look up: tests and the next command.
+    assert "the test ids you added or touched" in steer and "the exact next command to run" in steer, steer
     split = json.loads(p.db.one("SELECT note FROM runs WHERE id=?", (rid,))["note"])["split"]
-    assert split["cache_read"] == 3_500_000 and split["limit"] == 3_000_000 and split["ts"] > 0, split
-    turn(4, 2_000_000)
+    assert split["cache_read"] == 4_500_000 and split["limit"] == 4_000_000 and split["ts"] > 0, split
+    turn(5, 2_000_000)
     d._metered.clear()
     d.meter_running()
     assert (run_dir / "steer.md").read_text() == steer, "told once per run"
@@ -2104,7 +2113,7 @@ def test_a_worker_that_rereads_too_much_context_is_told_once_to_split(env, tmp_p
     d.finish_run(stale, {"rc": 0})
     row = p.db.one("SELECT note, cache_read_tokens FROM runs WHERE id=?", (rid,))
     assert json.loads(row["note"])["split"] == {**split, "handoff": "done"}
-    assert row["cache_read_tokens"] == 5_500_000
+    assert row["cache_read_tokens"] == 6_500_000
     from ttp import budget as bud
     st = bud.reread_stats(p.db, 7)["steered"]
     assert st == {"runs": 1, "after_avg": 2_000_000, "after_max": 2_000_000, "handoffs": {"done": 1}}, st
@@ -2115,7 +2124,7 @@ def test_a_worker_that_rereads_too_much_context_is_told_once_to_split(env, tmp_p
     d.cfg = p.config()
     (run_dir / "steer.md").unlink()
     d._metered.clear()
-    turn(5, 1)
+    turn(6, 1)
     d.meter_running()
     assert not (run_dir / "steer.md").exists(), "0 turns it off"
 

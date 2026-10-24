@@ -31519,7 +31519,7 @@ def test_a_mechanical_or_light_continue_hop_is_queued_at_light_tier_and_reads_it
              "followups": [{"title": "continue: feature", "spec": "Run the checks.", "tier": "light"}]}
     root, *_ = _finish_code(env, p, "feature", {"a.py": 10}, result=light)
     (hop,) = p.db.q("SELECT * FROM tasks WHERE parent=?", (root,))
-    assert hop["tier"] == "light" and hop["spec"] == "Run the checks."
+    assert hop["tier"] == "light" and hop["spec"].startswith("Run the checks.\n\nParent branch "), hop["spec"]
     # The hop of a split (a code task with changes and a `continue:` follow-up) takes its branch over:
     # its worker starts from that head and reads the parent's summary.
     prompt = worker_prompt(p, p.db.task(hop["id"]), str(p.root), None)
@@ -31529,7 +31529,8 @@ def test_a_mechanical_or_light_continue_hop_is_queued_at_light_tier_and_reads_it
             "followups": [{"title": "mechanical: push other", "spec": "Push it."}]}
     root2, *_ = _finish_code(env, p, "other", {"b.py": 3}, result=mech)
     (hop2,) = p.db.q("SELECT * FROM tasks WHERE parent=?", (root2,))
-    assert hop2["tier"] == "light" and hop2["title"] == "mechanical: push other" and hop2["spec"] == "Push it."
+    assert hop2["tier"] == "light" and hop2["title"] == "mechanical: push other" \
+        and hop2["spec"].startswith("Push it.\n\nParent branch "), hop2["spec"]
     assert [t["id"] for t in chaincap.chain(p.db, hop2["id"])] == [root2, hop2["id"]]
     # Downward only: a follow-up never raises the hop above its parent's tier; junk keeps the parent's.
     std = {"tier": "standard"}
@@ -31538,6 +31539,47 @@ def test_a_mechanical_or_light_continue_hop_is_queued_at_light_tier_and_reads_it
     assert chaincap.hop_tier(std, {"title": "continue: x"}) == "standard"
     assert chaincap.hop_tier({"tier": "deep"}, {"title": "continue: x", "tier": "Standard"}) == "standard"
     assert chaincap.hop_tier({"tier": "light"}, {"title": "mechanical: x", "tier": "deep"}) == "light"
+
+
+def test_a_daemon_queued_continue_hop_carries_its_parent_branch_head_and_changed_line_ranges(env):
+    """The daemon appends the parent branch's head and its changed files with hunk line ranges (against
+    the merge base with the base ref) to the hop's spec, model-free and bounded; with no branch to read
+    the hop is queued with its spec as written."""
+    p = make(env)
+    from ttp import chaincap
+    _commit_files(env["repo"], {"lib.py": "".join(f"line {i}\n" for i in range(1, 21)), "old.py": "x\n"}, "base")
+
+    def edit(path):   # lines 5-6 changed and line 15 dropped in a tracked file; another one removed
+        lines = (path / "lib.py").read_text().splitlines(keepends=True)
+        lines[4:6] = ["five\n", "six\n"]
+        del lines[14]
+        (path / "lib.py").write_text("".join(lines))
+        (path / "old.py").unlink()
+    root, branch, _, _ = _finish_code(env, p, "feature", {"a.py": 10, "pkg/b.py": 1}, result=_cont("feature"),
+                                      edit=edit)
+    (hop,) = p.db.q("SELECT * FROM tasks WHERE parent=?", (root,))
+    head = _git_out(env["repo"], "rev-parse", branch).strip()
+    spec, _, brief = hop["spec"].partition("\n\n")
+    assert spec == "Carry on with feature from its branch.", hop["spec"]
+    lines = brief.splitlines()
+    assert lines[0] == f"Parent branch {branch}, head {head} (added by the daemon).", brief
+    assert lines[1].startswith("Changed against ") and "4 files" in lines[1], brief
+    assert sorted(lines[2:]) == ["- a.py (+10 -0): 1-10", "- lib.py (+2 -3): 5-6, -14",
+                                 "- old.py (+0 -1): deleted", "- pkg/b.py (+1 -0): 1"], brief
+    # Bounded: a branch with many files lists what fits in BRIEF_MAX_LINES, then how many more.
+    many = {f"m{i:02}.py": 1 for i in range(60)}
+    root2, *_ = _finish_code(env, p, "wide", many, result=_cont("wide"))
+    (hop2,) = p.db.q("SELECT * FROM tasks WHERE parent=?", (root2,))
+    wide = hop2["spec"].partition("\n\n")[2].splitlines()
+    assert len(wide) == chaincap.BRIEF_MAX_LINES and wide[-1] == f"+{60 - (len(wide) - 3)} more files", wide
+    assert "60 files" in wide[1] and wide[2] == "- m00.py (+1 -0): 1"
+    # No branch to read (its ref is gone): the hop is queued, its spec as the follow-up wrote it.
+    gone = lambda tid, _head: p.db.update_task(tid, branch="no-such-branch")
+    root3, *_ = _finish_code(env, p, "gone", {"c.py": 2}, result=_cont("gone"), before=gone)
+    assert chaincap.auto_hop(p, p.config(), p.db.task(root3), _cont("gone")["followups"][0], "1 new commit")
+    (hop3,) = p.db.q("SELECT * FROM tasks WHERE parent=?", (root3,))
+    assert hop3["spec"] == "Carry on with gone from its branch.", hop3["spec"]
+    assert chaincap.branch_brief(p, {"branch": None}) == chaincap.branch_brief(p, {"branch": "nope"}) == ""
 
 
 def test_a_continue_hop_with_progress_is_queued_by_the_daemon_without_a_coordinator_turn(env):
