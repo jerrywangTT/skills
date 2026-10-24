@@ -21045,6 +21045,39 @@ def test_an_on_pass_cmd_runs_only_for_the_hand_off_the_task_waits_on(env, monkey
     assert "cannot carry on_pass_cmd" in on_pass_problem({**DONE_ON_PASS, "on_pass_cmd": "true"})
 
 
+def test_always_passes_names_only_probes_that_test_nothing():
+    from ttp.waitheal import always_passes
+    assert all(always_passes(x) for x in ("true", ":", "exit 0", "exit", "/bin/true", "true && true", "true; :"))
+    assert not any(always_passes(x) for x in ("exit 1", "test -e x", "", "  ", None, "true || false",
+                                               "true && test -e x", "false"))
+
+
+def test_set_when_refuses_an_always_passing_probe_while_the_hand_offs_on_pass_cmd_stays(env, monkeypatch, tmp_path,
+                                                                                         capsys):
+    """An overwrite of a waiting hand-off's probe with `true` (a watcher reading a stale record) would run
+    its on_pass_cmd at once, before the wait ended: refused loudly, the probe stays; one event per wait."""
+    p = make(env)
+    from ttp import cli, daemon as dmod
+    monkeypatch.setattr(dmod, "PROBE_EVERY_S", 0)
+    d = dmod.Daemon(p.base)
+    flag = tmp_path / "ran"
+    tid, _ = _on_pass_cmd_task(p, tmp_path, f"touch {flag}", probe="exit 1")
+    for _ in range(2):
+        with pytest.raises(SystemExit):
+            cli.main(["task", "demo", "set-when", str(tid), "true"])
+        assert "rejected" in capsys.readouterr().err
+    res = json.loads(p.db.task(tid)["result"])
+    assert res["retry_when"] == "exit 1" and "retry_when_orig" not in res, res
+    assert len(p.db.q("SELECT id FROM events WHERE kind='set_when_refused' AND fingerprint LIKE ?",
+                      (f"set_when_refused:{tid}:%",))) == 1
+    _settle_on_pass(d, tid)
+    assert p.db.task(tid)["status"] == "queued" and not flag.exists() and not _ready(p, tid)
+    # Still allowed: an explicit on_pass_cmd (run it now), or clearing it (wake the task for a run).
+    cli.main(["task", "demo", "set-when", str(tid), "true", "--on-pass-cmd", ""])
+    res = json.loads(p.db.task(tid)["result"])
+    assert res["retry_when"] == "true" and res.get("on_pass_cmd") is None, res
+
+
 @pytest.mark.parametrize("change", ["probe", "cmd", "both", "unrelated"])
 def test_an_on_pass_cmd_runs_model_free_after_set_when_rewrites_the_hand_off(env, monkeypatch, tmp_path, capsys,
                                                                             change):
@@ -21064,12 +21097,14 @@ def test_an_on_pass_cmd_runs_model_free_after_set_when_rewrites_the_hand_off(env
         res = json.loads(p.db.task(tid)["result"])
         res.pop("on_pass_cmd")
         p.db.update_task(tid, result=json.dumps(res))
-    args = {"probe": ["true"], "cmd": ["--on-pass-cmd", cmd]}.get(change, ["true", "--on-pass-cmd", cmd])
+    # a new probe alone that passes at once would run the kept on_pass_cmd now: it must test something
+    new = "test -d ." if change == "probe" else "true"
+    args = {"probe": [new], "cmd": ["--on-pass-cmd", cmd]}.get(change, [new, "--on-pass-cmd", cmd])
     cli.main(["task", "demo", "set-when", str(tid), *args])
     out = capsys.readouterr().out
     res = json.loads(p.db.task(tid)["result"])
-    assert res["retry_when"] == "true" and res["on_pass_cmd"] == cmd, res
-    assert ("retry_when set: true" in out) == (change != "cmd") and ("on_pass_cmd set" in out) == (change != "probe")
+    assert res["retry_when"] == new and res["on_pass_cmd"] == cmd, res
+    assert (f"retry_when set: {new}" in out) == (change != "cmd") and ("on_pass_cmd set" in out) == (change != "probe")
     if change == "unrelated":   # a result.json naming some other probe is still not the hand-off the task waits on
         hand = json.loads((run_dir / "result.json").read_text())
         (run_dir / "result.json").write_text(json.dumps({**hand, "retry_when": "test -e /tmp/other"}))

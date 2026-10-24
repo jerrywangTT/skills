@@ -3487,6 +3487,18 @@ class Daemon:
             rstatus, result = "failed", dict(result, status=CHANGES_NEEDED)
         summary = str((result.get("summary") if isinstance(result, dict) else None)
                       or (usage.final_text or usage.error or "")[:1500])
+        if rstatus == "waiting" and result.get("retry_when") is not None and not isinstance(result["retry_when"], str):
+            # No shell command (JSON true, a number, a list): never run, nor read as passed through its
+            # truthiness. It is dropped, said loudly, and the task wakes at its timer (or on its jobs' probe).
+            bad = json.dumps(result["retry_when"])[:200]
+            result = {**{k: v for k, v in result.items() if k != "retry_when"}, "retry_when_refused": bad}
+            text = (f"#{task['id']} {task['title']}: its waiting hand-off's retry_when {bad} is no shell command, "
+                    f"so it was not stored; the task wakes at its retry timer"
+                    + ("; its on_pass_cmd runs only after a probe passes, so a run reads it instead"
+                       if result.get("on_pass_cmd") is not None else ""))
+            db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+                 (time.time(), f"task:{task['id']}", "handoff_probe_refused", "normal", text, "queued", task["id"]))
+            log(self.p, f"task {task['id']} hand-off: retry_when {bad} refused: no shell command")
         jobs = _detached_jobs(run_dir)
         if jobs and (rstatus is None and status in ("ok", "timeout", "stalled")
                      or rstatus == "waiting" and not result.get("retry_when")):

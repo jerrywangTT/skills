@@ -163,6 +163,15 @@ def header_grep(probe: str | None) -> str:
     return ""
 
 
+_ALWAYS_RE = re.compile(r"(?:(?:/usr)?/bin/)?true|:|exit(?:\s+0)?")
+
+
+def always_passes(probe: str | None) -> bool:
+    """Whether a probe passes whatever it waits for: only `true`, `:` or `exit 0` steps (joined by && or ;)."""
+    parts = [x.strip() for x in re.split(r"&&|;", str(probe or ""))]
+    return bool(str(probe or "").strip()) and all(not x or _ALWAYS_RE.fullmatch(x) for x in parts) and any(parts)
+
+
 def probe_flag(probe: str | None) -> str:
     """The first flag for a wait probe that may wait wrongly (end_marker_only, header_grep), else ""."""
     return end_marker_only(probe) or header_grep(probe)

@@ -4849,13 +4849,35 @@ def add_task(p, a) -> tuple[int, str]:
         + (f"; starts after {timefmt.long(after, p)}" if after else "") + (f"; flagged: {stale}" if stale else "")
 
 
+class _ProbeRefused(ValueError):
+    """set_when's refusal of an always-passing retry_when under a kept on_pass_cmd; `key` names the wait."""
+    def __init__(self, text: str, key: str):
+        super().__init__(text)
+        self.key = key
+
+
 def set_when(db, tid: int, probe: str | None, p=None, on_pass_cmd: str | None = None) -> str:
+    """_set_when; an always-passing retry_when it refuses is also recorded as one set_when_refused event
+    per wait, so a refused model-free caller (a watcher that drops stderr) still shows."""
+    try:
+        return _set_when(db, tid, probe, p, on_pass_cmd)
+    except _ProbeRefused as e:
+        fp = f"set_when_refused:{e.key}"
+        if not db.one("SELECT id FROM events WHERE fingerprint=?", (fp,)):
+            db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status,task) VALUES(?,?,?,?,?,?,?,?)",
+                 (time.time(), "cli", "set_when_refused", fp, "low", str(e), "handled", tid))
+        raise ValueError(str(e)) from None
+
+
+def _set_when(db, tid: int, probe: str | None, p=None, on_pass_cmd: str | None = None) -> str:
     """Re-point the probe of a task that has not started: a waiting task's `retry_when`, else its
     `start_when` deferral. An empty probe clears it. Same checks as the coordinator's task_update
     (the push branch's log check needs `p`). `on_pass_cmd` sets (\"\" clears) a waiting task's
     model-free completion command; `probe` None then keeps its retry_when. The first rewrite keeps
     what the run's result.json says as retry_when_orig / on_pass_cmd_orig, so the daemon still
-    takes that result.json as the hand-off the task waits on (daemon._same_probe)."""
+    takes that result.json as the hand-off the task waits on (daemon._same_probe). An always-passing
+    probe (`true`) while the hand-off's on_pass_cmd stays is refused: that command was written to run
+    only once the hand-off's own wait ended."""
     from .coordinator import (_start_args, check_probe, check_task_refs, defer_labels, marker_only_probe,
                               missing_file_probe, start_why)
     from .db import TERMINAL_TASK_STATES, deferral, dump_result, load_result, without_deferral
@@ -4874,6 +4896,16 @@ def set_when(db, tid: int, probe: str | None, p=None, on_pass_cmd: str | None = 
             if probe is not None:
                 check_probe(probe, "retry_when")
                 check_task_refs(db, probe, "retry_when")
+                from .waitheal import always_passes
+                if on_pass_cmd is None and prev.get("on_pass_cmd") is not None and always_passes(probe):
+                    # A caller acting on an older view of the task (a watcher that read the hand-off before
+                    # the latest one) would run the hand-off's on_pass_cmd before the wait it was written for.
+                    raise _ProbeRefused(
+                        f"task #{tid} rejected: its hand-off's on_pass_cmd runs once its retry_when "
+                        f"`{str(prev.get('retry_when') or '')[:200]}` passes; `{probe.strip()}` passes at once, "
+                        f"so it would run now, before that wait ended. The probe stays. To run it now anyway, "
+                        f"also give --on-pass-cmd with that command; to wake the task for a run instead, "
+                        f"give --on-pass-cmd \"\"", f"{tid}:{prev.get('waiting_since')}")
             if on_pass_cmd is not None:
                 check_probe(on_pass_cmd, "on_pass_cmd")
             for key, value in (("retry_when", probe), ("on_pass_cmd", on_pass_cmd)):
