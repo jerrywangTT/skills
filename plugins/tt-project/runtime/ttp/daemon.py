@@ -240,7 +240,8 @@ NOT_YET_RCS = (1, 75, 255)   # probe exits meaning "not yet": 1, EX_TEMPFAIL (a 
 JOB_FAILED = "detached job failed"   # what a `ttp detach --check` exit detach.FAILED_RC found (Daemon._job_failed)
 PROBE_TIMEOUT_S = 60
 # The detached rerun of a shared failure's ids on the push-branch tip (Daemon._start_tip_check):
-# argv dir worktree repo timeout_s cmd...; writes rc (124 once timed out) and removes the worktree.
+# argv dir worktree repo timeout_s cmd...; removes the worktree, then writes rc (124 once timed out),
+# so a present rc means the rerun is wholly done.
 TIP_RUNNER = r'''
 import os, signal, subprocess, sys
 d, wt, repo, limit, argv = sys.argv[1], sys.argv[2], sys.argv[3], float(sys.argv[4]), sys.argv[5:]
@@ -256,12 +257,12 @@ with open(os.path.join(d, "out"), "wb") as out:
             rc = 124
     except OSError:
         rc = 127
+subprocess.run(["git", "-C", repo, "worktree", "remove", "--force", wt], capture_output=True)
 with open(os.path.join(d, "rc.tmp"), "w") as f:
     f.write(f"{rc}\n")
     f.flush()
     os.fsync(f.fileno())
 os.replace(os.path.join(d, "rc.tmp"), os.path.join(d, "rc"))
-subprocess.run(["git", "-C", repo, "worktree", "remove", "--force", wt], capture_output=True)
 '''
 ON_PASS_TIMEOUT_S, ON_PASS_DIR, ON_PASS_LOG = 600, "on_pass", "on_pass.log"   # a hand-off's on_pass_cmd
 ON_PASS_NOTES_EVERY_S, ON_PASS_NOTES_DAYS = 600, 14   # sweep for notes an unsettled on_pass_cmd queued
