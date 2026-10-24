@@ -15415,3 +15415,37 @@ def test_a_stored_always_0_task_probe_never_starts_or_wakes_its_task(env, monkey
     d.probe_waiting()
     woke = json.loads(p.db.task(waiting)["result"])["woke"]
     assert _ready(p, waiting) and woke.startswith("probe broken") and "always exits 0" in woke, woke
+
+
+# Real tests that end in `; exit 0`: an earlier list exits non-zero (or errexit stops at a failing step).
+EARLY_EXIT_ENDS = ["test -e /tmp/fixed || exit 1; exit 0", "test -e /tmp/fixed || { echo no; exit 1; }; echo ok; exit 0",
+                   'for i in 1 2; do ttp landed "#$i" >/dev/null || exit 1; done; exit 0',
+                   "set -e; test -e /tmp/fixed; exit 0"]
+
+
+def test_a_probe_that_exits_non_zero_before_its_final_exit_0_is_a_real_test(env, monkeypatch):
+    """A probe whose earlier list can `exit` non-zero (also inside a loop or { } group), or that turns on
+    errexit, is a real test even though it ends in `exit 0`: every wait accepts it and the daemon runs a
+    stored one. `|| true`, `; exit 0` and `|| :` endings without such a step stay refused."""
+    p = make(env)
+    from ttp import coordinator as coord, ends, pauseends
+    from ttp import daemon as dmod
+    from ttp import screen as scr
+    for good in EARLY_EXIT_ENDS + ["test -e x || exit $rc; exit 0", "set -o errexit; test -e x; true",
+                                   "if test -e x; then :; else exit 1; fi; exit 0", "test -e x || exit 2 || true"]:
+        assert not ends.always_succeeds(good) and not ends.hides_test(good), good
+        coord.check_probe(good, "start_when")
+        coord.check_probe(good, "retry_when")
+        assert ends.from_action({"until_probe": good})["probe"] == good
+        assert pauseends.from_action({"end_when": good})["end_when"] == good
+    for i, good in enumerate(EARLY_EXIT_ENDS):
+        scr.mute(p.db, "watcher:hw", f"dropped {i}", None, end_when=good)
+    assert len(scr.mutes(p.db)) == len(EARLY_EXIT_ENDS)
+    for bad in ALWAYS_0 + ["test -e x; exit 0", "set +e; test -e x || true", "echo 'exit 1'; exit 0"]:
+        assert ends.hides_test(bad), bad
+    monkeypatch.setattr(dmod, "PROBE_EVERY_S", 0)
+    tid = _due_waiting_task(p, EARLY_EXIT_ENDS[0])
+    d = dmod.Daemon(p.base)
+    d._start_probe(tid, EARLY_EXIT_ENDS[0], time.time())
+    assert tid in d._probes and d._probes[tid][2] == EARLY_EXIT_ENDS[0], "a stored one starts a real probe"
+    d._probes[tid][0].wait(_load_scaled(60))

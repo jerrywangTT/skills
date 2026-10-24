@@ -146,13 +146,57 @@ def _trivial_command(cmd: str) -> bool:
     return words in ([w] for w in TRIVIAL_WORDS) or words == ["exit", "0"]
 
 
+def _words(probe: str) -> list[str]:
+    """`probe`'s words and operators (`;`, `&`, `|`, `(`, `)`, `{`, `}`, newline), outside comments; each
+    quoted string reads as the word "Q"."""
+    out, buf, i, n = [], "", 0, len(probe)
+    while i < n:
+        ch = probe[i]
+        if ch == "\\":
+            buf += probe[i:i + 2]
+            i += 2
+        elif ch in "'\"`":
+            buf, i = buf + "Q", _quote_end(probe, i)
+        elif ch == "#" and not buf:
+            while i < n and probe[i] != "\n":
+                i += 1
+        elif ch in " \t" or ch in ";&|(){}\n":
+            out += [buf] if buf else []
+            out += [ch] if ch not in " \t" else []
+            buf, i = "", i + 1
+        else:
+            buf, i = buf + ch, i + 1
+    return out + ([buf] if buf else [])
+
+
+def _may_exit_non_zero(probe: str) -> bool:
+    """Whether a step anywhere in `probe` can end it non-zero before its last list runs: an `exit` with
+    no argument or one other than a literal 0 (`test -e x || exit 1; exit 0`, in a loop or group too), or
+    errexit turned on (`set -e`, `set -o errexit`). Read loosely: an `exit 1` in a subshell counts too, so
+    a doubtful probe is kept as a real test."""
+    words = _words(probe)
+    for k, w in enumerate(words):
+        nxt = words[k + 1] if k + 1 < len(words) else ""
+        if w == "exit" and nxt != "0":
+            return True
+        if w == "set":
+            for j in range(k + 1, len(words)):
+                opt = words[j]
+                if not opt.startswith("-") or opt == "--":
+                    break
+                if "e" in opt[1:] or (opt[1:].endswith("o") and words[j + 1:j + 2] == ["errexit"]):
+                    return True
+    return False
+
+
 def always_succeeds(probe: str) -> bool:
     """Whether shell probe `probe` exits 0 whatever it tests: it is only `true`, `:` or `exit 0`, or its last
     list ends in one of them after `||`, `;`, `&` or `|` (`test -e x || true`, `check; exit 0`). Such a
     probe says "over" at once, so an end, hold or undo waiting on it fires while its cause is still there.
-    A real test (`test -e x || exit 1`, `cmd && true`, `(a || true) && b`) is not flagged."""
+    A real test (`test -e x || exit 1`, `cmd && true`, `(a || true) && b`) is not flagged, nor one with a
+    step that can exit non-zero first (`test -e x || exit 1; exit 0`, `set -e; test -e x; exit 0`)."""
     parts = _top_level(probe or "")
-    if not parts:
+    if not parts or _may_exit_non_zero(probe):
         return False
     start = max((k for k, (op, _) in enumerate(parts) if op == ";"), default=0)
     pipelines: list[list[str]] = []   # [operator before it, its last command] of the last and-or list
