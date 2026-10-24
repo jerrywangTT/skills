@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import os
 import re
+import signal
 import subprocess
 from pathlib import Path
 
@@ -46,8 +47,15 @@ SSH_VALUE_OPTS = set("bcDEeFIiJLlmOopQRSWw")
 PKILL_VALUE_OPTS = set("gGPstuUFqdOr")
 PKILL_LONG_VALUE = {"signal", "group", "terminal", "euid", "uid", "pidfile", "ns", "nslist", "queue", "delimiter",
                     "older", "runstates", "env", "cgroup"}
-PKILL_LONG_FLAGS = {"count", "list-name", "list-full", "inverse", "lightweight", "full", "ignore-case", "newest",
-                    "oldest", "exact", "logpidfile", "require-handler", "ignore-ancestors", "echo", "help", "version"}
+# Signal names any procps or libc may accept after `-` (pkill scans all of argv for -<number> or -<name>),
+# a superset on purpose: an extra name only refuses more, a missing one would let a real signal through.
+SIGNAL_NAMES = {"ABRT", "ALRM", "BUS", "CHLD", "CLD", "CONT", "EMT", "EXIT", "FPE", "HUP", "ILL", "INFO", "INT", "IO",
+                "IOT", "KILL", "LOST", "PIPE", "POLL", "PROF", "PWR", "QUIT", "SEGV", "STKFLT", "STOP", "SYS", "TERM",
+                "TRAP", "TSTP", "TTIN", "TTOU", "UNUSED", "URG", "USR1", "USR2", "VTALRM", "WINCH", "XCPU", "XFSZ",
+                *(s.name[3:] for s in signal.Signals if s.name.startswith("SIG"))}
+SIGNAL_TOKEN_RE = re.compile(r"-(?:\d.*|(?:SIG)?(?:%s|RTM(?:IN|AX)(?:[+-]\d+)?))" % "|".join(sorted(SIGNAL_NAMES)),
+                             re.I)
+SIGNAL_ZERO_RE = re.compile(r"(?:SIG)?0+", re.I)
 OWN_WORDS = {"$!", "${!}", "$$", "${$}", "$BASHPID", "${BASHPID}"}
 SUB = "__ttpsub{}__"
 SUB_RE = re.compile(r"__ttpsub(\d+)__")
@@ -299,7 +307,7 @@ class _Guard:
         scope, i = [], 0
         if args and re.fullmatch(r"-(?:\d+|(?:SIG)?[A-Z]{3}[A-Z0-9+-]*)", args[0]):   # -9, -TERM: a signal
             i = 1
-            if re.fullmatch(r"-(?:SIG)?0+", args[0], re.I) and re.fullmatch(r"(?:SIG)?0+", self._pkill_signal(args), re.I):
+            if re.fullmatch(r"-(?:SIG)?0+", args[0], re.I) and self._pkill_signal_zero(args):
                 return   # signal 0 sends nothing: a liveness probe
         while i < len(args):
             a = args[i]
@@ -335,28 +343,26 @@ class _Guard:
                         raise Refused(f"{name} -{opt} {self._show(v)}: {n} is not this task's own process, group or session")
 
     @staticmethod
-    def _pkill_signal(args: list[str]) -> str:
-        """The signal pkill sends: getopt reads a --signal anywhere before `--` after the leading -<sig>, and the
-        last one wins (`pkill -0 --signal KILL x` sends 9); --si, --sig... abbreviate it. An option that takes a
-        value takes the next word even when it is `--` (`pkill -0 -q -- --signal 9 x` sends 9), as getopt does."""
-        longs = {"parent", "pgroup", "session", *PKILL_LONG_VALUE}
-        sig, k = args[0][1:], 1
-        while k < len(args) and args[k] != "--":
-            a, takes = args[k], False
-            if a.startswith("--"):
-                opt, eq, value = a[2:].partition("=")
-                hits = [opt] if opt in longs | PKILL_LONG_FLAGS else [o for o in longs | PKILL_LONG_FLAGS
-                                                                       if opt and o.startswith(opt)]
-                takes = len(hits) == 1 and hits[0] in longs and not eq
-                if hits == ["signal"]:
-                    sig = args[k + 1] if takes and k + 1 < len(args) else value
-            elif a.startswith("-") and len(a) > 1:
-                for j, ch in enumerate(a[1:], 2):
-                    if ch in PKILL_VALUE_OPTS:
-                        takes = not a[j:]
-                        break
-            k += 2 if takes else 1
-        return sig
+    def _pkill_signal_zero(args: list[str]) -> bool:
+        """Whether pkill surely sends signal 0. Its options are not parsed: which word an option takes as its value
+        differs between procps versions (`--r` is --runstates in one and ambiguous in another, and a value can be
+        `--`), so every word counts, before and after `--`. Signal words are -<number> or -<name> (with or without
+        SIG, any case: pkill takes the first one anywhere in argv) and --s, --si ... --signal with its value after
+        `=` or in the next word. All of them must mean 0; a --signal with no value does not.
+        Accepted false refusals (probe with pgrep instead): `pkill -0 -- --signal`, and a pattern or option
+        cluster that looks like a signal word (`pkill -0 -- -HUP`, `pkill -0 -io x`)."""
+        for k, a in enumerate(args):
+            head, eq, value = a.partition("=")
+            if len(head) >= 3 and "--signal".startswith(head):
+                if not eq:
+                    if k + 1 >= len(args):
+                        return False
+                    value = args[k + 1]
+                if not SIGNAL_ZERO_RE.fullmatch(value):
+                    return False
+            elif SIGNAL_TOKEN_RE.fullmatch(a) and not SIGNAL_ZERO_RE.fullmatch(a[1:]):
+                return False
+        return True
 
     def _kill(self, args: list[str], remote: bool, stdin: bool) -> None:
         if args[:1] and re.fullmatch(r"-[lL]|--list(?:=.*)?|--table", args[0]):
