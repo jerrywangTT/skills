@@ -50,14 +50,16 @@ NEEDS_END = ("a resource pause needs an end: `until` (a delay such as 2d or an I
              "ahead) or `end_when` (a read-only shell probe)")
 
 
-def from_action(a: dict, now: float | None = None, p: Project | None = None, by: str = "") -> dict:
+def from_action(a: dict, now: float | None = None, p: Project | None = None, by: str = "", where=None) -> dict:
     """Validate `until`, an `end_when` shell probe and `report_from`. With `p`, a pause of a resource
     with an enabled heal check gets its health end: a pause `by` the coordinator unless it names a
-    probe (its `until` stays the reported deadline), any other only when it names no end."""
+    probe (its `until` stays the reported deadline), any other only when it names no end. A zone-less
+    `until` is read in the home zone of `where` (else `p`; ends.parse_expires)."""
     now = time.time() if now is None else now
     out: dict = {}
     if a.get("until"):
-        out["until"] = ends.parse_expires(a["until"], now, what="until", max_s=MAX_UNTIL_S)
+        out["until"] = ends.parse_expires(a["until"], now, what="until", max_s=MAX_UNTIL_S,
+                                          where=where if where is not None else p)
     probe = a.get("end_when")
     if probe is not None and not isinstance(probe, str):
         raise ValueError("end_when must be one shell command; a health end is never written by hand: a coordinator "

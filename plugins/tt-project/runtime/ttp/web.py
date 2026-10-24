@@ -822,7 +822,7 @@ class Handler(BaseHTTPRequestHandler):
                     try:
                         pause_resource(p, str(body["resource"]), bool(body.get("paused")),
                                        reason=str(body.get("reason") or ""), by="user", db=db,
-                                       end=from_action(body) if body.get("paused") else None)
+                                       end=from_action(body, where=p) if body.get("paused") else None)
                     except ValueError as e:
                         return self._send(400, {"error": str(e)})
                     return self._send(200, {"ok": True})

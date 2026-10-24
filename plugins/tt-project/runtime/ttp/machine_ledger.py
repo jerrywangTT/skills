@@ -182,7 +182,7 @@ def _one_line(text: Any, chars: int = TEXT_CHARS) -> str:
 def add_change(alias: str, what: str, undo: str, by: str, expires: Any = None, until_probe: str | None = None,
                task: int | None = None, now: float | None = None, expects=None, extra: dict | None = None,
                until_task: int | None = None, queue: Path | None = None, test: bool = False,
-               since: float | None = None) -> dict:
+               since: float | None = None, where=None) -> dict:
     """Record a live change to machine `alias` made by project `by`; returns the entry. `queue`: the project's
     state dir, where the change is queued for its daemon when the shared ledger is read-only here (returns
     the request then, with `queued`: its id; see Queued requests). `expects`: the
@@ -191,7 +191,8 @@ def add_change(alias: str, what: str, undo: str, by: str, expires: Any = None, u
     `until_task`: a task of project `by` whose end (done, failed, cancelled, gone) makes it overdue
     (check_task validates it). `test`: the change is made for a test, so `ttp ttr` labels this project's
     incidents on `alias` that start while it is open as tests (ttr.test_windows). `since`: an epoch time the
-    change started before it was recorded (parse_since): its window starts there."""
+    change started before it was recorded (parse_since): its window starts there. `where`: the zone a
+    zone-less --expires is read in (ends.parse_expires)."""
     now = time.time() if now is None else now
     if since is not None and not now - SINCE_MAX_S <= float(since) <= now:
         raise ValueError(f"--since must lie within the last {SINCE_MAX_S / 86400:g} days, not in the future")
@@ -207,7 +208,7 @@ def add_change(alias: str, what: str, undo: str, by: str, expires: Any = None, u
     if probe:
         ends.check_sh(probe, "--until-probe")
     end = float(expires) if isinstance(expires, (int, float)) else \
-        ends.parse_expires(expires, now) if expires else now + PROBE_END_S   # a number: an epoch time
+        ends.parse_expires(expires, now, where=where) if expires else now + PROBE_END_S   # a number: an epoch time
     fields = {"alias": alias, "what": what, "undo": undo, "by": by, "task": task, "added": now, "expires": end,
               "probe": probe or None, **({"until_task": int(until_task)} if until_task else {}),
               **({"test": True} if test else {}), **({"since": float(since)} if since is not None else {}),
@@ -239,8 +240,7 @@ def parse_since(raw: str, now: float | None = None, where=None) -> float:
             raise ValueError(f"--since {raw!r}: use a delay back such as 2h, or an ISO time such as "
                              f"2026-10-05T09:00") from None
         from . import timefmt
-        zone = timefmt.tzinfo(where if where is not None else timefmt.ambient())
-        at = (d if d.tzinfo else d.replace(tzinfo=zone)).timestamp()
+        at = (d if d.tzinfo else d.replace(tzinfo=timefmt.reading_zone(where))).timestamp()
     if at > now:
         raise ValueError(f"--since {raw!r} is in the future: a change's start can only be backdated")
     if at < now - SINCE_MAX_S:
@@ -268,15 +268,16 @@ def _store_change(fields: dict, request: str | None = None) -> dict:
 
 
 def add_power_cycle(alias: str, at: Any, by: str, why: str = "", task: int | None = None,
-                    now: float | None = None, extra: dict | None = None, queue: Path | None = None) -> dict:
-    """Record a planned power cycle of `alias` at `at` (a delay or a time, as --expires takes).
+                    now: float | None = None, extra: dict | None = None, queue: Path | None = None,
+                    where=None) -> dict:
+    """Record a planned power cycle of `alias` at `at` (a delay or a time, as --expires takes, read in `where`'s zone).
     `extra`: more fields (`ttp drain --reboot` adds the boot it was made on and its reason)."""
     now = time.time() if now is None else now
-    when = ends.parse_expires(at, now, what="--power-cycle-at")
-    what = f"power-cycle intent, at {ends.shown(when)}" + (f": {_one_line(why)}" if _one_line(why) else "")
+    when = ends.parse_expires(at, now, what="--power-cycle-at", where=where)
+    what = f"power-cycle intent, at {ends.shown(when, where)}" + (f": {_one_line(why)}" if _one_line(why) else "")
     return add_change(alias, what, "none: a planned power cycle; the entry closes itself after it", by,
                       expires=when + POWER_CYCLE_AFTER_S, task=task, now=now, expects=["down"],
-                      extra={**(extra or {}), "kind": POWER_CYCLE, "at": when}, queue=queue)
+                      extra={**(extra or {}), "kind": POWER_CYCLE, "at": when}, queue=queue, where=where)
 
 
 def cycle_window(c: dict) -> tuple[float, float]:
@@ -539,14 +540,15 @@ def _set_test(cid: int, by: str, test: bool, now: float) -> dict:
 
 
 def edit_change(cid: int, by: str, what: str | None = None, undo: str | None = None, expires: Any = None,
-                until_probe: str | None = None, now: float | None = None, until_task: int | None = None) -> dict:
+                until_probe: str | None = None, now: float | None = None, until_task: int | None = None,
+                where=None) -> dict:
     """Correct open entry #cid in place: its text, undo command or end (--expires, --until-probe or
     --until-task, as add_change takes them, an --until-probe with an --expires too; the same until-task again
     restarts its PROBE_END_S, so a continuation task re-extends the entry, and the same until-probe again keeps
     its end but is judged afresh). Keeps its id, alias, author and creation time; records who edited it, when
     and the values it replaced in `edits`. A new end starts afresh (`page_from`): its until-probe result and overdue
     pages are dropped. Refuses a closed or unknown id, a power-cycle intent's undo or end, and an edit
-    that changes nothing."""
+    that changes nothing. `where`: the zone a zone-less --expires is read in (ends.parse_expires)."""
     now = time.time() if now is None else now
     if sum(map(bool, (expires, until_probe, until_task))) > 1 and not (expires and until_probe and not until_task):
         raise ValueError("give one end: --expires, --until-probe (with or without --expires) or --until-task")
@@ -563,12 +565,12 @@ def edit_change(cid: int, by: str, what: str | None = None, undo: str | None = N
             raise ValueError("the --until-probe command cannot be empty")
         ends.check_sh(probe, "--until-probe")
         new.update(probe=probe, until_task=None, expires=now + PROBE_END_S if not expires else
-                   float(expires) if isinstance(expires, (int, float)) else ends.parse_expires(expires, now))
+                   float(expires) if isinstance(expires, (int, float)) else ends.parse_expires(expires, now, where=where))
     elif until_task:
         new.update(probe=None, until_task=int(until_task), expires=now + PROBE_END_S)
     elif expires:
         new.update(probe=None, until_task=None, expires=float(expires) if isinstance(expires, (int, float))
-                   else ends.parse_expires(expires, now))
+                   else ends.parse_expires(expires, now, where=where))
     if not new:
         raise ValueError("say what to change: --what, --undo, --expires, --until-probe or --until-task")
     with _locked():
@@ -705,12 +707,13 @@ def conditions() -> dict[str, dict]:
 # known outages ------------------------------------------------------------------------------------
 
 def set_outage(alias: str, why: str, by: str, expires: Any, owner: str = "", now: float | None = None,
-               covers: Any = None) -> dict:
+               covers: Any = None, where=None) -> dict:
     """Record that `alias` is out for a known reason (a hardware repair) until `expires`: nobody is paged
     about it meanwhile. `by`: the project recording it; each project keeps its own entry per machine (module
     doc: Known outages), so this replaces only `by`'s. `owner`: who has the repair, often a human or an
     external ticket. `covers`: the parts it explains (OUTAGE_COVERS, or a service by name), stored for
-    co-tenant watchers and heal checks; none: the whole machine. Returns the entry."""
+    co-tenant watchers and heal checks; none: the whole machine. `where`: the zone a zone-less `expires` is
+    read in (ends.parse_expires). Returns the entry."""
     now = time.time() if now is None else now
     if alias not in machines.load():
         raise ValueError(f"no machine {alias!r} in `ttp machines list`")
@@ -722,7 +725,7 @@ def set_outage(alias: str, why: str, by: str, expires: Any, owner: str = "", now
     parts = outage_covers(covers)
     by = _one_line(by, 120) or "user"
     rec = {"why": why, "owner": _one_line(owner, 120), "by": by, "since": now,
-           "until": ends.parse_expires(expires, now)}
+           "until": ends.parse_expires(expires, now, where=where)}
     if parts:
         rec["covers"] = parts
     with _locked():

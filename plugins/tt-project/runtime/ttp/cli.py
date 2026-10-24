@@ -5450,7 +5450,7 @@ def cmd_machines(a) -> None:
                                                             a.shared)) or a.unshared:
                 entry = mm.add(a.alias, a.tags, a.note,
                                ... if a.min_free_gb is None else a.min_free_gb, a.hostname,
-                               False if a.unshared else a.shared, a.until)
+                               False if a.unshared else a.shared, a.until, where=here())
             if recovery:   # only an owner or fallback: the machine must be known already
                 entry = mm.set_recovery(a.alias.strip(), a.owner, a.fallback)
         except ValueError as e:
@@ -5534,7 +5534,7 @@ def _machine_outage(a) -> None:
         if ml.clear_outage(a.alias, by):
             left = ml.outages().get(a.alias)
             print(f"{a.alias}: {by}'s known outage cleared"
-                  + (f"; still out: {ml.outage_line(a.alias, left)}" if left else ""))
+                  + (f"; still out: {ml.outage_line(a.alias, left, p)}" if left else ""))
             return
         others = sorted((ml.outage_entries().get(a.alias) or {}))
         print(f"{a.alias}: no known outage from {by}"
@@ -5547,15 +5547,15 @@ def _machine_outage(a) -> None:
             return
         for alias, o in sorted(got.items()):
             if not a.alias or alias == a.alias:
-                print(ml.outage_line(alias, o))
+                print(ml.outage_line(alias, o, p))
         if not got:
             print("no known outages")
         return
     try:
-        rec = ml.set_outage(a.alias, a.why, by, a.expires, owner=a.owner or "", covers=a.covers)
+        rec = ml.set_outage(a.alias, a.why, by, a.expires, owner=a.owner or "", covers=a.covers, where=p)
     except ValueError as e:
         die(str(e))
-    print(ml.outage_line(a.alias, ml.outages().get(a.alias) or rec))
+    print(ml.outage_line(a.alias, ml.outages().get(a.alias) or rec, p))
 
 
 def _machine_change(a) -> None:
@@ -5568,10 +5568,10 @@ def _machine_change(a) -> None:
             return
         if not got:
             print("no open machine changes")
-        for c in got:
-            print(ml.change_line(c) + (f" (closed {ml.ends.shown(c['closed'])}: {c.get('closed_why')})"
-                                       if c.get("closed") else ""))
         p = here()
+        for c in got:
+            print(ml.change_line(c, where=p) + (f" (closed {ml.ends.shown(c['closed'], p)}: {c.get('closed_why')})"
+                                                if c.get("closed") else ""))
         for r in ml.pending(p.state) if p else []:
             print(f"queued for this project's daemon (request {r['queued']}): {r['op']} "
                   + (f"#{r['fields'].get('id')}" if r["op"] == "close" else
@@ -5603,7 +5603,8 @@ def _machine_change(a) -> None:
             if a.until_task:
                 c = next((c for c in ml.changes() if c.get("id") == a.id), None)
                 _until_task_ok(p, c.get("by") if c else by, a.until_task)
-            c = ml.edit_change(a.id, by or "user", a.what, a.undo, a.expires, a.until_probe, until_task=a.until_task)
+            c = ml.edit_change(a.id, by or "user", a.what, a.undo, a.expires, a.until_probe, until_task=a.until_task,
+                               where=p)
         except ValueError as e:
             die(str(e))
         except OSError as e:
@@ -5613,7 +5614,7 @@ def _machine_change(a) -> None:
                 f"--no-test) is not queued: "
                 f"`ttp machines change close {a.id}` and `ttp machines change add` a new entry (both are queued "
                 f"for this project's daemon)")
-        print(f"edited {ml.change_line(c)}")
+        print(f"edited {ml.change_line(c, where=p)}")
         return
     if not by:
         die("run it inside a project, or say whose change it is: --by <project>")
@@ -5634,18 +5635,22 @@ def _machine_change(a) -> None:
         if a.until_task:
             _until_task_ok(p, by, a.until_task)
         c = ml.add_power_cycle(a.alias, a.power_cycle_at, by, a.what, tid, queue=queue,
-                                extra={"test": True} if a.test else None) if a.power_cycle_at else \
+                                extra={"test": True} if a.test else None, where=p) if a.power_cycle_at else \
             ml.add_change(a.alias, a.what, a.undo, by, a.expires, a.until_probe, tid, expects=a.expect,
-                          until_task=a.until_task, queue=queue, test=a.test, since=since)
+                          until_task=a.until_task, queue=queue, test=a.test, since=since, where=p)
     except ValueError as e:
         die(str(e))
-    print(_queued_line(c) if c.get("queued") else f"recorded {ml.change_line(c)}")
+    print(_queued_line(c, p) if c.get("queued") else f"recorded {ml.change_line(c, where=p)}")
 
 
-def _queued_line(req: dict) -> str:
-    """What `ttp machines change add|close` says when it queued the request (machine_ledger: Queued requests)."""
+def _queued_line(req: dict, where=None) -> str:
+    """What `ttp machines change add|close` says when it queued the request (machine_ledger: Queued requests);
+    an added change's end is shown in the zone of `where`."""
+    from . import ends
+    end = req["fields"].get("expires")
     what = f"close of machine change #{req['fields']['id']}" if req["op"] == "close" else \
-        f"machine change on {req['fields']['alias']}: {req['fields']['what']}"
+        f"machine change on {req['fields']['alias']}: {req['fields']['what']}" \
+        + (f" (ends {ends.shown(float(end), where)} at the latest)" if isinstance(end, (int, float)) else "")
     return (f"queued {what} (request {req['queued']}): the shared machine ledger is read-only here, so this "
             f"project's daemon records it on its next tick, within a few minutes while it runs; "
             f"`ttp machines change list` shows it. Running the command again adds nothing.")
@@ -5686,7 +5691,8 @@ def cmd_pause(a) -> None:
         from .project import in_run
         try:
             from . import pauseends
-            end = pauseends.from_action({"until": a.until, "end_when": a.end_when, "report_from": a.report_from}) \
+            end = pauseends.from_action({"until": a.until, "end_when": a.end_when, "report_from": a.report_from},
+                                        where=p) \
                 if a.cmd == "pause" else None
             # Only the user's own command outside a run sets or lifts a hold as theirs.
             print(f"{p.name}: " + pause_machine(p, a.machine, a.cmd == "pause", reason=getattr(a, "reason", None) or "",
@@ -5698,7 +5704,8 @@ def cmd_pause(a) -> None:
         from .coordinator import pause_resource
         try:
             from . import pauseends
-            end = pauseends.from_action({"until": a.until, "end_when": a.end_when, "report_from": a.report_from}) \
+            end = pauseends.from_action({"until": a.until, "end_when": a.end_when, "report_from": a.report_from},
+                                        where=p) \
                 if a.cmd == "pause" else None
             print(f"{p.name}: " + pause_resource(p, a.resource, a.cmd == "pause", reason=getattr(a, "reason", None) or "",
                                                  by=_pause_by(p), end=end))
@@ -8093,7 +8100,8 @@ def main(argv: list[str] | None = None) -> None:
     m.add_argument("alias", help="a short name, also used as the resource name in tasks (e.g. box-a)")
     m.add_argument("--tags", help="what it offers, comma-separated (e.g. device,x86)")
     m.add_argument("--note", help="one line for the coordinator (no secrets)")
-    m.add_argument("--until", help="when the note stops being true (a delay such as 3d, or an ISO time); past "
+    m.add_argument("--until", help="when the note stops being true (a delay such as 3d, or an ISO time, home zone "
+                                   "unless it names one); past "
                                    "it the coordinator sees it as stale (\"\" = no end)")
     m.add_argument("--min-free-gb", dest="min_free_gb",
                    help="disk guard threshold on this machine's filesystem, overriding the projects' "
@@ -8127,7 +8135,8 @@ def main(argv: list[str] | None = None) -> None:
     m.add_argument("alias", nargs="?", help="the machine (none: list the known outages)")
     m.add_argument("why", nargs="?", help="why it is out, one line (none: show it)")
     m.add_argument("--owner", help="who has the repair: a person's role or a ticket, not a project")
-    m.add_argument("--expires", help="when it ends: a delay (3d) or a time (required to record one)")
+    m.add_argument("--expires", help="when it ends: a delay (3d) or an ISO time, home zone unless it names one "
+                                     "(required to record one)")
     m.add_argument("--by", help="the project recording or clearing it (default: the project you are in); "
                                 "each project keeps its own entry per machine")
     m.add_argument("--covers", action="append",
@@ -8146,7 +8155,8 @@ def main(argv: list[str] | None = None) -> None:
     c.add_argument("alias", help="the machine")
     c.add_argument("what", help="what changed and why, one line")
     c.add_argument("--undo", help="the command that undoes it (required, except for --power-cycle-at)")
-    c.add_argument("--expires", help="when it ends: a delay (6h, 3d) or a time; with --until-probe, at the latest")
+    c.add_argument("--expires", help="when it ends: a delay (6h, 3d) or an ISO time (home zone unless it names one, "
+                                     "e.g. 2026-10-26T15:30 or 2026-10-26T15:30-07:00); with --until-probe, at the latest")
     end = c.add_mutually_exclusive_group()
     end.add_argument("--until-probe", dest="until_probe",
                      help="a command that exits 0 once the change should be undone (checked every 10 min)")
@@ -8155,7 +8165,8 @@ def main(argv: list[str] | None = None) -> None:
                           "while this task of the project is open: it ends once that task is done, failed "
                           "or cancelled, at the latest after 7 days")
     end.add_argument("--power-cycle-at", dest="power_cycle_at", metavar="T",
-                     help="a planned power cycle at T (a delay or a time): running workers on the machine are "
+                     help="a planned power cycle at T (a delay, or an ISO time in the home zone unless it "
+                          "names one): running workers on the machine are "
                           "told to commit and hand off shortly before; the entry closes itself after")
     c.add_argument("--by", help="the project that owns the change (default: the project you are in)")
     c.add_argument("--expect", action="append", metavar="FINGERPRINT|CONDITION",
@@ -8180,7 +8191,8 @@ def main(argv: list[str] | None = None) -> None:
     c.add_argument("id", type=int, help="the change's id, as `ttp machines change list` shows it")
     c.add_argument("--what", help="the new text: what changed and why, one line")
     c.add_argument("--undo", help="the new command that undoes it")
-    c.add_argument("--expires", help="a new end: a delay (6h, 3d) or a time; with --until-probe, at the latest")
+    c.add_argument("--expires", help="a new end: a delay (6h, 3d) or an ISO time (home zone unless it names "
+                                     "one); with --until-probe, at the latest")
     end = c.add_mutually_exclusive_group()
     end.add_argument("--until-probe", dest="until_probe",
                      help="a new end: a command that exits 0 once the change should be undone; the same "
@@ -8211,7 +8223,8 @@ def main(argv: list[str] | None = None) -> None:
         if name == "pause":
             s.add_argument("--reason", help="why, shown to workers, the coordinator and in status; required "
                                             "for a project pause from a run")
-            s.add_argument("--until", help="with --resource: when it should end, a delay (2d) or an ISO time, at "
+            s.add_argument("--until", help="with --resource: when it should end, a delay (2d) or an ISO time (home "
+                                           "zone unless it names one), at "
                                            "most 7 days ahead; this or --end-when is required")
             s.add_argument("--end-when", dest="end_when", metavar="PROBE",
                            help="with --resource: a read-only shell probe that exits 0 once the pause can end")

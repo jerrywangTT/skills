@@ -88,9 +88,11 @@ def parse_time(raw: str) -> float | None:
 
 
 def parse_expires(raw: Any, now: float | None = None, what: str = "expires",
-                  max_s: float = MAX_EXPIRES_S) -> float:
-    """`expires` (or `what`) from an action: a delay (`6h`, `3d`) from now, or an ISO date or time
-    (local unless it names a zone). Must lie ahead, within `max_s` (a year)."""
+                  max_s: float = MAX_EXPIRES_S, where=None) -> float:
+    """`expires` (or `what`) from an action: a delay (`6h`, `3d`) from now, or an ISO date or time. A time
+    with an offset or Z keeps it; one without (a date alone is its midnight) is read in the home zone of
+    `where` (a Project, settings or zone name; see timefmt.reading_zone), never UTC by default. Must lie
+    ahead, within `max_s` (a year)."""
     now = time.time() if now is None else now
     s = str(raw).strip() if isinstance(raw, str) else ""
     m = re.fullmatch(r"([0-9]+) ?([smhdw])", s)
@@ -99,9 +101,10 @@ def parse_expires(raw: Any, now: float | None = None, what: str = "expires",
     else:
         iso = re.sub(r"([+-][0-9]{2})([0-9]{2})$", r"\1:\2", s.replace(" ", "T", 1).replace("Z", "+00:00"))
         try:
-            at = datetime.fromisoformat(iso).timestamp() if s else None
+            d = datetime.fromisoformat(iso) if s else None
         except ValueError:
-            at = None
+            d = None
+        at = (d if d.tzinfo else d.replace(tzinfo=timefmt.reading_zone(where))).timestamp() if d else None
         if at is None:
             raise ValueError(f"{what} {raw!r}: use a delay such as 12h or 3d, or an ISO date or time such as "
                              f"2026-10-05T09:00")
@@ -113,11 +116,12 @@ def parse_expires(raw: Any, now: float | None = None, what: str = "expires",
     return at
 
 
-def from_action(a: dict, now: float | None = None) -> dict:
-    """The end an action sets: {"expires": ts, "until": text, "probe": command}, only those given."""
+def from_action(a: dict, now: float | None = None, where=None) -> dict:
+    """The end an action sets: {"expires": ts, "until": text, "probe": command}, only those given. A zone-less
+    `expires` is read in the home zone of `where` (parse_expires)."""
     out: dict = {}
     if a.get("expires"):
-        out["expires"] = parse_expires(a["expires"], now)
+        out["expires"] = parse_expires(a["expires"], now, where=where)
     until = " ".join(str(a.get("until") or "").split())
     if until:
         if len(until) > UNTIL_CHARS:

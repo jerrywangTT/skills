@@ -323,3 +323,95 @@ def test_a_single_outage_record_from_an_older_runtime_migrates_without_loss(env)
         doc["outages"].pop("box-a")
         ml._write(ml.ROUTES, doc)
     assert "box-a" not in ml.outages(t0 + 180) and "box-b" in ml.outages(t0 + 180)
+
+
+def test_zoneless_expires_is_read_in_the_home_zone_never_utc():
+    """[note 1de9156a8106e61e] A zone-less --expires (date and time, or a date alone) is read in the home zone, in
+    winter (PST) and summer (PDT); one with Z or an offset keeps it; a delay is unchanged."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    from ttp import ends
+    la, now = "America/Los_Angeles", 1_790_000_000.0   # 2026-09: both dates below lie ahead, within a year
+    utc = lambda s: datetime.fromisoformat(s).timestamp()
+    assert ends.parse_expires("2027-01-15T09:00", now, where=la) == utc("2027-01-15T17:00+00:00")   # PST
+    assert ends.parse_expires("2027-07-15 09:00", now, where=la) == utc("2027-07-15T16:00+00:00")   # PDT
+    assert ends.parse_expires("2027-07-15", now, where=la) == utc("2027-07-15T07:00+00:00")
+    assert ends.parse_expires("2027-07-15T09:00Z", now, where=la) == utc("2027-07-15T09:00+00:00")
+    assert ends.parse_expires("2027-07-15T09:00-07:00", now, where=la) == utc("2027-07-15T16:00+00:00")
+    assert ends.parse_expires("2027-07-15T09:00+0200", now, where=la) == utc("2027-07-15T07:00+00:00")
+    assert ends.parse_expires("3h", now, where=la) == now + 3 * 3600
+    assert ends.parse_expires("2d", now, where=la) == now + 2 * 86400
+    assert ends.parse_expires("2027-01-15T09:00", now, where=ZoneInfo(la)) == utc("2027-01-15T17:00+00:00")
+    assert ends.from_action({"expires": "2027-01-15T09:00"}, now, where=la)["expires"] == utc("2027-01-15T17:00+00:00")
+
+
+def _ahead_at(days: int, zone: str, hm=(15, 30)):
+    """A wall time `days` ahead in `zone`: (its zone-less ISO form, its epoch time, its abbreviation)."""
+    from datetime import datetime, timedelta
+    from zoneinfo import ZoneInfo
+    d = (datetime.now(ZoneInfo(zone)) + timedelta(days=days)).replace(hour=hm[0], minute=hm[1], second=0, microsecond=0)
+    return d.strftime("%Y-%m-%dT%H:%M"), d.timestamp(), d.strftime("%Z")
+
+
+def test_machines_change_and_outage_read_zoneless_expires_in_the_project_home_zone(env, monkeypatch, capsys):
+    """[note 1de9156a8106e61e] On a host whose own zone is UTC, a project worker's zone-less `--expires` for
+    `machines change add|edit`, `--power-cycle-at` and `machines outage` is read in the project's home zone, and
+    the confirmation and `change list` show it there with its abbreviation."""
+    from datetime import datetime
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    from ttp import timefmt
+    from ttp.cli import main
+    la = "America/Los_Angeles"
+    p = make(env, "alpha")
+    p.set_config(timefmt.KEY, la)
+    mm.add("box-a", tags="device")
+    monkeypatch.setenv("TTP_PROJECT", str(p.base))
+    monkeypatch.chdir(p.root)
+    iso, at, abbr = _ahead_at(5, la)
+    main(["machines", "change", "add", "box-a", "a drop-in", "--undo", "true", "--expires", iso])
+    out = capsys.readouterr().out
+    c = ml.changes()[-1]
+    assert c["expires"] == at and f"ends {iso[:10]} 15:30 {abbr}" in out
+    main(["machines", "change", "list"])
+    assert f"15:30 {abbr}" in capsys.readouterr().out
+    iso2, at2, abbr2 = _ahead_at(6, la, (8, 0))
+    main(["machines", "change", "edit", str(c["id"]), "--expires", iso2])
+    assert ml.changes()[-1]["expires"] == at2 and f"08:00 {abbr2}" in capsys.readouterr().out
+    main(["machines", "change", "edit", str(c["id"]), "--expires", iso2 + "Z"])
+    capsys.readouterr()
+    assert ml.changes()[-1]["expires"] == datetime.fromisoformat(iso2 + "+00:00").timestamp()
+    iso3, at3, abbr3 = _ahead_at(2, la, (10, 0))
+    main(["machines", "change", "add", "box-a", "fan swap", "--power-cycle-at", iso3])
+    capsys.readouterr()
+    assert ml.changes()[-1]["at"] == at3 and f"10:00 {abbr3}" in ml.changes()[-1]["what"]
+    main(["machines", "outage", "box-a", "tray swap", "--expires", iso])
+    out = capsys.readouterr().out
+    assert ml.outage_entries()["box-a"]["alpha"]["until"] == at and f"15:30 {abbr}" in out
+    main(["machines", "outage", "box-a", "tray swap", "--expires", iso[:10] + "T15:30-07:00"])
+    capsys.readouterr()
+    assert ml.outage_entries()["box-a"]["alpha"]["until"] == datetime.fromisoformat(iso[:10] + "T15:30-07:00").timestamp()
+
+
+def test_zoneless_expires_with_no_project_uses_the_account_zone_else_the_machines_never_utc(env, monkeypatch,
+                                                                                           tmp_path, capsys):
+    """[note 1de9156a8106e61e] Run outside any project, a zone-less time is read in the account's budget.timezone,
+    else this machine's zone; never UTC by default."""
+    import json as _json
+    from ttp import ends
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    from ttp.cli import main
+    from ttp.project import account_settings_path
+    mm.add("box-a", tags="device")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("TTP_TEST_LOCAL_TZ", "Asia/Tokyo")
+    iso, at, abbr = _ahead_at(5, "Asia/Tokyo")
+    assert ends.parse_expires(iso) == at
+    main(["machines", "outage", "box-a", "tray swap", "--expires", iso, "--by", "alpha"])
+    assert ml.outage_entries()["box-a"]["alpha"]["until"] == at and f"15:30 {abbr}" in capsys.readouterr().out
+    account_settings_path().parent.mkdir(parents=True, exist_ok=True)
+    account_settings_path().write_text(_json.dumps({"budget": {"timezone": "Europe/Berlin"}}))
+    iso, at, _ = _ahead_at(5, "Europe/Berlin")
+    main(["machines", "change", "add", "box-a", "a drop-in", "--undo", "true", "--expires", iso, "--by", "alpha"])
+    assert ml.changes()[-1]["expires"] == at

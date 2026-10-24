@@ -2093,7 +2093,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     text = f"{text.rstrip()} {RELAYED_MARK}: {relayed}]"
                     notes.append(f"memory_add: marked in the entry as relayer context ({relayed})")
                 added = p.add_memory(text, kind=a.get("memory_kind") or "fact", title=a.get("title"), key=key,
-                                     end=ends.from_action(a), standing=a.get("standing") is True,
+                                     end=ends.from_action(a, where=p), standing=a.get("standing") is True,
                                      audience=a.get("audience"))
                 if (a.get("memory_kind") or "") == "restriction":
                     _tell_running_workers(db, f"New binding restriction: {a['text'].strip()}", key)
@@ -2126,7 +2126,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                                      + (f". {words}" if words else ""))
                 if not forbidden.is_section(section):   # that section holds the patterns themselves
                     forbidden.check(p, "charter_update", text, str(a.get("over") or ""))
-                end = ends.from_action(a)
+                end = ends.from_action(a, where=p)
                 if end and (quote or not text):
                     raise ValueError("charter_update: an end (`expires`, `until`, `until_probe`) goes with new `text`, "
                                      "not with `quote`")
@@ -2345,7 +2345,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     pause_machine(p, str(a["machine"]).strip(), a["paused"], reason=a.get("reason") or a.get("text") or "",
                                   by="user" if mine else "coordinator",
                                   users_word=user_turn and bool(_users_own(db, messages or [])),
-                                  end=pauseends.from_action(a) if a["paused"] else None, key=key,
+                                  end=pauseends.from_action(a, where=p) if a["paused"] else None, key=key,
                                   user_msg=_users_own(db, messages or [])[-1] if mine else None)
                     continue
                 name = str(a.get("resource") or "").strip()

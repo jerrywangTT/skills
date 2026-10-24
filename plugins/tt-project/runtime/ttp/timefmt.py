@@ -167,6 +167,22 @@ def ambient() -> str:
         return "UTC"
 
 
+def reading_zone(where=None) -> ZoneInfo:
+    """The zone a zone-less time the user typed (`--expires 2026-10-26T15:30`) is read in: the home zone of
+    `where` (a zone name, ZoneInfo, Project or settings) when it has one, else ambient() (the home zone of
+    the project in TTP_PROJECT, else the account's budget.timezone, else this machine's), never UTC by
+    default."""
+    if isinstance(where, ZoneInfo):
+        return where
+    name = None
+    try:
+        name = valid(where) if isinstance(where, str) else valid(where.get(KEY)) if isinstance(where, dict) \
+            else valid(where.raw_config().get(KEY)) if where is not None else None
+    except Exception:
+        name = None
+    return ZoneInfo(name or ambient())
+
+
 def abbrev(where, ts: float | None = None) -> str:
     """The zone's abbreviation at `ts` (now by default): 'UTC', or the zone's own ('<zone>')."""
     return datetime.fromtimestamp(ts if ts is not None else time.time(), _tz(where)).strftime("%Z")

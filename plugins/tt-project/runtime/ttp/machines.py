@@ -116,13 +116,13 @@ def tag_names(v: Any) -> list[str]:
 
 
 def add(alias: str, tags: Any = None, note: str | None = None, min_free_gb: Any = ...,
-        hostname: str | None = None, shared: Any = None, until: str | None = None) -> dict:
+        hostname: str | None = None, shared: Any = None, until: str | None = None, where=None) -> dict:
     """Add a machine, or update its tags, note, disk threshold or host name (one left out keeps the
     old value; a threshold or host name of "" removes it). `shared` names the resources on it that
     all of the user's projects share (shared.py): a list or "a,b"; "" the alias itself; False none.
     Left out, it keeps the old ones. `until` (a delay such as 3d or an ISO time) is when the note
-    stops being true; past it the digest marks the note stale. A new note without one has none;
-    "" removes it."""
+    stops being true; past it the digest marks the note stale (a zone-less time is read in the home zone of
+    `where`, ends.parse_expires). A new note without one has none; "" removes it."""
     alias = (alias or "").strip()
     if not ALIAS_RE.fullmatch(alias):
         raise ValueError(f"not a machine alias: {alias!r} (letters, digits and _.@+- only)")
@@ -135,7 +135,7 @@ def add(alias: str, tags: Any = None, note: str | None = None, min_free_gb: Any 
              "added": old.get("added") or now, "updated": now}
     if until:
         from .ends import parse_expires
-        entry["note_until"] = parse_expires(until, now, what="until")
+        entry["note_until"] = parse_expires(until, now, what="until", where=where)
     elif until is None and note is None and old.get("note_until"):
         entry["note_until"] = old["note_until"]
     gb = old.get("min_free_gb") if min_free_gb is ... else gb_value(min_free_gb)

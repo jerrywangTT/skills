@@ -122,7 +122,7 @@ def from_action(p, a: dict, key: str | None = None) -> dict:
     text = str(a.get("text") or "")
     return add(p, a.get("files") or files_in(text), a.get("title") or text, text,
                a.get("reviews") or reviews_in(text), FUNC_RE.findall(text),
-               expires=ends.from_action(a).get("expires"), key=key)
+               expires=ends.from_action(a, where=p).get("expires"), key=key)
 
 
 def files_in(text: str) -> list[str]:
