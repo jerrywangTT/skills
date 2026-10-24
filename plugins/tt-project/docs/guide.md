@@ -1002,8 +1002,9 @@ project with `ttp config <name> jev.enabled false`. Without a key, screening is 
   once the project's own daemon reports the release, and a recovered
   daemon returns to pending. Missing ownership/deadlines, current upgrade errors and daemons
   that fail to start remain failures; an older release's upgrade error does not count.
-  Keep nonzero upgrade errors as failures in the deploy command; exit 75 means deferred,
-  and needs this final verification. Ordinary `ttp deployed` remains a strict read-only
+  Keep nonzero upgrade errors as failures in the deploy command; exit 75 means deferred
+  (nothing changed) and 76 applied with the restart deferred to the daemon; both need this
+  final verification. Ordinary `ttp deployed` remains a strict read-only
   probe for `retry_when`. It also runs, queue on or off, after
   each `ttp push` or `ttp push --detach` that pushed to the push branch (never after `--own`), with
   `TTP_PUSH_RECEIPT` instead of `TTP_PUSH_BATCH`: a receipt under the project's state records it,
@@ -1226,8 +1227,11 @@ it on first use after an update), each project's daemon merges it into its own h
 and restarts, keeping running work. `ttp config <name> upgrade.auto false` turns that off;
 `ttp upgrade <name>` then merges by hand. `ttp upgrade` exits 75 when it changed nothing and the
 project finishes the upgrade itself (a merge conflict handed to its harness task, or retried by its
-daemon under `upgrade.auto`, which retries only a newer version), so a deploy script can count it as
-deferred; exit 1 is a real failure, such as a conflict nothing retries.
+daemon under `upgrade.auto`, which retries only a newer version), or when another upgrade or the
+daemon's landing of harness worktrees holds it, so a deploy script can count it as deferred. Exit 76
+means the harness was upgraded and the restart deferred to the running daemon (it restarts when it
+takes the request); `ttp restart` uses 76 the same way. Exit 1 is a real failure, such as a conflict
+nothing retries.
 Most conflicts settle without a model: changes to different lines, additions at one spot, and a
 local edit that upstream now makes too (comments and spacing aside: upstream's version is taken,
 the project's stays in the merge's first parent; a line the project removed and upstream reworded

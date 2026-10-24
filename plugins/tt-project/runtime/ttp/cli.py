@@ -6052,8 +6052,9 @@ def cmd_upgrade(a) -> None:
     task or the daemon landing a harness worktree holds it, a push is in flight, or a conflicting merge waits for a harness task or for the daemon's
     retry, which comes only for a newer version under upgrade.auto). Exit 1 = failed, including a conflict
     nothing will retry (upgrade.auto off, or the same version from another commit). After main moved, the
-    restart decides: exit 75 = the restart is deferred (the old daemon runs on and restarts when it takes
-    the request a sandboxed caller left it), exit 1 = it failed or the runtime was rolled back."""
+    restart decides: exit RESTART_DEFERRED (76) = main is applied and the restart deferred (the old daemon
+    runs on and restarts when it takes the request a sandboxed caller left it), exit 1 = it failed or the
+    runtime was rolled back. 75 never means main moved."""
     from . import locks, release
     if a.project_dir:      # the daemon names its own folder: never another project of the same name
         p = Project(a.project_dir)
@@ -6079,7 +6080,9 @@ def cmd_upgrade(a) -> None:
                            else "another upgrade is running")
         what = (f"the daemon is landing harness worktrees of {p.name}" if landing
                 else f"another upgrade of {p.name} is running")
-        die(f"upgrade refused: {what}" + (f" ({who[0]})" if who else "") + "; nothing was changed", 75)
+        die(f"upgrade refused: {what}" + (f" ({who[0]})" if who else "") + "; nothing was changed"
+            + ("; main is as it was and no restart is coming: rerun this --apply once it ends"
+               if a.apply is not None else ""), UPGRADE_BUSY)
     try:
         own = _own_run(p)
         if a.apply is not None and own and release.fenced(p, os.environ.get("TTP_TASK") or ""):
@@ -6645,11 +6648,17 @@ def _apply_upgrade(p: Project, commit: str) -> None:
     _exit_for_restart(service.restart(p))
 
 
+UPGRADE_BUSY = 75       # `ttp upgrade` deferred or refused: nothing was changed (EX_TEMPFAIL, as for `ttp lock`)
+RESTART_DEFERRED = 76   # main (or the runtime) is applied; the old daemon restarts when it takes restart.request
+
+
 def _exit_for_restart(res) -> None:
-    """Print a restart's report; exit 75 when it is deferred (the old daemon runs on and restarts when it
-    takes the request) and 1 when it failed or rolled back, never 0 for either."""
+    """Print a restart's report; exit RESTART_DEFERRED when it is deferred (the old daemon runs on and
+    restarts when it takes the request) and 1 when it failed or rolled back, never 0 for either. Never 75:
+    that is `ttp upgrade`'s "nothing was changed", and a worker that read it as "applied" would wait on a
+    restart.request that never comes."""
     print(res)
-    code = {"deferred": 75, "failed": 1, "rolled_back": 1}.get(getattr(res, "outcome", "running"), 0)
+    code = {"deferred": RESTART_DEFERRED, "failed": 1, "rolled_back": 1}.get(getattr(res, "outcome", "running"), 0)
     if code:
         print(f"restart {res.outcome.replace('_', ' ')} (exit {code})", file=sys.stderr)
         sys.exit(code)
@@ -6706,13 +6715,20 @@ In this harness repo:
    to <commit> under the upgrade lock and restarts the daemon (it rolls the runtime back if the daemon
    does not start). Never merge upstream into main any other way: the harness refuses it.
    Where the service manager is out of reach (a sandbox), it asks the running daemon to restart itself.
-   Exit 0: done, remove <tmp>. Exit 75: main is applied and the restart deferred; the old daemon runs on
-   and restarts when it takes the request: remove <tmp> and hand off `waiting` with retry_when
-   `test ! -e {state}/restart.request -a ! -e {state}/restart.request.taken`. When it wakes you, read
-   {state}/restart.result: its `outcome` (running, busy, failed, rolled_back) and `text` say how the
-   restart went; report a failure or a rollback with that text.
-   Exit 1 or other: keep <tmp> and hand off with its path and the error (it says whether the restart
-   was unavailable or the new daemon failed).
+   Its exit code says what happened; act on it alone:
+   - Exit 0: done, remove <tmp>.
+   - Exit 75: busy, nothing was changed (the daemon is landing harness worktrees, or another upgrade
+     runs): main is as it was and no restart is coming, so never wait on restart.request. Keep <tmp> and
+     rerun this step once the landing ends (a minute or two), or hand off `waiting` with
+     retry_after_s 300 and retry_when `ttp lock --probe harness-upgrade` (tell it from exit 76 by its
+     "nothing was changed" line).
+   - Exit 76: main is applied and the restart deferred; the old daemon runs on and restarts when it
+     takes the request: remove <tmp> and hand off `waiting` with retry_when
+     `test ! -e {state}/restart.request -a ! -e {state}/restart.request.taken`. When it wakes you, read
+     {state}/restart.result: its `outcome` (running, busy, failed, rolled_back) and `text` say how the
+     restart went; report a failure or a rollback with that text.
+   - Exit 1 or other: keep <tmp> and hand off with its path and the error (it says whether the restart
+     was unavailable or the new daemon failed).
 """
 
 

@@ -11505,7 +11505,7 @@ def test_an_old_daemon_still_ticking_after_the_restart_is_never_rolled_back(env,
     _no_rollback(p, head)
 
 
-@pytest.mark.parametrize("outcome,code", [("deferred", 75), ("failed", 1), ("rolled_back", 1), ("running", 0)])
+@pytest.mark.parametrize("outcome,code", [("deferred", 76), ("failed", 1), ("rolled_back", 1), ("running", 0)])
 def test_upgrade_apply_never_exits_0_on_a_deferred_or_failed_restart(env, monkeypatch, tmp_path, outcome, code):
     from ttp import cli, service
     p, _ = _conflicting_upgrade(env, monkeypatch)
@@ -11530,6 +11530,63 @@ def test_upgrade_apply_never_exits_0_on_a_deferred_or_failed_restart(env, monkey
     else:
         cli.main(["upgrade", "demo", "--apply", merged])
     assert _git_out(h, "rev-parse", "HEAD") == merged
+
+
+def test_upgrade_apply_while_busy_exits_75_and_a_deferred_restart_exits_76(env, monkeypatch, tmp_path, capsys):
+    """Busy (the daemon lands harness worktrees) and 'applied, restart deferred' never share an exit code:
+    a worker going by the code alone must not wait on a restart.request that never comes."""
+    from ttp import cli, locks, release, service
+    p, _ = _conflicting_upgrade(env, monkeypatch)
+    h = p.harness
+    with pytest.raises(SystemExit):
+        cli.main(["upgrade", "demo"])
+    tid = p.db.one("SELECT id FROM tasks WHERE kind='harness'")["id"]
+    ident = ["-c", "user.name=t", "-c", "user.email=t@t"]
+    wt = tmp_path / "merge"
+    _git_out(h, "worktree", "add", "-q", "--detach", str(wt), "main")
+    subprocess.run(["git", "-C", str(wt), *ident, "merge", "-X", "theirs", "upstream"], capture_output=True)
+    _git_out(wt, "add", "-A")
+    subprocess.run(["git", "-C", str(wt), *ident, "commit", "-qm", "merge upstream"], capture_output=True)
+    merged, before = _git_out(wt, "rev-parse", "HEAD"), _git_out(h, "rev-parse", "HEAD")
+    monkeypatch.setenv("TTP_TASK", str(tid))
+    restarts = []
+    monkeypatch.setattr(service, "restart",
+                        lambda p: restarts.append(1) or service._said("restart deferred", "deferred"))
+    capsys.readouterr()
+    held = locks.try_take([release.upgrade_lock(p)], "daemon (pid 1): landing harness worktrees", "x")
+    try:
+        with pytest.raises(SystemExit) as e:
+            cli.main(["upgrade", "demo", "--apply", merged])
+    finally:
+        held.close()
+    err = capsys.readouterr().err
+    assert e.value.code == cli.UPGRADE_BUSY == 75
+    assert "nothing was changed" in err and "no restart is coming" in err, err
+    assert _git_out(h, "rev-parse", "HEAD") == before and not restarts
+    assert not (p.state / "restart.request").exists()
+    with pytest.raises(SystemExit) as e:
+        cli.main(["upgrade", "demo", "--apply", merged])
+    assert e.value.code == cli.RESTART_DEFERRED == 76 and restarts == [1]
+    assert _git_out(h, "rev-parse", "HEAD") == merged
+
+
+def test_the_upgrade_task_spec_says_what_each_apply_exit_code_means():
+    from ttp import cli
+    spec = cli._UPGRADE_TASK.format(problem="x", name="demo", target="1 (c)", state="/s")
+    bullets = {}
+    for ln in spec.splitlines():
+        m = re.match(r"\s*- Exit (\d+)", ln)
+        if m:
+            key = m.group(1)
+            bullets[key] = ln
+        elif bullets and ln.startswith("     "):
+            bullets[key] += " " + ln.strip()
+    assert set(bullets) == {"0", "75", "76", "1"}, bullets
+    busy, deferred = bullets["75"], bullets["76"]
+    assert "nothing was changed" in busy and "never wait on restart.request" in busy
+    assert "ttp lock --probe harness-upgrade" in busy and "test ! -e" not in busy
+    assert "restart deferred" in deferred and "test ! -e /s/restart.request -a ! -e /s/restart.request.taken" in deferred
+    assert "restart.request" not in bullets["0"] + bullets["1"]
 
 
 @pytest.mark.parametrize("kickstart_rc", [0, 1])

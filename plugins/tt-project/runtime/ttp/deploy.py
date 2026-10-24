@@ -185,7 +185,8 @@ def launch_takeover(p, name: str, task: int | None) -> subprocess.Popen:
 def _reap(name: str, t: dict, now: float, p=None) -> None:
     """Record the end of `name`'s running attempt: its exit code when this daemon started it, else once its
     process is gone (a restart or a reboot in between). An attempt past TAKEOVER_TIMEOUT_S is over. The end
-    goes to its takeover log too (exit 75: deferred, nothing changed; its output above says why)."""
+    goes to its takeover log too (exit 75: deferred, nothing changed; 76: applied, restart deferred to the
+    daemon; its output above says why)."""
     pid = int(t.get("pid") or 0)
     if not pid:
         return
@@ -208,7 +209,9 @@ def _reap(name: str, t: dict, now: float, p=None) -> None:
             return
         rc = "timed out" if late else "unknown (it ended while this daemon was down)"
     t.update(pid=None, ended=now, rc=rc if isinstance(rc, str) else f"exit {rc}")
-    _log(p, name, f"takeover ended: {t['rc']}" + (" (deferred: nothing was changed)" if t["rc"] == "exit 75" else ""))
+    _log(p, name, f"takeover ended: {t['rc']}" + {"exit 75": " (deferred: nothing was changed)",
+                                                    "exit 76": " (applied; the daemon restarts when it takes the "
+                                                               "request)"}.get(t["rc"], ""))
 
 
 def _takeover(p, rec: dict, outcome: str, kind: str, reason: str, t: dict, now: float,

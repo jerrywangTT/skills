@@ -248,7 +248,9 @@ The boot is told by the kernel's boot id (on macOS, kern.bootsessionuuid, else k
   never in the live harness, and apply the result with `ttp upgrade <name> --apply <commit>`.
   Where the service manager is out of reach (a sandboxed worker), it asks the running daemon to
   restart itself (state/restart.request) and rolls nothing back while the old daemon still ticks.
-  Exit 75: applied, restart deferred to the daemon; exit 1: the restart failed or was rolled back.
+  Exit 76: applied, restart deferred to the daemon (wait for restart.request to go); exit 75: busy
+  (the daemon is landing harness worktrees or another upgrade runs), nothing was changed, so retry
+  later and never wait on restart.request; exit 1: the restart failed or was rolled back.
 - One merge at a time: `ttp upgrade` holds the `harness-upgrade` lock for the whole merge, refuses
   while another upgrade runs, and stops if `main` changed the template's files meanwhile. An open
   upgrade task holds the live harness until it ends: a newer release moves `upstream` and retargets
