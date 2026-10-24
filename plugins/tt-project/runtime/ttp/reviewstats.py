@@ -3,7 +3,8 @@
 """One row per finished review (table review_stats), so review routing can be measured and retested:
 the reviewed head, its changed lines against its merge-base with the base branch, the areas the
 change touches (runtime, skills-prompts-config, tests-docs), the review's tier, whether it was a
-re-review after a failed one, its outcome and its cost. The daemon writes a row each time a review's
+re-review after a failed one, its outcome, its cost and whether the reviewed hand-off carried a
+`self_check` line (kind-code.md's try-to-break-it step). The daemon writes a row each time a review's
 run ends in a verdict (a later verdict of the same review replaces it). The daily review's
 efficiency audit reads `summary`/`audit_line`; `ttp audit --json` carries the rows.
 
@@ -16,7 +17,7 @@ import time
 from typing import Any
 
 from . import budget as bud
-from .db import DB, continues_id, review_subject
+from .db import DB, continues_id, load_result, review_subject
 
 AREAS = ("runtime", "skills-prompts-config", "tests-docs")
 # Prompt, skill and config content: a part of the path with one of these names, or a config suffix.
@@ -63,6 +64,20 @@ def is_rereview(db: DB, review: dict) -> bool:
     return bool(t) and db._continues_failed_review(labels if isinstance(labels, list) else [])
 
 
+def has_self_check(db: DB, review: dict) -> int | None:
+    """1 when the hand-off of the task `review` reviews carries a non-empty `self_check` line (or its
+    `on_pass` does), 0 when it carries none, None when the review names no task that exists."""
+    subject = review_subject(review)
+    t = db.task(subject) if subject is not None else None
+    if not t:
+        return None
+    res = load_result(t.get("result"))
+    for got in (res, res.get("on_pass")):
+        if isinstance(got, dict) and isinstance(got.get("self_check"), str) and got["self_check"].strip():
+            return 1
+    return 0
+
+
 def _reviewed(p, review: dict) -> tuple[str, str]:
     """(branch, full head) the review reviewed: the head it approved for the push queue, else the
     tip of its subject's branch now; ('', '') when it names none."""
@@ -81,7 +96,8 @@ def _reviewed(p, review: dict) -> tuple[str, str]:
 
 def record(p, review: dict, outcome: str, now: float | None = None) -> dict | None:
     """Write the review's row: its head, changed lines against the merge-base, areas, tier,
-    re-review flag, outcome (OUTCOMES) and cost so far. Git trouble leaves lines and areas empty."""
+    re-review flag, outcome (OUTCOMES), cost so far and self-check flag (has_self_check). Git trouble
+    leaves lines and areas empty."""
     from . import worktree
     db = p.db
     if review.get("kind") != "review":
@@ -99,9 +115,9 @@ def record(p, review: dict, outcome: str, now: float | None = None) -> dict | No
     row = {"task": review["id"], "ts": time.time() if now is None else now, "head": head[:40] or None,
            "lines": lines, "areas": ",".join(touched), "tier": t.get("tier") or "standard",
            "rereview": int(is_rereview(db, t)), "outcome": OUTCOMES.get(outcome, outcome),
-           "cost_usd": float(t.get("spent_usd") or 0)}
-    db.x("INSERT OR REPLACE INTO review_stats(task,ts,head,lines,areas,tier,rereview,outcome,cost_usd) "
-         "VALUES(?,?,?,?,?,?,?,?,?)", tuple(row.values()))
+           "cost_usd": float(t.get("spent_usd") or 0), "self_check": has_self_check(db, t)}
+    db.x("INSERT OR REPLACE INTO review_stats(task,ts,head,lines,areas,tier,rereview,outcome,cost_usd,self_check) "
+         "VALUES(?,?,?,?,?,?,?,?,?,?)", tuple(row.values()))
     return row
 
 
@@ -142,14 +158,16 @@ def size_bucket(lines: int | None) -> str:
 
 def summary(db: DB, since: float) -> dict[str, Any]:
     """Reviews finished since `since`: counts, cost and the failure rate (failed or changes_needed)
-    per size bucket, per tier and for first reviews against re-reviews."""
-    out: dict[str, Any] = {"n": 0, "usd": 0.0, "by_size": {}, "by_tier": {}, "by_kind": {}}
+    per size bucket, per tier, for first reviews against re-reviews and by whether the reviewed hand-off
+    carried a self-check (rows from before the field, or with no reviewed task, count as unknown)."""
+    out: dict[str, Any] = {"n": 0, "usd": 0.0, "by_size": {}, "by_tier": {}, "by_kind": {}, "by_self_check": {}}
     for r in rows(db, since):
         out["n"] += 1
         out["usd"] += float(r["cost_usd"] or 0)
         bad = r["outcome"] in ("failed", "changes_needed")
         for key, val in (("by_size", size_bucket(r["lines"])), ("by_tier", r["tier"]),
-                         ("by_kind", "re-review" if r["rereview"] else "first")):
+                         ("by_kind", "re-review" if r["rereview"] else "first"),
+                         ("by_self_check", {1: "self-checked", 0: "not self-checked"}.get(r["self_check"], "unknown"))):
             g = out[key].setdefault(val, {"n": 0, "failed": 0, "usd": 0.0})
             g["n"] += 1
             g["failed"] += bad
@@ -166,4 +184,4 @@ def audit_line(db: DB, since: float) -> str:
     def part(groups: dict) -> str:
         return ", ".join(f"{k} {g['n']} ({g['failed']} failed, ${g['usd']:.2f})" for k, g in sorted(groups.items()))
     return (f"reviews finished: {s['n']}, ${s['usd']:.2f}; by diff lines: {part(s['by_size'])}; by tier: "
-            f"{part(s['by_tier'])}; {part(s['by_kind'])}")
+            f"{part(s['by_tier'])}; {part(s['by_kind'])}; {part(s['by_self_check'])}")

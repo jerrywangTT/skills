@@ -164,10 +164,11 @@ CREATE UNIQUE INDEX IF NOT EXISTS ttr_open ON ttr_incidents(alias) WHERE ended I
 CREATE INDEX IF NOT EXISTS ttr_alias ON ttr_incidents(alias, started);
 
 -- One row per finished review (reviewstats.py): reviewed head, changed lines against its merge-base,
--- areas touched, tier, re-review flag, outcome and cost. A later verdict of the same review replaces it.
+-- areas touched, tier, re-review flag, outcome, cost and whether the reviewed hand-off carried a
+-- `self_check` line (1/0; NULL: no reviewed task found). A later verdict of the same review replaces it.
 CREATE TABLE IF NOT EXISTS review_stats (
   task INTEGER PRIMARY KEY, ts REAL NOT NULL, head TEXT, lines INTEGER, areas TEXT, tier TEXT,
-  rereview INTEGER NOT NULL DEFAULT 0, outcome TEXT, cost_usd REAL NOT NULL DEFAULT 0);
+  rereview INTEGER NOT NULL DEFAULT 0, outcome TEXT, cost_usd REAL NOT NULL DEFAULT 0, self_check INTEGER);
 CREATE INDEX IF NOT EXISTS review_stats_ts ON review_stats(ts);
 """
 
@@ -346,6 +347,15 @@ class DB:
         self._migrate_stuck_since()
         self._migrate_message_broadcast()
         self._migrate_ttr_sample()
+        self._migrate_review_self_check()
+
+    def _migrate_review_self_check(self) -> None:
+        # Whether the reviewed hand-off carried a `self_check` line. Older rows have none (NULL).
+        if "self_check" in {r["name"] for r in self.q("PRAGMA table_info(review_stats)")}:
+            return
+        with self.tx():
+            if "self_check" not in {r["name"] for r in self.q("PRAGMA table_info(review_stats)")}:
+                self.x("ALTER TABLE review_stats ADD COLUMN self_check INTEGER")
 
     def _migrate_ttr_sample(self) -> None:
         # A heal-sourced incident's last unhealthy sample and check period (ttr.observe caps its end by

@@ -9,19 +9,22 @@
 - Run the full checks before handing off, committed, through `ttp checks`: the project's checks,
   plus after `--` only the repository's test and lint commands they do not already run, each
   command quoted as one word (`-- 'pytest -q tests/a.py' 'ruff check .'`). It reuses
-  a recorded pass for the same tree and commands. If they outlast a tool call,
+  a pass for the same tree and commands. If they outlast a tool call,
   run `ttp checks --detach -- <cmds>`: its output and exit code go to the run's directory, never
   the worktree. Hand off `waiting` with the `retry_when` it prints and no `wake_tier` (its wake is light;
   failed checks wake you at your tier);
   that probe also wakes the task if the checks were killed. If only recording the result is
   left after them, put that final hand-off (`done` or `needs_review`) in `on_pass`: a pass on
   the same head records it without a model run; a failure wakes the task at its tier with the output.
-  Running it again stops this run's earlier detached checks.
 - While you iterate, run only the tests your change affects (a file, `pytest -k`, `file::test`),
   never the full suite: each fix changes the tree, wasting a full run per fix. Run `ttp checks`
   once at the end, committed, before the hand-off. A direct full-suite run is refused.
   Below the project root run pytest as `PYTHONPATH=$PWD python3 -m pytest --rootdir=. --confcutdir=.`.
 - Keep the diff minimal and on-topic. No drive-by rewrites.
+- Before the hand-off, try to break it (tt-project-harness `references/self-check.md`): tick each spec
+  step; a guard or parser: test 3+ bypasses; exit codes: an unexpected one, an interrupted run;
+  no unbounded wait or I/O in a db transaction; over ~200 lines: say why not split. Add a one-line
+  `self_check` to result.json (and `on_pass`): what you ticked and tried.
 - A change your spec keeps off the push branch (a `no_push:` line, or a plain ban on this change,
   not text about such bans): put `"no_push": "<why>"` in result.json, so its review is review only.
 <!-- ttp:if upstream_ingest -->
@@ -36,19 +39,15 @@
 - Only when the delivery policy line says "code tasks may land on <branch> with ttp push=True"
   AND your spec asks you to land on that branch. Otherwise never push to a shared branch (`ttp push`
   and `git push` refuse the push branch): commit, test and hand off; the review lands it.
-- Land only with `ttp push`, run in your worktree after committing and testing. NEVER use
-  `git push` to a shared branch. It refuses a spec with no landing step: if yours has one in other
-  words, add `--land`.
-- It refuses uncommitted changes, rebases onto the target, runs the project's checks on
-  the final head, starts over if the branch moved, and pushes without force.
+- Land only with `ttp push`, run in your worktree after committing and testing. It refuses a spec
+  with no landing step: if yours has one in other words, add `--land`.
 - Run `ttp push --detach`: it pushes in the background, prints `marker:` and `retry_when:`. Hand off
-  `waiting` with that `retry_when`, `next_step` "report the push", `retry_after_s` 900 and no `wake_tier`
-  (a push that did not land wakes you at your tier). NEVER put plain
-  `ttp push` in the background yourself.
+  `waiting` with that `retry_when`, `next_step` "report the push", `retry_after_s` 900 and no `wake_tier`.
+  NEVER put plain `ttp push` in the background yourself.
 - On resume, run that `retry_when`: it prints `ttp push: pushed <sha> to <branch>`, or `ttp push: not pushed` with the
   exit code and log tail. Report the sha or the failure. A push that "ended
   without writing an outcome" was killed: rerun `ttp push --detach` once.
-- Exit codes (of `ttp push --detach` for an instant refusal, else the push's, printed by the probe):
+- Exit codes (of `ttp push --detach`, or the push's as the probe prints):
   Exit 0: pushed. 3: rebase conflict; resolve it keeping both sides' intents, commit, rerun.
   4: a check failed; hand off `failed` with the output. If instead it says the change keeps the
   plugin version already on the branch, bump past it (and its changeset), commit, rerun.
@@ -73,7 +72,7 @@
   `ttp push --own-branch --detach` then publishes your own branch under its own name.
 - Every review comment (bot or human) and CI failure on your PR is part of the work: fix it, or
   briefly answer on the PR why not, until CI is green.
-- Description: what improved and why, one line of how, key numbers. Short, for humans.
+- Description: what improved and why, one line of how, key numbers.
   Keep it and your PR comments current.
 - Every PR comment or review you post ends with the hidden line `<!-- ttp -->`, so the PR watcher
   skips it.

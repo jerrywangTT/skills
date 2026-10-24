@@ -83,6 +83,51 @@ def test_a_re_review_leads_with_the_fix_delta_and_each_review_is_recorded(env):
     assert rep["n"] == 2 and {r["task"] for r in rep["rows"]} == {rev["id"], re_rev["id"]}
 
 
+def test_each_review_row_records_whether_the_reviewed_hand_off_carried_a_self_check(env):
+    from ttp import audit, reviewstats
+    p = make(env)
+    ok = {"status": "done", "summary": "works"}
+    cases = [("ticked", {**ok, "self_check": "steps 1-3 ticked; tried exit 2 and a killed run"}, 1),
+             ("none", ok, 0),
+             ("blank", {**ok, "self_check": "  "}, 0),
+             ("not text", {**ok, "self_check": True}, 0),
+             ("on pass", {"status": "waiting", "summary": "checks", "on_pass": {**ok, "self_check": "ticked"}}, 1)]
+    for title, result, want in cases:
+        if result["status"] == "waiting":   # the final hand-off is recorded from its on_pass
+            tid, _, _, _ = _finish_code(env, p, title, {f"{title}.py": 3}, result=ok)
+            p.db.update_task(tid, result=json.dumps(result))
+            (rev,) = p.db.q("SELECT * FROM tasks WHERE kind='review' AND depends_on=?", (json.dumps([tid]),))
+        else:
+            _, _, _, (rev,) = _finish_code(env, p, title, {f"{title}.py": 3}, result=result)
+        _fail_review(env, p, rev["id"], status="done", summary="fine")
+        row = p.db.one("SELECT * FROM review_stats WHERE task=?", (rev["id"],))
+        assert row["self_check"] == want, (title, row)
+    assert reviewstats.has_self_check(p.db, {"title": "Review #99999: gone"}) is None, "no reviewed task"
+    assert reviewstats.has_self_check(p.db, {"title": "a review naming no task"}) is None
+    p.db.x("UPDATE review_stats SET self_check=NULL WHERE task=?", (rev["id"],))   # a row from before the field
+    s = reviewstats.summary(p.db, 0)["by_self_check"]
+    assert {k: g["n"] for k, g in s.items()} == {"self-checked": 1, "not self-checked": 3, "unknown": 1}, s
+    line = next(x for x in audit.lines(p.db, p=p) if x.startswith("reviews finished: 5"))
+    assert "not self-checked 3 (0 failed" in line and "self-checked 1 (0 failed" in line and "unknown 1" in line, line
+
+
+def test_the_self_check_column_is_added_to_an_existing_review_stats_table(env):
+    from ttp.db import DB
+    path = env["tmp"] / "old-stats.db"
+    old = DB(path)
+    old.conn.execute("DROP TABLE review_stats")
+    old.conn.execute("CREATE TABLE review_stats (task INTEGER PRIMARY KEY, ts REAL NOT NULL, head TEXT, "
+                     "lines INTEGER, areas TEXT, tier TEXT, rereview INTEGER NOT NULL DEFAULT 0, outcome TEXT, "
+                     "cost_usd REAL NOT NULL DEFAULT 0)")
+    old.conn.execute("INSERT INTO review_stats(task,ts,outcome) VALUES(7,1.0,'approved')")
+    old.conn.commit()
+    old.conn.close()
+    db = DB(path)
+    assert db.one("SELECT * FROM review_stats WHERE task=7")["self_check"] is None, "older rows keep NULL"
+    db.conn.close()
+    assert "self_check" in {r["name"] for r in DB(path).q("PRAGMA table_info(review_stats)")}   # a no-op again
+
+
 def test_a_coordinator_fix_review_leads_with_the_delta_from_the_recorded_failed_head(env):
     p = make(env)
     _, branch, _, (rev,) = _finish_code(env, p, "feature", {"app.py": 40})

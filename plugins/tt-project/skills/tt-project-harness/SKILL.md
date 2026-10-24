@@ -68,6 +68,7 @@ read the one for the lever you change.
 | Shared watchers | A watcher that workers also run: non-blocking lock, re-check, dedupe, and seconds-fast git steps. See [references/shared-watchers.md](references/shared-watchers.md) |
 | Machine change ends | `ttp machines change add ... --until-task <id>`: a ledger entry open while a dependent task is. See [references/machine-change-ends.md](references/machine-change-ends.md) |
 | Continue hops | A done task's `continue: ...` follow-up is queued at the parent's tier; `mechanical: ...` runs it light. See [references/continue-hops.md](references/continue-hops.md) |
+| Self-check before hand-off | A code worker tries to break its change before handing off (spec steps ticked, guard bypasses, unexpected exit codes and interrupted runs, bounded waits, no I/O in a db transaction, diff size) and hands off a `self_check` line; `review_stats.self_check` records whether the reviewed hand-off had one. See [references/self-check.md](references/self-check.md) |
 | Web app | `runtime/ttp/web/` |
 | Runtime behavior | `runtime/ttp/*.py` (last resort) |
 
