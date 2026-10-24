@@ -74,6 +74,12 @@ def test_kill_guard_signal_zero_probes_pass_and_real_signals_are_refused(kill_tr
         assert _kill_refusal(f"kill {sig} {o}", t) is not None, sig
     # Signal 0 given twice still sends nothing.
     assert _kill_refusal(f"kill -0 -s 0 {o}", t) is None
+    # pkill's getopt still reads a --signal after -0, anywhere before `--` (abbreviations too), and sends it.
+    for cmd in ("pkill -0 --signal KILL sleep", "pkill -0 --signal=9 -f sleep", "pkill -SIG0 -f x --signal TERM",
+                "pkill -0 sleep --sig 9", "pkill -0 --signal 0 -f x --signal=KILL"):
+        assert _kill_refusal(cmd, t) is not None, cmd
+    for cmd in ("pkill -0 --signal 0 sleep", "pkill -0 sleep", "pkill -0 --signal=SIG0 sleep", "pkill -0 -- --signal"):
+        assert _kill_refusal(cmd, t) is None, cmd
 
 
 def test_kill_guard_allows_kill_of_own_tree_only(kill_tree):

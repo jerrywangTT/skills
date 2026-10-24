@@ -296,8 +296,8 @@ class _Guard:
         scope, i = [], 0
         if args and re.fullmatch(r"-(?:\d+|(?:SIG)?[A-Z]{3}[A-Z0-9+-]*)", args[0]):   # -9, -TERM: a signal
             i = 1
-            if re.fullmatch(r"-(?:SIG)?0+", args[0], re.I):   # signal 0 sends nothing: a liveness probe
-                return
+            if re.fullmatch(r"-(?:SIG)?0+", args[0], re.I) and re.fullmatch(r"(?:SIG)?0+", self._pkill_signal(args), re.I):
+                return   # signal 0 sends nothing: a liveness probe
         while i < len(args):
             a = args[i]
             if a == "--":
@@ -330,6 +330,20 @@ class _Guard:
                           all(self.procs.own(p) for p in self.procs.members(n, 1 if opt == "g" else 2)))
                     if not ok:
                         raise Refused(f"{name} -{opt} {self._show(v)}: {n} is not this task's own process, group or session")
+
+    @staticmethod
+    def _pkill_signal(args: list[str]) -> str:
+        """The signal pkill sends: getopt reads a --signal anywhere before `--` after the leading -<sig>, and the
+        last one wins (`pkill -0 --signal KILL x` sends 9); --si, --sig... abbreviate it."""
+        sig, k = args[0][1:], 1
+        while k < len(args) and args[k] != "--":
+            opt, eq, value = args[k].partition("=")
+            if len(opt) > 3 and "--signal".startswith(opt):
+                if not eq:
+                    value, k = (args[k + 1] if k + 1 < len(args) else ""), k + 1
+                sig = value
+            k += 1
+        return sig
 
     def _kill(self, args: list[str], remote: bool, stdin: bool) -> None:
         if args[:1] and re.fullmatch(r"-[lL]|--list(?:=.*)?|--table", args[0]):
