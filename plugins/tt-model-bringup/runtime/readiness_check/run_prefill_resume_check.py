@@ -8,6 +8,11 @@ Validates that a generator can resume prefill at a nonzero absolute start
 position over an existing KV cache, which is what a vLLM prefix-cache hit,
 a chunked-prefill continuation, and a preemption resume all require.
 
+Prompts are deterministic natural text by default. Random token ids give
+near-flat next-token distributions on which argmax flips under BF16 drift, so
+top-1 agreement stops measuring the resume path; use ``--prompt-source random``
+only as a stress variant.
+
 For each prompt length and each resume point ``s`` the check compares:
 
   reference  full prefill of the prompt, logits over a position window W
@@ -239,6 +244,41 @@ def _random_tokens(length: int, vocab_size: int, seed: int) -> List[int]:
     return torch.randint(1, max(2, vocab_size - 1), (length,), generator=rng).tolist()
 
 
+def natural_tokens(tokenizer: Any, pieces: Sequence[str], length: int) -> List[int]:
+    """Deterministic natural text of exactly `length` tokens, built from the prompt pieces."""
+    if not pieces:
+        raise RuntimeError("no prompt pieces available for natural text")
+    text = ""
+    index = 0
+    ids: List[int] = []
+    while len(ids) < length:
+        text = (text + "\n\n" if text else "") + pieces[index % len(pieces)]
+        index += 1
+        ids = list(tokenizer.encode(text))
+    return ids[:length]
+
+
+def _prompt_pieces(prompts_file: Path) -> List[str]:
+    return [p.strip() for p in prompts_file.read_text().split("\n\n") if p.strip()]
+
+
+def _prompt_tokens(
+    generator: Generator,
+    *,
+    length: int,
+    source: str,
+    prompts_file: Path,
+    vocab_size: Optional[int],
+    seed: int,
+) -> List[int]:
+    tokenizer = getattr(generator, "tokenizer", None)
+    if source == "natural" and tokenizer is not None and hasattr(tokenizer, "encode"):
+        return natural_tokens(tokenizer, _prompt_pieces(prompts_file), length)
+    if source == "natural":
+        raise RuntimeError("--prompt-source natural needs a generator tokenizer with encode(); pass --prompt-source random")
+    return _random_tokens(length, _vocab_size(generator, vocab_size), seed)
+
+
 def _vocab_size(generator: Generator, override: Optional[int]) -> int:
     if override:
         return override
@@ -264,12 +304,16 @@ def run_prefill_resume_check(
     thresholds: Dict[str, float],
     vocab_size: Optional[int],
     seed: int,
+    prompt_source: str = "natural",
+    prompts_file: Optional[Path] = None,
     build_kwargs: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     build_generator = _import_build_generator(model_dir)
     generator: Generator = build_generator(model_dir=model_dir, mesh_device=mesh_device, **(build_kwargs or {}))
+    prompts_file = prompts_file or (Path(__file__).parent / "vllm_prompts.txt")
     record: Dict[str, Any] = {
         "model_dir": str(model_dir),
+        "prompt_source": prompt_source,
         "lengths": list(lengths),
         "block_sizes": list(block_sizes),
         "sliding_window": sliding_window,
@@ -280,9 +324,15 @@ def run_prefill_resume_check(
         "cases": [],
     }
     try:
-        size = _vocab_size(generator, vocab_size)
         for length in lengths:
-            tokens = _random_tokens(length, size, seed)
+            tokens = _prompt_tokens(
+                generator,
+                length=length,
+                source=prompt_source,
+                prompts_file=prompts_file,
+                vocab_size=vocab_size,
+                seed=seed,
+            )
             for point in resume_points(length, block_sizes=block_sizes, sliding_window=sliding_window, tile=tile):
                 try:
                     case = run_case(
@@ -334,6 +384,13 @@ def _main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--controls", type=str, default=",".join(CONTROL_NAMES))
     parser.add_argument("--vocab-size", type=int, default=None)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--prompt-source",
+        choices=("natural", "random"),
+        default="natural",
+        help="natural: deterministic text from --prompts-file through the generator tokenizer; random: uniform token ids.",
+    )
+    parser.add_argument("--prompts-file", type=Path, default=Path(__file__).parent / "vllm_prompts.txt")
     for key, value in DEFAULT_THRESHOLDS.items():
         parser.add_argument(f"--{key.replace('_', '-')}", type=float, default=value)
     add_mesh_device_args(parser)
@@ -361,6 +418,8 @@ def _main(argv: Optional[Sequence[str]] = None) -> int:
             thresholds=thresholds,
             vocab_size=args.vocab_size,
             seed=args.seed,
+            prompt_source=args.prompt_source,
+            prompts_file=args.prompts_file.resolve(),
         )
     finally:
         close_readiness_mesh_device(mesh_device, args.fabric_config)

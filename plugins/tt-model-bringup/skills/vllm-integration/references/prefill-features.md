@@ -57,7 +57,7 @@ python -m readiness_check.run_prefill_resume_check \
   --output models/autoports/<model>/readiness/prefill_resume_check.json
 ```
 
-The runner derives the resume starts from the geometry: the smallest block, the least common multiple of the blocks, a tile-unaligned start, the sliding window and one past it, the exact prefix-cache hit for a repeat (`floor((L-1)/lcm)*lcm`), and `L-1`. It compares full-prefill logits with continuation logits over `[s, s+256)` plus the last position.
+The runner derives the resume starts from the geometry: the smallest block, the least common multiple of the blocks, a tile-unaligned start, the sliding window and one past it, the exact prefix-cache hit for a repeat (`floor((L-1)/lcm)*lcm`), and `L-1`. It compares full-prefill logits with continuation logits over `[s, s+256)` plus the last position. Prompts are deterministic natural text built from the readiness prompt file through the generator tokenizer. Random token ids are a stress variant (`--prompt-source random`), not the gate: their next-token distributions are near flat, argmax flips under ordinary BF16 drift, and top-1 agreement stops measuring the resume path. On a 30-layer MoE model a per-layer continuation PCC of 0.999 still produced top-1 agreement near 0.3 on random tokens.
 
 Gates per start: mean PCC >= 0.99, minimum PCC >= 0.98, top-1 agreement >= 0.98, final-position top-1 equal. Continuation changes MoE and SDPA chunk boundaries, so bit equality is not expected; BF16 drift at the margin is legitimate. A failure here is a cache address, position, or history bug, not drift.
 

@@ -162,6 +162,24 @@ def test_control_that_cannot_fail_is_reported_as_a_check_defect():
     assert "did not fail" in reasons[0]
 
 
+class _WordTokenizer:
+    def encode(self, text):
+        return [hash(w) % 1000 for w in text.split()]
+
+
+def test_natural_tokens_are_deterministic_and_exact_length():
+    from readiness_check.run_prefill_resume_check import natural_tokens
+
+    pieces = ["alpha beta gamma", "delta epsilon"]
+    first = natural_tokens(_WordTokenizer(), pieces, 7)
+    second = natural_tokens(_WordTokenizer(), pieces, 7)
+    assert first == second
+    assert len(first) == 7
+    assert first[:3] == [hash(w) % 1000 for w in ["alpha", "beta", "gamma"]]
+    with pytest.raises(RuntimeError, match="no prompt pieces"):
+        natural_tokens(_WordTokenizer(), [], 3)
+
+
 def test_controls_are_skipped_for_narrow_windows():
     case = run_case(
         generator=_ContinuationGenerator(),
