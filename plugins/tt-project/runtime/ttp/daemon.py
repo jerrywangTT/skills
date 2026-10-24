@@ -8338,15 +8338,15 @@ class Daemon:
                                                       and not gate.allow_optional))
         log(self.p, f"task {tid} retry_when {why}; {f'held by gate {gate.level}' if held else 'dispatching'}")
 
-    def _probe_passed(self, task: dict, now: float) -> None:
+    def _probe_passed(self, task: dict, now: float, why: str = "probe passed") -> None:
         """A waiting task's probe passed. A wait on its own detached `ttp checks` is settled here
         without a model run where the outcome is clear: checks that passed on the head still checked
         out record the hand-off's `on_pass` through the normal finish (review and push queue as
         usual); checks that failed only on tests failing elsewhere too are held (_shared_hold); others
         that failed or were killed wake the task at once at its own tier with their output's tail.
         Anything unclear wakes it as any passed probe does. A hand-off that also names an on_pass_cmd
-        runs that command first (_start_on_pass): its on_pass counts only once the command exits 0."""
-        why = "probe passed"
+        runs that command first (_start_on_pass): its on_pass counts only once the command exits 0.
+        `why` is what passed (a freed exclusive slot, for _slot_reservations)."""
         try:
             got = self._checks_wait(task)
         except Exception as e:   # a wake is always safe; a broken check must not keep the task asleep
@@ -8390,7 +8390,7 @@ class Daemon:
             why += f"; its on_pass was not applied: {got[1]}"
         else:
             try:
-                started = self._start_on_pass(task, now)
+                started = self._start_on_pass(task, now, said=why)
             except Exception as e:   # as above: a wake is always safe
                 started = f"it could not start: {type(e).__name__}: {e}"
             if started is True:
@@ -8980,6 +8980,8 @@ class Daemon:
                 for lock in mine:
                     excl.setdefault(lock, []).append(t)
                 continue
+            if not due:   # a task still on its retry timer takes no slot and uses the resource for nothing yet
+                continue
             for lock in mine:
                 excl.setdefault(lock, []).append(t)
             for lock in {canon(r) for r in _shared(t)} - mine:
@@ -9038,7 +9040,8 @@ class Daemon:
         (_slot_plan). Each reserver's resource is reserved, so new `ttp lock` commands of other tasks wait
         as well (a ready reserver that dispatch then does not reach drops that, as before). A lock's first
         contender in pick order, reserver or not, still on its retry timer is woken as soon as every
-        resource it needs has a free slot, so a free slot goes to it ahead of later tasks. A running
+        resource it needs has a free slot, so a free slot goes to it ahead of later tasks (a waiting hand-off
+        goes through _probe_passed, so its on_pass_cmd runs model-free). A running
         task is never preempted. A reservation ends once its task starts, leaves the queue (cancelled,
         blocked, deferred), needs a paused resource or is outranked, and lapses (logged) once it has kept
         a free slot unused for budget.exclusive_reserve_s (default 600), so a reserver that cannot start
@@ -9096,7 +9099,7 @@ class Daemon:
                 woken.add(task["id"])
                 why = f"{name(lock, task)} came free" + (" and is reserved for it" if lock in want else "")
                 if load_result(task["result"]).get("status") == "waiting":
-                    self._wake_waiting(task, why, now)
+                    self._probe_passed(task, now, why)   # its on_pass_cmd, if any, runs model-free
                 else:
                     db.update_task(task["id"], not_before=now)
                     log(self.p, f"task {task['id']}: {why}; dispatching")

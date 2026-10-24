@@ -229,12 +229,13 @@ def _board_add(p, title, priority, resources=("board",)):
     return p.db.one("SELECT id FROM tasks WHERE title=?", (title,))["id"]
 
 
-def _board_waiting(p, d, tmp_path, tid, probe="ttp lock --probe board"):
+def _board_waiting(p, d, tmp_path, tid, probe="ttp lock --probe board", **more):
     """Start task tid (the test leaves a slot of each of its resources free), let its run hand off
-    waiting on `probe` and reap it; the next run of the task stays running until go(tid)."""
+    waiting on `probe` (and the hand-off fields `more`) and reap it; the next run of the task stays
+    running until go(tid)."""
     res = tmp_path / f"result-{tid}.json"
     res.write_text(json.dumps({"status": "waiting", "summary": "board busy", "retry_when": probe,
-                               "retry_after_s": 3600}))
+                               "retry_after_s": 3600, **more}))
     d.dispatch()
     assert _until_true(lambda: d.reap_runs() or p.db.task(tid)["status"] == "queued" and tid not in _slot_tasks(p))
     res.unlink()
@@ -421,5 +422,67 @@ def test_a_reservation_keeps_one_slot_so_lower_tasks_take_the_spare_slots_and_it
         flag.touch()
         if holder:
             _ended([holder])
+        drain(d)
+        assert reap_tmp_processes(tmp_path) == [], "a stand-in run outlived the test"
+
+
+def test_a_command_user_still_on_its_retry_timer_does_not_stop_a_slot_reservation(
+        env, monkeypatch, tmp_path, reap_tmp_processes):
+    """P1 (exclusive) waits for board; N, as urgent, uses board per command but is deferred hours off.
+    N is not due, so it takes no part in the rank: P1 reserves the slot. Once N is due it ties P1 again
+    and nothing is reserved."""
+    from ttp import coordinator as coord, locks
+    p, d, drain, go = _board_setup(env, monkeypatch, tmp_path, board=2)
+    try:
+        a = _board_add(p, "A holds board", 3)
+        p1 = _board_add(p, "P1 urgent", 1)
+        _board_waiting(p, d, tmp_path, p1)
+        assert _slot_tasks(p) == [a]
+        _board_slots(p, d, 1)
+        assert coord.apply(p, [{"type": "task_add", "title": "N uses board later", "spec": "s", "kind": "work",
+                                "tier": "light", "resources": ["board"], "priority": 1,
+                                "start_after": "6h"}]) == []
+        n = p.db.one("SELECT id FROM tasks WHERE title=?", ("N uses board later",))["id"]
+        assert p.db.task(n)["not_before"] > time.time() + 3600
+        d.dispatch()
+        assert _slot_tasks(p) == [a]
+        assert list(d._slot_reservers(time.time()).values()) == [p1], "a deferred command user outranked P1"
+        assert locks.reserved_by(d._reserve_path("board")) == f"task #{p1}"
+        assert coord.apply(p, [{"type": "task_update", "id": n, "start_after": "now"}]) == []
+        assert (p.db.task(n)["not_before"] or 0) <= time.time()
+        assert d._slot_reservers(time.time()) == {}, "a due command user of equal rank no longer counted"
+    finally:
+        drain(d)
+        assert reap_tmp_processes(tmp_path) == [], "a stand-in run outlived the test"
+
+
+@pytest.mark.parametrize("on_pass_cmd", [True, False])
+def test_a_slot_wake_runs_the_hand_offs_on_pass_cmd_model_free(env, monkeypatch, tmp_path, reap_tmp_processes,
+                                                               on_pass_cmd):
+    """P1 waits only on `ttp lock --probe board`, its timer an hour off. Once board frees, its slot wake
+    runs the hand-off's on_pass_cmd model-free and records its result, with no model run. A hand-off
+    without one is woken and started as before."""
+    p, d, drain, go = _board_setup(env, monkeypatch, tmp_path, board=2)
+    try:
+        a = _board_add(p, "A holds board", 3)
+        p1 = _board_add(p, "P1 urgent", 1)
+        cmd = """printf '{"status": "done", "summary": "board came free; published"}' > "$TTP_RESULT\""""
+        _board_waiting(p, d, tmp_path, p1, **({"on_pass_cmd": cmd} if on_pass_cmd else {}))
+        _board_slots(p, d, 1)
+        runs = p.db.one("SELECT COUNT(*) AS n FROM runs WHERE task=?", (p1,))["n"]
+        go(a)
+        d.dispatch()
+        if not on_pass_cmd:
+            assert _slot_tasks(p) == [p1], "the hand-off was not woken and started"
+            assert "board came free" in json.loads(p.db.task(p1)["result"])["woke"]
+            return
+        assert _slot_tasks(p) == [], "the slot wake started a model run"
+        assert p1 in d._on_pass, "its on_pass_cmd did not start"
+        assert p.db.task(p1)["not_before"] > time.time() + 60, "left due for a model run meanwhile"
+        assert _until_true(lambda: d._poll_on_pass(time.time()) or p.db.task(p1)["status"] == "done"), \
+            p.db.task(p1)
+        assert json.loads(p.db.task(p1)["result"])["summary"].startswith("board came free; published")
+        assert p.db.one("SELECT COUNT(*) AS n FROM runs WHERE task=?", (p1,))["n"] == runs, "a model run started"
+    finally:
         drain(d)
         assert reap_tmp_processes(tmp_path) == [], "a stand-in run outlived the test"
