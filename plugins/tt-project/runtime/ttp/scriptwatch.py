@@ -7,13 +7,17 @@ path in it, a file in the folder it runs in, or a bare command found on PATH, th
 other scripts in their folders that a watched script names (by path or file name, a .py also by module name, or a glob such
 as *.sh, or a path it builds at run time: `$here/lib-$x.sh` names lib-*.sh), followed from script to script. An unrelated
 script beside them is not watched, so editing it costs no rerun; a script that cannot be read in full, or that builds a
-path ending in an expansion or a bare `*` (`"$here"/*`, `$here/$f`), is taken to name all of its neighbours. rerun() runs the command; a run that failed while
-one of them changed is run once more, on the new version, and said as LABEL. The rerun's result counts,
-so a real failure still fails; a failure with nothing changed is reported as before.
+path ending in an expansion or a bare `*` (`"$here"/*`, `$here/$f`), is taken to name all of its neighbours. A script
+changed when its content did: a touch, a commit or a rename of the same text is no change. rerun() runs the command; a run
+that failed while one of them changed is run once more, on the new version, and said as LABEL. The rerun's result counts,
+so a real failure still fails; a failure with nothing changed is reported as before. A push check (`on_pass`) is the
+other way round: its failure stands and is never rerun (the next push runs the new version), and only a pass against
+a script whose content changed is run once more, since it passed on the old version.
 """
 from __future__ import annotations
 
 import fnmatch
+import hashlib
 import os
 import re
 import shlex
@@ -24,6 +28,7 @@ from typing import Callable, TypeVar
 T = TypeVar("T")
 
 LABEL = "script changed mid-run, rerun once"
+KEPT = "script changed mid-run; the check failed, so it is not rerun and its failure stands (the next push runs the new version)"
 SUFFIXES = (".sh", ".bash")
 MAX_FOLDER = 200   # a folder with more entries (/usr/bin) adds only the named script, not its neighbours
 MAX_WATCHED = 200  # at most this many scripts per command
@@ -139,44 +144,59 @@ def _names(text: str | None, built: set[str] | None, name: str) -> bool:
             return True
     return any(g.strip("*?") and fnmatch.fnmatchcase(name, g) for g in _GLOB.findall(text))
 
-def _stat(path: str) -> tuple | None:
+def _digest(path: str) -> str | None:
+    """A hash of the file's content, or None when it cannot be read (gone, or not a file)."""
+    h = hashlib.sha256()
     try:
-        st = os.stat(path)
+        with open(path, "rb") as f:
+            for block in iter(lambda: f.read(1 << 16), b""):
+                h.update(block)
     except OSError:
         return None
-    return st.st_dev, st.st_ino, st.st_mtime_ns, st.st_size
+    return h.hexdigest()
 
 
-def watch(cmd: str, cwd: str | Path, env: dict | None = None) -> dict[str, tuple | None]:
-    """What changed() compares against: each script's identity and content stamp before a run."""
-    return {str(p): _stat(str(p)) for p in scripts(cmd, cwd, env)}
+def watch(cmd: str, cwd: str | Path, env: dict | None = None) -> dict[str, str | None]:
+    """What changed() compares against: each script's content hash before a run."""
+    return {str(p): _digest(str(p)) for p in scripts(cmd, cwd, env)}
 
 
-def changed(seen: dict[str, tuple | None]) -> list[str]:
-    """The watched scripts that were rewritten, replaced or removed since watch()."""
-    return [p for p, st in seen.items() if _stat(p) != st]
+def changed(seen: dict[str, str | None]) -> list[str]:
+    """The watched scripts whose content changed, or that were removed, since watch(). A new mtime, a
+    commit or a rename of the same content is no change."""
+    return [p for p, h in seen.items() if _digest(p) != h]
 
 
-def note(paths: list[str], cwd: str | Path = "") -> str:
+def _short(paths: list[str], cwd: str | Path) -> str:
     def short(p: str) -> str:
         try:
             return str(Path(p).relative_to(cwd)) if cwd else p
         except ValueError:
             return p
-    return f"{LABEL}: {', '.join(short(p) for p in paths)}"
+    return ", ".join(short(p) for p in paths)
+
+
+def note(paths: list[str], cwd: str | Path = "") -> str:
+    return f"{LABEL}: content changed in {_short(paths, cwd)}"
 
 
 def rerun(run: Callable[[], T], failed: Callable[[T], bool], cmd: str | None, cwd: str | Path,
           env: dict | None = None, say: Callable[[str], None] | None = None,
-          again: Callable[[], bool] | None = None) -> T:
-    """run(); when its result failed and a script `cmd` names changed meanwhile, say so and run() once
-    more, returning that result. No `cmd` (a check that runs on another host) watches nothing.
-    `again` (optional) can veto the rerun, e.g. when no time is left for it."""
+          again: Callable[[], bool] | None = None, on_pass: bool = False) -> T:
+    """run(); when its result failed and the content of a script `cmd` names changed meanwhile, say so and
+    run() once more, returning that result. No `cmd` (a check that runs on another host) watches nothing.
+    `again` (optional) can veto the rerun, e.g. when no time is left for it. `on_pass` (a push check):
+    rerun only a pass whose scripts changed; a failure stands, said as KEPT when a script changed."""
     seen = watch(cmd, cwd, env) if cmd else {}
     out = run()
-    if not seen or not failed(out):
+    bad = failed(out)
+    if not seen or (not bad and not on_pass):
         return out
     moved = changed(seen)
+    if bad and on_pass:
+        if moved and say:
+            say(f"{KEPT}: content changed in {_short(moved, cwd)}")
+        return out
     if not moved or (again is not None and not again()):
         return out
     if say:

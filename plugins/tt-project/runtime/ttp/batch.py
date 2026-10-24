@@ -1141,7 +1141,7 @@ class Batch:
                 rc, tail, _ = scriptwatch.rerun(
                     lambda: _stream(push.check_argv(cmd, self.wt), self.wt,
                                     env={**env, **extra, **slot.env()}, pass_fds=checkdirs.inherited()),
-                    lambda r: r[0] != 0, None if push.remote_host(cmd) else str(cmd), self.wt, env, say)
+                    lambda r: r[0] != 0, None if push.remote_host(cmd) else str(cmd), self.wt, env, say, on_pass=True)
                 suite_out.append(tail)
                 if fault := push.remote_fault(cmd, rc, self.wt):
                     raise envfault.Fault(fault)   # the check host, not this head: push_phase holds the batch

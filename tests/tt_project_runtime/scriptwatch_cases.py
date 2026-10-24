@@ -34,7 +34,7 @@ def test_scriptwatch_reruns_once_a_command_whose_script_was_rewritten_in_place_m
     out = scriptwatch.rerun(run, lambda r: r.returncode != 0, "bash check.sh", tmp_path, None, said.append)
     assert script.stat().st_ino == ino, "the script was edited in place, as in the reported failure"
     assert out.returncode == 0 and _runs(script) == 2
-    assert said == [f"{scriptwatch.LABEL}: check.sh"]
+    assert said == [f"{scriptwatch.LABEL}: content changed in check.sh"]
     # Without the watch the same first run is the plain failure the report showed.
     (tmp_path / "check.sh.ran").unlink()
     (tmp_path / "check.sh.runs").unlink()
@@ -55,7 +55,7 @@ def test_scriptwatch_still_fails_a_real_failure_and_a_second_failure(tmp_path):
     # Changed mid-run, and the new version fails too: the rerun's failure counts.
     twice = _self_rewriting(tmp_path / "twice.sh", then_exit=3)
     assert scriptwatch.rerun(run("twice.sh"), bool, "bash twice.sh", tmp_path, None, said.append) == 3
-    assert _runs(twice) == 2 and said == [f"{scriptwatch.LABEL}: twice.sh"]
+    assert _runs(twice) == 2 and said == [f"{scriptwatch.LABEL}: content changed in twice.sh"]
     # A command that names no script, or no command (a remote check), is never rerun.
     count = tmp_path / "count"
     sh = lambda: subprocess.run(["sh", "-c", f"echo x >> {count}; exit 1"]).returncode
@@ -128,7 +128,7 @@ def test_scriptwatch_reruns_for_an_edited_dependency_but_not_for_an_unrelated_ne
         said = []
         assert scriptwatch.rerun(run, bool, "bash bin/check.sh", tmp_path, {"PATH": ""}, said.append) == 1
         assert len(count) == runs
-        assert said == ([f"{scriptwatch.LABEL}: bin/deep.sh"] if runs == 2 else [])
+        assert said == ([f"{scriptwatch.LABEL}: content changed in bin/deep.sh"] if runs == 2 else [])
 
 def test_scriptwatch_watches_neighbours_a_script_reaches_through_a_path_built_at_run_time(tmp_path):
     # A path built at run time is an ambiguous reference: include what it may name rather than drop it.
@@ -161,7 +161,7 @@ def test_ttp_checks_reruns_a_check_whose_script_was_rewritten_mid_run_and_labels
     p.set_config("delivery.push_checks", [{"run": "bash check.sh", "cwd": "authoring"}])
     cli.main(["checks"])
     out = capsys.readouterr().out
-    assert f"ttp checks: {scriptwatch.LABEL}: check.sh" in out
+    assert f"ttp checks: {scriptwatch.LABEL}: content changed in check.sh" in out
     assert json.loads((run / "checks.json").read_text())["passed"] and _runs(repo / "check.sh") == 2
     assert scriptwatch.LABEL in (run / "checks.log").read_text()
     # A check that fails with its script unchanged still fails, run once.
@@ -176,26 +176,94 @@ def test_ttp_checks_reruns_a_check_whose_script_was_rewritten_mid_run_and_labels
     assert not json.loads((run / "checks.json").read_text())["passed"]
 
 
-def test_a_push_check_whose_script_was_rewritten_mid_run_is_rerun_once(tmp_path):
+def _push_check(path, edit, exit_code=0):
+    """A push check script whose first run runs `edit` (shell, with $0 the script) and exits `exit_code`;
+    later runs exit 0. Each run appends a line to <path>.runs."""
+    path.write_text(
+        "#!/bin/bash\n"
+        "echo x >> \"$0.runs\"\n"
+        "if [ ! -e \"$0.ran\" ]; then\n"
+        "  : > \"$0.ran\"\n"
+        f"  {edit}\n"
+        f"  exit {exit_code}\n"
+        "fi\n")
+    path.chmod(0o755)
+    return path
+
+
+def test_a_push_check_whose_script_is_touched_or_recommitted_with_the_same_content_is_not_rerun(tmp_path):
+    from ttp import push
+    git = lambda *a: subprocess.run(["git", "-C", str(tmp_path), *a], check=True, capture_output=True)
+    git("init", "-q")
+    git("config", "user.email", "t@example.com")
+    git("config", "user.name", "t")
+    same = 'cp "$0" "$0.new" && mv "$0.new" "$0" && touch -d "+1 hour" "$0" && git add -A && git commit -qm again --allow-empty'
+    for code, want in ((0, 0), (1, push.CHECKS_FAILED)):
+        name = f"check{code}.sh"
+        _push_check(tmp_path / name, same, code)
+        git("add", "-A")
+        git("commit", "-qm", "check")
+        ino = (tmp_path / name).stat().st_ino
+        said = []
+        assert push._run_one(f"bash {name}", tmp_path, dict(os.environ), said.append) == want
+        assert (tmp_path / name).stat().st_ino != ino, "replaced, touched and recommitted: only the content is the same"
+        assert _runs(tmp_path / name) == 1 and said == []
+
+
+def test_a_passed_push_check_whose_script_content_changed_is_rerun_once_and_a_failed_one_never(tmp_path):
     from ttp import push, scriptwatch
-    _self_rewriting(tmp_path / "check.sh")
+    edit = 'echo "# new" >> "$0"'
+    _push_check(tmp_path / "check.sh", edit)
     said = []
     assert push._run_one("bash check.sh", tmp_path, dict(os.environ), said.append) == 0
-    assert said == [f"{scriptwatch.LABEL}: check.sh"]
-    _self_rewriting(tmp_path / "again.sh", then_exit=1)
-    assert push._run_one("bash again.sh", tmp_path, dict(os.environ), said.append) == push.CHECKS_FAILED
-    assert _runs(tmp_path / "again.sh") == 2
+    assert said == [f"{scriptwatch.LABEL}: content changed in check.sh"] and _runs(tmp_path / "check.sh") == 2
+    # A failure stands: not rerun, the push refused, and the report says the script changed.
+    _push_check(tmp_path / "fail.sh", edit, exit_code=1)
+    said = []
+    assert push._run_one("bash fail.sh", tmp_path, dict(os.environ), said.append) == push.CHECKS_FAILED
+    assert _runs(tmp_path / "fail.sh") == 1
+    assert said == [f"{scriptwatch.KEPT}: content changed in fail.sh"]
+    # A torn script (rewritten in place, failing with a syntax error) is a failure too: never rerun.
+    _self_rewriting(tmp_path / "torn.sh")
+    said = []
+    assert push._run_one("bash torn.sh", tmp_path, dict(os.environ), said.append) == push.CHECKS_FAILED
+    assert _runs(tmp_path / "torn.sh") == 1 and said == [f"{scriptwatch.KEPT}: content changed in torn.sh"]
+    # At most one rerun: a rerun that changes the script again is not run a third time.
+    count = []
+    def run():
+        count.append(1)
+        with open(tmp_path / "check.sh", "a") as f:
+            f.write("# again\n")
+        return 0
+    assert scriptwatch.rerun(run, bool, "bash check.sh", tmp_path, None, None, on_pass=True) == 0
+    assert len(count) == 2
+
+
+def test_a_push_check_reruns_when_a_named_neighbour_content_changed_not_an_unnamed_one(tmp_path):
+    from ttp import push, scriptwatch
+    bin_ = tmp_path / "bin"
+    bin_.mkdir()
+    (bin_ / "lib.sh").write_text("x=1\n")
+    (bin_ / "other.sh").write_text("x=1\n")
+    for edit, runs in (("other.sh", 1), ("lib.sh", 2)):
+        (bin_ / "check.sh.ran").unlink(missing_ok=True)
+        (bin_ / "check.sh.runs").unlink(missing_ok=True)
+        _push_check(bin_ / "check.sh", '. "$(dirname "$0")/lib.sh"; echo y=2 >> "$EDIT"')   # names lib.sh only
+        said = []
+        assert push._run_one("bash bin/check.sh", tmp_path, {**os.environ, "EDIT": str(bin_ / edit)}, said.append) == 0
+        assert _runs(bin_ / "check.sh") == runs
+        assert said == ([f"{scriptwatch.LABEL}: content changed in bin/lib.sh"] if runs == 2 else [])
 
 
 def test_a_schedule_command_and_a_heal_check_whose_script_changed_mid_run_are_rerun_once(env, tmp_path):
     from ttp import heal, schedrun, scriptwatch
     _self_rewriting(tmp_path / "watch.sh")
     out = schedrun.run_group("bash watch.sh", cwd=str(tmp_path), timeout=60, env=dict(os.environ))
-    assert out.returncode == 0 and out.stderr.startswith(f"ttp: {scriptwatch.LABEL}: watch.sh\n")
+    assert out.returncode == 0 and out.stderr.startswith(f"ttp: {scriptwatch.LABEL}: content changed in watch.sh\n")
     assert _runs(tmp_path / "watch.sh") == 2
     _self_rewriting(tmp_path / "healthy.sh")
     rc, text = heal.check({"check": "bash healthy.sh", "timeout_s": 60}, {}, str(tmp_path), dict(os.environ))
-    assert rc == 0 and text.endswith(f"{scriptwatch.LABEL}: healthy.sh")
+    assert rc == 0 and text.endswith(f"{scriptwatch.LABEL}: content changed in healthy.sh")
     # An unhealthy answer with nothing changed is the check's answer, run once.
     (tmp_path / "sick.sh").write_text("#!/bin/bash\necho x >> \"$0.runs\"\necho down\nexit 1\n")
     assert heal.check({"check": "bash sick.sh", "timeout_s": 60}, {}, str(tmp_path), dict(os.environ)) == (1, "down")
@@ -230,7 +298,7 @@ def test_a_watcher_or_precheck_exit_1_is_its_answer_and_never_rerun_when_a_neigh
     # A real failure (a bash syntax error from a script rewritten in place) is still rerun once.
     _self_rewriting(bin_dir / "broken.sh")
     out = schedrun.run_group("bash bin/broken.sh", cwd=str(p.root), timeout=60, env=dict(os.environ), ok=(0, 1))
-    assert out.returncode == 0 and out.stderr.startswith(f"ttp: {scriptwatch.LABEL}: bin/broken.sh\n")
+    assert out.returncode == 0 and out.stderr.startswith(f"ttp: {scriptwatch.LABEL}: content changed in bin/broken.sh\n")
     assert _runs(bin_dir / "broken.sh") == 2
 
 

@@ -3451,7 +3451,7 @@ def _run_one(cmd: Any, repo: Path, env: dict, say: Callable[[str], None]) -> int
         say(f"running {cmd}{where(cmd)}")
     rc = scriptwatch.rerun(
         lambda: subprocess.run(check_argv(cmd, repo, env), cwd=repo, env=env, pass_fds=checkdirs.inherited()).returncode,
-        bool, None if remote_host(cmd) else str(cmd), repo, env, say)
+        bool, None if remote_host(cmd) else str(cmd), repo, env, say, on_pass=True)
     if rc == 0:
         return 0
     if fault := remote_fault(cmd, rc, repo):
