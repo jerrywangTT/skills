@@ -49,6 +49,7 @@ from .db import DB, continues_id, load_result
 
 CONT_TITLE = re.compile(r"(?i)^\s*(?:continue|mechanical)\s*:")
 # A hop that only runs checks, pushes or edits spec or PR text: queued at the light tier (hop_tier).
+FIX_TITLE = re.compile(r"(?i)^\s*fix review #\d+")   # the daemon's review fix title, also used by hand
 MECH_TITLE = re.compile(r"(?i)^\s*mechanical\s*:")
 TIERS = ("light", "standard", "deep")
 REASON_RE = re.compile(r"(?i)\b(?:new|different|changed|other)\s+(?:approach|evidence|design|strategy)\b"
@@ -104,6 +105,21 @@ def prev_of(task: dict) -> int | None:
     if task.get("parent") and CONT_TITLE.match(task.get("title") or ""):
         return int(task["parent"])
     return None
+
+
+def is_review_fix(task: dict) -> bool:
+    """Whether hop `task` is a review fix (the daemon's review fix path labels it `review_fix:<review>`;
+    a fix the coordinator added by title is matched by FIX_TITLE) rather than a continuation. A `continue:`
+    or FOLLOWS hop that took a failed review's findings over stays a continuation: the split made it."""
+    title = task.get("title") or ""
+    if CONT_TITLE.match(title) or follows_id(task) is not None:
+        return False
+    try:
+        labels = json.loads(task.get("labels") or "[]")
+    except ValueError:
+        labels = []
+    return any(isinstance(lb, str) and lb.startswith("review_fix:") for lb in (labels if isinstance(labels, list) else [])) \
+        or bool(FIX_TITLE.match(title))
 
 
 def chain(db: DB, task_id: int) -> list[dict]:
@@ -404,7 +420,9 @@ def clear_notices(db: DB, before: float) -> None:
 
 
 def lineages(db: DB, since: float) -> list[dict]:
-    """Each lineage with a hop active since `since`: {root, title, hops, usd, auto, refused, overridden, tip}."""
+    """Each lineage with a hop active since `since`: {root, title, hops, usd, auto, refused, overridden, tip,
+    fix_hops, fix_usd, cont_hops, cont_usd}: usd is the whole lineage's, the hop figures split its hops into
+    review fixes (is_review_fix) and continuations, each with the hops' own spend."""
     out: dict[int, dict] = {}
     for t in db.q("SELECT * FROM tasks WHERE COALESCE(updated, created)>=? ORDER BY id", (since,)):
         if prev_of(t) is None:
@@ -412,8 +430,11 @@ def lineages(db: DB, since: float) -> list[dict]:
         ch = chain(db, t["id"])
         if len(ch) < 2 or ch[0]["id"] in out and out[ch[0]["id"]]["hops"] >= len(ch) - 1:
             continue
+        fixes = [t for t in ch[1:] if is_review_fix(t)]
         out[ch[0]["id"]] = {"root": ch[0]["id"], "title": str(ch[0]["title"]), "hops": len(ch) - 1,
                             "usd": spend(ch), "tip": ch[-1]["id"], "status": ch[-1]["status"],
+                            "fix_hops": len(fixes), "fix_usd": spend(fixes),
+                            "cont_hops": len(ch) - 1 - len(fixes), "cont_usd": spend(ch[1:]) - spend(fixes),
                             "auto": 0, "refused": 0, "overridden": 0}
     for kind, key in ((AUTO_EVENT, "auto"), (CAP_EVENT, "refused"), (OVERRIDE_EVENT, "overridden")):
         for r in db.q("SELECT data FROM events WHERE kind=? AND ts>=?", (kind, since)):
@@ -427,15 +448,22 @@ def lineages(db: DB, since: float) -> list[dict]:
 
 
 def audit_line(db: DB, since: float, top: int = 8) -> str:
-    """The self-efficiency audit's line: hops and spend per lineage, and refusals; '' with none."""
+    """The self-efficiency audit's line: hops and spend per lineage, split into continuations and review
+    fixes (those the review-loop line counts already), and refusals; '' with none."""
     ls = lineages(db, since)
     if not ls:
         return ""
     refused = sum(x["refused"] for x in ls)
+    cont, fix = [x for x in ls if x["cont_hops"]], [x for x in ls if x["fix_hops"]]
     return (f"continue chains: {len(ls)} lineage(s), {sum(x['hops'] for x in ls)} hops, "
-            f"${sum(x['usd'] for x in ls):.2f}, {sum(x['auto'] for x in ls)} hops queued by the daemon, "
+            f"${sum(x['usd'] for x in ls):.2f} with their first tasks; continuations: "
+            f"{sum(x['cont_hops'] for x in cont)} hops in {len(cont)} lineage(s), ${sum(x['cont_usd'] for x in cont):.2f}; "
+            f"review fixes (also in the review-loop line): {sum(x['fix_hops'] for x in fix)} hops in {len(fix)} "
+            f"lineage(s), ${sum(x['fix_usd'] for x in fix):.2f}; {sum(x['auto'] for x in ls)} hops queued by the daemon, "
             f"{refused} refused by a cap, {sum(x['overridden'] for x in ls)} passed with a reason: " + "; ".join(
-                f"#{x['root']} {headline.clip(x['title'], 50)}: {x['hops']} hops to #{x['tip']} ({x['status']}), ${x['usd']:.2f}"
+                f"#{x['root']} {headline.clip(x['title'], 50)}: {x['hops']} hops"
+                + (f" ({x['fix_hops']} review fix{'es' if x['fix_hops'] > 1 else ''})" if x["fix_hops"] else "")
+                + f" to #{x['tip']} ({x['status']}), ${x['usd']:.2f}"
                 + (f", {x['auto']} auto" if x["auto"] else "") + (f", {x['refused']} refused" if x["refused"] else "")
                 + (f", {x['overridden']} overridden" if x["overridden"] else "") for x in ls[:top])
             + (f"; +{len(ls) - top} more" if len(ls) > top else ""))

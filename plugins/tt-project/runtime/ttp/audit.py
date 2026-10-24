@@ -134,15 +134,16 @@ def lost_runs(db: DB, since: float) -> dict[str, dict]:
     return out
 
 
-def continued_tasks(db: DB, since: float) -> list[dict]:
+def continued_tasks(db: DB, since: float, fixes: bool = False) -> list[dict]:
     """Work tasks added since `since` that continue an earlier one (`continues:<id>`; review rounds are
-    review_loops'), most costly first: {id, title, of, of_usd, usd}."""
+    review_loops'), most costly first: {id, title, of, of_usd, usd}. Continuations only, or with `fixes`
+    only the review fixes (chaincap.is_review_fix), whose spend the review-loop line counts."""
     out = []
     for t in db.q("SELECT id, title, labels, spent_usd FROM tasks WHERE kind!='review' AND created>=? "
                   "AND labels LIKE '%continues:%'", (since,)):
         of = continues_id(t)
         old = db.task(of) if of is not None else None
-        if old:
+        if old and chaincap.is_review_fix(t) == fixes:
             out.append({"id": t["id"], "title": t["title"], "of": of, "of_usd": float(old["spent_usd"] or 0),
                         "usd": float(t["spent_usd"] or 0)})
     return sorted(out, key=lambda x: -(x["of_usd"] + x["usd"]))
@@ -315,9 +316,11 @@ def lines(db: DB, now: float | None = None, window_s: float = WINDOW_S, blocked_
                        f"{c['n']} to {cause} ${c['usd'] - c['kept_usd']:.2f}"
                        + (f" ({c['kept_n']} resumed, work kept)" if c["kept_n"] else "")
                        for cause, c in sorted(lost.items())))
-    cont = continued_tasks(db, since)
-    if cont:
-        out.append(f"tasks continued from an earlier one: {len(cont)}: " + ", ".join(
+    cont, fixed = continued_tasks(db, since), continued_tasks(db, since, fixes=True)
+    if cont or fixed:
+        out.append(f"tasks continued from an earlier one: {len(cont)}"
+                   + (f" (+ {len(fixed)} review fixes, ${sum(t['usd'] for t in fixed):.2f}, counted in the review-loop line)"
+                      if fixed else "") + (": " if cont else "") + ", ".join(
             f"#{t['id']} {_short(t['title'], 50)} continues #{t['of']} (${t['of_usd']:.2f} + ${t['usd']:.2f})"
             for t in cont[:TOP]) + _more(cont))
     if fixes := correction.audit_line(db, since):
@@ -416,6 +419,7 @@ def report(db: DB, now: float | None = None, window_s: float = WINDOW_S, blocked
     return {"window_h": window_s / 3600, "asks": asks(db, since, now), "asks_refused": rejected_asks(db, since),
             "failed_runs": failed_runs(db, since), "lost_runs": lost_runs(db, since),
             "retried_tasks": retried_tasks(db, since), "continued_tasks": continued_tasks(db, since),
+            "review_fix_tasks": continued_tasks(db, since, fixes=True),
             "coordinator_turns": coordinator_turns(db, since),
             "coordinator_cache": budget.coordinator_cache(db, now, window_s)["window"], "turns_skipped": turngate.skipped(db, since), "turns_quiet": quietgate.skipped(db, since), "sweeps": sweepskip.counts(db, since, now),
             "finished": done, "per_outcome": per_outcome(done),
