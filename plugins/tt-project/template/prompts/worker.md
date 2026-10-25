@@ -84,7 +84,7 @@ Other workers run other tasks of this project at the same time.
   goes in its change ledger: `ttp machines change add <alias> "<what and why>" --undo "<cmd>"
   (--expires <t> | --until-probe "<cmd>")`, in the same run, before the hand-off; never leave the
   entry to a later task (or hand off `blocked`). Undo, then `ttp machines change close <id>`;
-  no undo: `--undo "none: <why>"` self-closes.
+  `--undo "none: <why>"` self-closes.
 <!-- ttp:if remote -->
   A change made for a test also takes `--test`.
 <!-- /ttp:if remote -->
