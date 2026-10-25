@@ -1231,7 +1231,7 @@ def route(now: float | None = None, able: Callable[[str], tuple[bool, str]] | No
         _store_outages(doc, outage_entries(now, doc))
         _write(ROUTES, doc)
         ledger = _read(LEDGER, {"next": 1, "changes": []})
-        changed = False
+        changed, shut = False, []
         for c in ledger.get("changes", []):
             late = overdue(c, now)
             if not late:
@@ -1242,7 +1242,7 @@ def route(now: float | None = None, able: Callable[[str], tuple[bool, str]] | No
                 c.update(closed=now, closed_why=f"auto-closed: {rule}", closed_by=f"{AUTO_CLOSE}: {rule}",
                          auto_closed={"at": now, "rule": rule, "sweeper": claimer})
                 changed = True
-                log(f"machine change #{c['id']} on {c['alias']} auto-closed ({rule}): {c['what']}")
+                shut.append(f"machine change #{c['id']} on {c['alias']} auto-closed ({rule}): {c['what']}")
                 continue
             page = c.setdefault("page", {})
             target = _step(page, chain(c["alias"], c.get("by")), now, able)
@@ -1256,6 +1256,8 @@ def route(now: float | None = None, able: Callable[[str], tuple[bool, str]] | No
             claim(page)
         if changed:
             _write(LEDGER, ledger)
+    for line in shut:   # only once written
+        log(line)
     return out
 
 
