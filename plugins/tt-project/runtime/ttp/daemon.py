@@ -42,6 +42,7 @@ from . import replymsg
 from . import awake
 from . import budget as bud
 from . import budgetkind
+from . import pregrant
 from . import deadwait
 from . import cachettl
 from . import chaincap
@@ -331,6 +332,9 @@ STALL_KEY = "stall"   # kv: {"run": the last worker run when a stall was raised}
 STALL_SETTLE_S = 600   # after a daemon start, dispatch gets this long before a stall is raised
 STALL_GAP_S = 600      # checks further apart than this (a paused project): readiness counts again
 STALL_LIST_MAX = 30    # ready tasks listed in one stall observation
+PRE_GRANT_KEY = "pre_grant_raised"   # kv: pregrant.fault_key -> when it was last raised
+PRE_GRANT_REUSE_S = 30                # dispatch reuses a pre-grant check's answer this long
+PRE_GRANT_RERAISE_S = 6 * 3600        # a broken pre-grant check is raised again at most this often
 STALE_HOLDS_KEY = "holds_stale"   # kv: run -> its hold alerted as kept for a closed task (Daemon.alert_stale_holds)
 WORKSPACE_RETRY_NOTE = "workspace retry"   # a queued task's note while its workspace is retried
 SLEPT_MIN_S = 60        # a run whose wall clock ran this much ahead of its monotonic clock overlapped a host sleep
@@ -658,6 +662,7 @@ class Daemon:
         self._metered: dict[int, tuple[int, float]] = {}   # run id -> (output size, when) last priced
         self._escalated: dict[int, tuple[int, int]] = {}   # run id -> (size, mtime_ns) of its ESCALATE_FILE relayed
         self._start_failures = 0
+        self._pre_grant_seen: dict[tuple[str, int], tuple[float, pregrant.Answer]] = {}
         self._lock_fd: int | None = None
         self._started = time.time()
         # what code this process loaded, captured once before the first tick (never re-read)
@@ -1158,7 +1163,7 @@ class Daemon:
         core_held = self._run_step(lambda: self.net_held(core) and not self._net_may_probe(core), "net_held", default=False)
         cycle = self._run_step(lambda: self.host_cycle_held(now), "host_cycle_held", default=False)
         for step in (self.run_schedules, self.poll_slack, self.check_resource_trouble, self.read_upstream,
-                     self.wake_upstream_fixes, self.drain_note_outbox, self.forward_upstream, self.retry_rejected, self.check_stall, self.check_slot_wait, self.check_progress, self.check_idle_capacity, self.check_obligations, self.audit_pushes, self.retire_ended, self.archive_hidden_memory, self.route_machines, self.refresh_coverage, self.sweep_holds, self.sweep_reviews, self.sweep_unreviewed, self.check_unqueued_continues, self.check_stale_duplicates, self.tend_mitigations, self.failover_pinned, self.rethink_asks, self.blocker_sweep, self.maybe_coordinate, self.refresh_ref_waits, self.sample_jobs, self.watch_progress, self.probe_waiting, self.start_pushes, self.dispatch, self.check_unreachable, self.remind_logouts, self.relay_when_blocked, self.deliver_outbound):
+                     self.wake_upstream_fixes, self.drain_note_outbox, self.forward_upstream, self.retry_rejected, self.check_stall, self.check_slot_wait, self.check_progress, self.check_idle_capacity, self.check_obligations, self.audit_pushes, self.retire_ended, self.archive_hidden_memory, self.route_machines, self.refresh_coverage, self.sweep_holds, self.sweep_reviews, self.sweep_unreviewed, self.check_unqueued_continues, self.check_stale_duplicates, self.tend_mitigations, self.failover_pinned, self.rethink_asks, self.blocker_sweep, self.maybe_coordinate, self.refresh_ref_waits, self.sample_jobs, self.watch_progress, self.probe_waiting, self.start_pushes, self.dispatch, self.raise_pre_grant_faults, self.check_unreachable, self.remind_logouts, self.relay_when_blocked, self.deliver_outbound):
             if self.cfg_status == "unavailable" and step in (self.maybe_coordinate, self.dispatch):
                 continue   # no routing to start model work with (see _load_config)
             # While the host settles after a sleep only new work waits: a person who wrote is answered now.
@@ -2182,6 +2187,10 @@ class Daemon:
                                    "holder": shared.holder(self.p, res, hold.who(task['id']), self.cfg)}
                                   for res in _exclusive(task)] if task else [],
                     "exclusive_wait_s": self.cfg["budget"].get("exclusive_wait_s", 600),
+                    # The project's own holds, asked again before each whole-run take (pregrant.py).
+                    **({"pre_grant": {"cmd": pregrant.command(self.cfg), "root": str(self.p.root),
+                                      "state": str(self.p.state), "timeout_s": pregrant.timeout_s(self.cfg)}}
+                       if task and _exclusive(task) and pregrant.command(self.cfg) else {}),
                     "holds": str(self.p.state / "holds"),   # where a hold kept for detached jobs is registered
                     "private_files": private, "tmp_dir": tmp_env.get("TMPDIR"),
                     # Workers and reviewers run niced, and all they start with them; the coordinator not.
@@ -8964,7 +8973,9 @@ class Daemon:
         which the stall check reads instead of working it out again): {"kind": "pause", "resource"}
         (paused, directly or through a device.locks alias), {"kind": "busy", "resource", "tasks"} (the
         running tasks that fill its slots) or {"kind": "lock", "resource", "holders"} (its `ttp lock`
-        slots are taken: each holder's label, pid and alive, from locks.holder_records)."""
+        slots are taken: each holder's label, pid and alive, from locks.holder_records), or with config
+        locks.pre_grant_check set, {"kind": "pre_grant", "resource", "rc", "line"} (the project's own
+        check holds it, or is broken: pregrant.py)."""
         paused = self.p.db.paused_resources().keys()
         hit = sorted(coord.task_resources(task) & paused)
         if hit:
@@ -9015,7 +9026,44 @@ class Daemon:
                 except Exception:   # naming the holder never changes the hold
                     holders = []
                 return {"kind": "lock", "resource": res, "holders": holders}
+        # Asked last, once the slots would let it start: the project's own holds (pregrant.py).
+        check = pregrant.command(self.cfg)
+        for res in sorted(coord.task_resources(task)) if check else []:
+            got = self._pre_grant(check, res, task["id"])
+            if not got.granted:
+                return {"kind": "pre_grant", "resource": res, "rc": got.rc, "line": got.line}
         return None
+
+    def _pre_grant(self, check: str, res: str, tid: int) -> pregrant.Answer:
+        """The pre-grant check's answer for a task and resource, reused for PRE_GRANT_REUSE_S: dispatch
+        and the stall checks ask every tick, and the grant itself (the run's take, `ttp lock`) asks again."""
+        now = time.time()
+        got = self._pre_grant_seen.get((res, tid))
+        if got and now - got[0] < PRE_GRANT_REUSE_S:
+            return got[1]
+        ans = pregrant.check(check, self.p.root, res, tid, self.p.state, pregrant.timeout_s(self.cfg))
+        self._pre_grant_seen = {k: v for k, v in self._pre_grant_seen.items() if now - v[0] < PRE_GRANT_REUSE_S}
+        self._pre_grant_seen[(res, tid)] = (now, ans)
+        if not ans.granted:
+            log(self.p, f"task {tid}: {ans.line}")
+        return ans
+
+    def raise_pre_grant_faults(self) -> None:
+        """A broken pre-grant check (an exit other than 0, 1 or 75, or no answer in time), as dispatch, a
+        run's take or `ttp lock` recorded it: one observation per resource and exit, raised again at most
+        every PRE_GRANT_RERAISE_S, however often the held tasks retry meanwhile."""
+        faults = pregrant.take_faults(self.p.state)
+        if not faults:
+            return
+        db, now = self.p.db, time.time()
+        raised = {k: v for k, v in (db.kv(PRE_GRANT_KEY, {}) or {}).items() if now - float(v) < PRE_GRANT_RERAISE_S}
+        for rec in faults:
+            key = pregrant.fault_key(rec)
+            if key in raised:
+                continue
+            raised[key] = now
+            self.observe("daemon:pre-grant", pregrant.fault_text(rec), "normal", key=key, whole=True)
+        db.set_kv(PRE_GRANT_KEY, raised)
 
     def _device_max_tasks(self) -> int:
         try:
@@ -11759,6 +11807,8 @@ def hold_reason(hold: dict | None) -> str:
         return f"{res} held by running task(s) " + (", ".join(f"#{t}" for t in hold.get("tasks") or []) or "?")
     if kind == "reserved":
         return f"{res} reserved for higher-priority task #{hold.get('task') or '?'}"
+    if kind == "pre_grant":
+        return hold.get("line") or f"{res} held by the project's pre-grant check"
     hs = [h for h in hold.get("holders") or [] if isinstance(h, dict)]
 
     def _who(h: dict, state: str) -> str:

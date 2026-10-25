@@ -3832,11 +3832,25 @@ def cmd_lock(a) -> None:
         except OSError as e:
             _unwritable(e, L)
     if a.probe:   # a paused `ttp lock` exits 75, so its probe must too
+        from . import pregrant
+        # A free lock is free for a task only once the project's pre-grant check grants it too (asked
+        # only for a known task: the probe of a task's retry_when names it with --task).
+        ptask = str(getattr(a, "task", None) or os.environ.get("TTP_TASK") or "").strip()
+        check = pregrant.command(cfg) if ptask else ""
+
+        def _answer(name: str) -> tuple[int, str | dict]:
+            rc, said = lockprobe.answer(p, cfg, name, a.shared, a.json)
+            if rc != 0 or not check:
+                return rc, said
+            got = pregrant.check(check, p.root, name, ptask, p.state, pregrant.timeout_s(cfg))
+            if got.granted:
+                return rc, said
+            return 75, ({**said, "free": False, "line": got.line, "pre_grant": got.line} if a.json else got.line)
         if len(names) == 1:
-            rc, said = lockprobe.answer(p, cfg, names[0], a.shared, a.json)
+            rc, said = _answer(names[0])
             print(json.dumps(said) if a.json else said)
             sys.exit(rc)
-        return _lock_answers(a, [(L["name"], *lockprobe.answer(p, cfg, L["name"], a.shared, a.json)) for L in todo])
+        return _lock_answers(a, [(L["name"], *_answer(L["name"])) for L in todo])
     label = hold.label(hold.who(os.environ.get("TTP_TASK")), os.environ.get("TTP_RUN_ID"))
     own = os.environ.get("TTP_TASK") or ""
     for L in todo:
@@ -3904,6 +3918,14 @@ def cmd_lock(a) -> None:
         if not todo:
             sys.exit(_logged("exclusive", run_held, lambda: subprocess.call(cmd, env=child_env)))
     what = ",".join(L["name"] for L in todo)   # what the messages and the retry_when name
+    from . import pregrant
+    if check := pregrant.command(cfg):
+        # The project's own holds (pregrant.py): asked before queueing, so a held lock is never taken.
+        for L in todo:
+            got = pregrant.check(check, p.root, L["name"], own, p.state, pregrant.timeout_s(cfg))
+            if not got.granted:
+                die(f"{got.line}; hand the task back as waiting with retry_when "
+                    f"`ttp lock --probe {what}{f' --task {own}' if own.strip() else ''}`", 75)
     # A waiter that holds locks already never waits behind one for several resources at once: that one
     # may wait for a lock this waiter's holder has, and neither would ever go on.
     past_multi = bool(held_locks or shared_locks or whole)
@@ -7813,6 +7835,9 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--shared", action="store_true",
                    help="read mode: run alongside other shared holders; exclusive holders and these exclude each other "
                         "(not for device locks)")
+    s.add_argument("--task", default=None,
+                   help="probe for this task id: a free lock then also needs config locks.pre_grant_check to "
+                        "grant it (default: TTP_TASK)")
     s.add_argument("--json", action="store_true",
                    help="probe, printing JSON: free, paused, waiting and each live holder with its pid and whether "
                         "it lives (a keeper of detached jobs: via \"keeper\", the taker's pid in taker_pid); "

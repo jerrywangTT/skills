@@ -541,7 +541,14 @@ project with `ttp config <name> jev.enabled false`. Without a key, screening is 
   order; a nested `ttp lock` of a resource the command already holds passes straight through; inside
   a run a wait is capped at half the run's stall limit (not in a `ttp detach` job or a background
   driver that outlives the run), then exits 75 so the task can wait on `ttp lock --probe <resource>`
-  (0 free, 75 busy or paused) without a model. Config `device.locks` (opt-in) names one device by several names: all share the first name's lock and pause, tasks that use one
+  (0 free, 75 busy or paused) without a model. Config `locks.pre_grant_check` (opt-in; unset, nothing
+  runs) is a shell command the runtime asks before it grants a task a resource's lock (dispatch of a task
+  naming the resource, an exclusive run's take, `ttp lock`), for a project that keeps holds of its own,
+  such as a repair: run from the project root with the resource and task id as arguments and as
+  `TTP_RESOURCE` and `TTP_TASK_ID`, within `locks.pre_grant_timeout_s` (10). Exit 0 grants; 1 or 75
+  holds as a busy resource (no attempt spent; `ttp lock` exits 75 with the check's reason, and
+  `ttp lock --probe <resource> --task <id>` asks it too); any other exit or no answer holds as well and
+  raises one observation per resource and exit. Config `device.locks` (opt-in) names one device by several names: all share the first name's lock and pause, tasks that use one
   get the `needs_device` label, and at most `device.max_tasks` of them run at once. A worker starts
   a long job with `ttp detach <name> -- <command>`; a run that ends without a hand-off, or waiting
   without a `retry_when`, then waits on `ttp detach --check`, which exits 0 once each job wrote exit

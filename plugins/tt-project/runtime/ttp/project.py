@@ -156,6 +156,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # follows a resource that moves to another box; runners' hosts count too.
     "device": {"locks": [], "max_tasks": 2, "runners": {}, "runner_restarts_per_day": 6, "nodes": [],
                "hosts": {}},
+    # pre_grant_check: a shell command asked before a task gets a resource's lock (pregrant.py), for
+    # a project's own holds on top of the locks; it gets the resource and task id, exit 0 grants, 1 or
+    # 75 holds, anything else or no answer in pre_grant_timeout_s holds and is raised once. "": off.
+    "locks": {"pre_grant_check": "", "pre_grant_timeout_s": 10},
     "shared_resources": [],             # resources whose slots and pause all the user's projects share
     # model / effort, when set, override the coordinator's defaults. Unset, every coordinator turn
     # runs at coordinator.DEFAULT_EFFORT (xhigh, or the provider's highest effort below it) on

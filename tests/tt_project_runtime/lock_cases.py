@@ -339,3 +339,166 @@ def test_a_multi_lock_passes_only_its_own_tasks_reservations_all_or_nothing(env,
     r = subprocess.run([sys.executable, str(TTP), "lock", "--timeout", "5", "rig-a,rig-b", "--", "true"],
                        env=_lock_env(env, p, TTP_TASK="7"), capture_output=True, text=True, timeout=60)
     assert r.returncode == 0 and locks.reserved_by(mark) is None, (r.returncode, r.stderr)
+
+
+def _pre_grant_hook(p, tmp_path, rc=75, timeout_s=None):
+    """Set config locks.pre_grant_check to a script that logs its arguments, env and cwd to `log` and
+    exits with the code in `verdict` (rewritable); (verdict, log)."""
+    verdict, log = tmp_path / "verdict", tmp_path / "hook.log"
+    verdict.write_text(str(rc))
+    hook = tmp_path / "pre-grant.sh"
+    hook.write_text(f'#!/bin/sh\necho "$1 $2 $TTP_RESOURCE $TTP_TASK_ID $PWD" >> {shlex.quote(str(log))}\n'
+                    f'echo "repair hold for task 9"\nexit "$(cat {shlex.quote(str(verdict))})"\n')
+    hook.chmod(0o755)
+    p.set_config("locks.pre_grant_check", shlex.quote(str(hook)))
+    if timeout_s is not None:
+        p.set_config("locks.pre_grant_timeout_s", timeout_s)
+    return verdict, log
+
+
+def test_pre_grant_check_holds_ttp_lock_and_its_task_probe_until_it_grants(env, tmp_path):
+    p = make(env)
+    verdict, log = _pre_grant_hook(p, tmp_path)
+    run_env = _lock_env(env, p, TTP_TASK="7")
+    ran = tmp_path / "ran"
+    for rc in (75, 1):
+        verdict.write_text(str(rc))
+        t = subprocess.run([sys.executable, str(TTP), "lock", "rig", "--", "touch", str(ran)], env=run_env,
+                           capture_output=True, text=True, timeout=60)
+        assert t.returncode == 75 and not ran.exists() and _queue_len(p, "rig") == 0, t.stderr
+        assert len(t.stderr.strip().splitlines()) == 1, t.stderr
+        assert f"held by the project's pre-grant check (exit {rc}): repair hold for task 9" in t.stderr, t.stderr
+        assert "`ttp lock --probe rig --task 7`" in t.stderr, t.stderr
+    # Its resource and task as arguments and env, run from the project root.
+    assert log.read_text().splitlines()[0] == f"rig 7 rig 7 {p.root}", log.read_text()
+    from ttp import locks, shared
+    assert locks.any_free(locks.slot_paths(shared.locks_dir(p, "rig", p.config()), "rig", 1))
+    # The task's probe stays busy while the check holds; a probe for no task does not ask it.
+    no_task = _lock_env(env, p)
+    assert _lock_probe(no_task, "rig", extra=("--task", "7")).returncode == 75
+    j = _lock_probe(no_task, "rig", extra=("--task", "7", "--json"))
+    assert j.returncode == 75 and json.loads(j.stdout)["free"] is False and "pre-grant" in json.loads(j.stdout)["line"]
+    asked = len(log.read_text().splitlines())
+    assert _lock_probe(no_task, "rig").returncode == 0 and len(log.read_text().splitlines()) == asked
+    verdict.write_text("0")
+    assert _lock_probe(no_task, "rig", extra=("--task", "7")).returncode == 0
+    t = subprocess.run([sys.executable, str(TTP), "lock", "rig", "--", "touch", str(ran)], env=run_env,
+                       capture_output=True, text=True, timeout=60)
+    assert t.returncode == 0 and ran.exists(), t.stderr
+
+
+def test_a_broken_or_slow_pre_grant_check_holds_and_is_raised_once(env, tmp_path):
+    from ttp import pregrant
+    from ttp.daemon import Daemon
+    p = make(env)
+    verdict, _ = _pre_grant_hook(p, tmp_path, rc=3)
+    run_env = _lock_env(env, p, TTP_TASK="7")
+    for _ in range(3):   # every retry is held; the fault is recorded once per resource and exit
+        t = subprocess.run([sys.executable, str(TTP), "lock", "rig", "--", "true"], env=run_env,
+                           capture_output=True, text=True, timeout=60)
+        assert t.returncode == 75 and "pre-grant check is broken (exited 3)" in t.stderr, t.stderr
+    assert len(list((p.state / pregrant.DIR).glob("*.json"))) == 1
+    d = Daemon(p.base)
+    obs = lambda: p.db.q("SELECT text FROM events WHERE source='daemon:pre-grant'")
+    d.raise_pre_grant_faults()
+    assert len(obs()) == 1 and "on rig for task #7 exited 3" in obs()[0]["text"], obs()
+    assert "locks.pre_grant_check" in obs()[0]["text"]
+    subprocess.run([sys.executable, str(TTP), "lock", "rig", "--", "true"], env=run_env, capture_output=True, timeout=60)
+    d.raise_pre_grant_faults()
+    assert len(obs()) == 1, obs()
+    # No answer in time is broken too: held, its process group killed, recorded with the timeout.
+    slow = tmp_path / "slow.sh"
+    slow.write_text("#!/bin/sh\nsleep 30\n")
+    slow.chmod(0o755)
+    t0 = time.time()
+    got = pregrant.check(str(slow), p.root, "rig", 7, p.state, timeout=0.5)
+    assert not got.granted and got.broken and got.rc is None and time.time() - t0 < 10, got
+    d.raise_pre_grant_faults()
+    assert len(obs()) == 2 and "no answer within 0.5 s" in obs()[-1]["text"], obs()
+    # A shell that cannot run the command at all (exit 127) is broken, never a grant.
+    assert pregrant.check("/nonexistent/check", p.root, "rig", 7).broken
+
+
+def test_dispatch_holds_a_task_while_the_pre_grant_check_holds(env, tmp_path, monkeypatch):
+    from ttp import pregrant
+    from ttp import daemon as dmod
+    p = make(env)
+    verdict, log = _pre_grant_hook(p, tmp_path)
+    d = dmod.Daemon(p.base)
+    ex = p.db.add_task("Whole run", "s", kind="work", tier="light", origin="coordinator", labels=["exclusive:rig"])
+    per = p.db.add_task("Per command", "s", kind="work", tier="light", origin="coordinator", labels=["resource:rig"])
+    for tid in (ex, per):
+        rec = d._resource_hold(p.db.task(tid))
+        assert rec["kind"] == "pre_grant" and rec["resource"] == "rig" and rec["rc"] == 75, rec
+        assert dmod.hold_reason(rec).startswith("rig: held by the project's pre-grant check (exit 75)")
+    asked = len(log.read_text().splitlines())
+    assert not d._resources_free(p.db.task(ex)) and len(log.read_text().splitlines()) == asked   # reused, not re-run
+    verdict.write_text("0")
+    later = time.time() + dmod.PRE_GRANT_REUSE_S + 1
+    monkeypatch.setattr(dmod.time, "time", lambda: later)   # past the reuse window
+    assert d._resource_hold(p.db.task(ex)) is None and d._resource_hold(p.db.task(per)) is None
+    # A busy slot holds before the check is asked.
+    d._pre_grant_seen.clear()
+    busy = p.db.add_task("Holder", "s", kind="work", tier="light", origin="coordinator", labels=["exclusive:rig"])
+    p.db.update_task(busy, status="running")
+    asked = len(log.read_text().splitlines())
+    assert d._resource_hold(p.db.task(ex))["kind"] == "busy" and len(log.read_text().splitlines()) == asked
+
+
+def test_with_no_pre_grant_check_no_grant_path_runs_one(env, tmp_path, monkeypatch):
+    from ttp import pregrant, runner
+    from ttp import daemon as dmod
+    p = make(env)
+    assert pregrant.command(p.config()) == "" and p.config()["locks"]["pre_grant_check"] == ""
+
+    def boom(*a, **k):
+        raise AssertionError("the pre-grant check ran with config locks.pre_grant_check unset")
+    monkeypatch.setattr(pregrant, "check", boom)
+    d = dmod.Daemon(p.base)
+    tid = p.db.add_task("Whole run", "s", kind="work", tier="light", origin="coordinator", labels=["exclusive:rig"])
+    assert d._resource_hold(p.db.task(tid)) is None
+    slot = tmp_path / "rig.0.lock"
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    held = runner._take_exclusive(run_dir, [{"resource": "rig", "paths": [str(slot)]}], {"TTP_TASK": "5"},
+                                  time.time() + 5)
+    assert held and len(held) == 1
+    held[0].close()
+    run_env = _lock_env(env, p, TTP_TASK="7")
+    assert subprocess.run([sys.executable, str(TTP), "lock", "rig", "--", "true"], env=run_env,
+                          timeout=60).returncode == 0
+
+
+def test_the_run_supervisor_takes_no_slot_the_pre_grant_check_holds(env, tmp_path, monkeypatch):
+    """The check flipped between dispatch and the run's take: the run ends resource_busy without the
+    slot, and the task goes back to the queue with no attempt spent."""
+    from ttp import coordinator as coord, locks, runner
+    from ttp import daemon as dmod
+    monkeypatch.setenv("TTP_TEST_POLL_S", "0.05")
+    p = make(env)
+    verdict, log = _pre_grant_hook(p, tmp_path)
+    slot = tmp_path / "rig.0.lock"
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    pg = {"cmd": p.config()["locks"]["pre_grant_check"], "root": str(p.root), "state": str(p.state)}
+    want = [{"resource": "rig", "paths": [str(slot)]}]
+    assert runner._take_exclusive(run_dir, want, {"TTP_TASK": "5"}, time.time() + 5, pre_grant=pg) is None
+    assert locks.any_free([slot]) and "rig: held by the project's pre-grant check" in (run_dir / "progress.md").read_text()
+    assert log.read_text().split()[:4] == ["rig", "5", "rig", "5"]
+    verdict.write_text("0")
+    held = runner._take_exclusive(run_dir, want, {"TTP_TASK": "5"}, time.time() + 5, pre_grant=pg)
+    assert held and not locks.any_free([slot])
+    held[0].close()
+    # End to end: dispatch saw a grant, the run's own take is held.
+    verdict.write_text("75")
+    assert coord.apply(p, [{"type": "task_add", "title": "reflash", "spec": "s", "tier": "light",
+                            "resources": ["rig"], "exclusive": True}]) == []
+    tid = p.db.one("SELECT id FROM tasks WHERE title='reflash'")["id"]
+    p.db.x("UPDATE messages SET handled=1")
+    d = dmod.Daemon(p.base)
+    monkeypatch.setattr(dmod.Daemon, "_pre_grant", lambda self, *a: dmod.pregrant.Answer(True, 0, False, "granted"))
+    assert _run_until(d, p, lambda: p.db.q("SELECT id FROM runs WHERE task=? AND status!='running'", (tid,)))
+    run, t = p.db.one("SELECT * FROM runs WHERE task=?", (tid,)), p.db.task(tid)
+    assert run["status"] == "resource_busy", dict(run)
+    assert t["status"] == "queued" and not t["attempts"] and t["not_before"], dict(t)
+    assert f"rig {tid} rig {tid}" in log.read_text(), log.read_text()
