@@ -2284,7 +2284,7 @@ def cmd_checks(a) -> None:
     unless a harness-tagged check applies to the head and ran or reused a recorded pass. With no
     harness-tagged check configured it runs the default harness plan (push.default_harness_checks). Its pass is recorded as such and never counts for a PR,
     an on_pass hand-off or `ttp push --own`; its failures open no check gap."""
-    from . import checkcap, checkdirs, cleantree, prguard, push, pushpass, slowtests
+    from . import checkcap, checkdirs, checkprestage, cleantree, prguard, push, pushpass, slowtests
     if getattr(a, "gap", None):
         from . import checkgaps
         p = here()
@@ -2387,6 +2387,14 @@ def cmd_checks(a) -> None:
     if a.detach:
         try:
             checkdirs.writable(run_dir)
+            # The project's short pre-stage runs first, in the foreground (checkprestage): its failure
+            # starts nothing, so it is fixed in this run, not after the whole detached suite.
+            if purpose == "candidate" and not harness_unset and not getattr(a, "no_prestage", False) \
+                    and d.get(checkprestage.KEY) is not None and not _checks_owner(Path(run_dir), top, purpose):
+                pre_env = {**push.check_env("checks"), "PWD": top, **venv_vars}
+                if checkprestage.run(d.get(checkprestage.KEY), top, pre_env,
+                                     lambda m: print(f"ttp checks: {m}", flush=True)):
+                    sys.exit(1)
             _checks_detach(a, Path(run_dir), p, top, head)
         except OSError as e:
             die(f"ttp checks: {e}")
@@ -7685,6 +7693,8 @@ def main(argv: list[str] | None = None) -> None:
                         "candidate gates are not run and the pass never counts for a PR or a push")
     s.add_argument("--detach", action="store_true",
                    help="run them in a process of their own; print a retry_when that exits 0 once they finished or died")
+    s.add_argument("--no-prestage", action="store_true",
+                   help="with --detach: skip delivery.check_prestage, the short foreground run before the full checks")
     s.add_argument("--result", metavar="RUN_DIR",
                    help="run nothing: exit 0 once a run's detached checks finished or died, 1 while they run")
     s.add_argument("--env-ok", nargs="*", metavar="SIG", default=None,

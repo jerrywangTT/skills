@@ -6889,6 +6889,86 @@ def test_detached_checks_start_directly_where_there_is_no_pid_namespace(env, tmp
     assert cli._checks_result(run) == 0
 
 
+def _prestage_setup(env, tmp_path, monkeypatch, prestage):
+    """A checks repo whose project sets delivery.check_prestage; the detached launch is recorded, not run."""
+    from ttp import cli
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    if prestage is not None:
+        p.set_config("delivery.check_prestage", prestage)
+    started = []
+    monkeypatch.setattr(cli, "_checks_detach", lambda a, run_dir, p, top="", head="", **kw: started.append(head))
+    return p, run, started
+
+
+def test_a_passing_check_prestage_runs_in_the_foreground_then_starts_the_full_checks(env, tmp_path, monkeypatch, capsys):
+    from ttp import cli
+    mark = tmp_path / "prestage-ran"
+    p, run, started = _prestage_setup(env, tmp_path, monkeypatch, f"pwd > {mark}")
+    cli.main(["checks", "--detach", "--", "true"])
+    out = capsys.readouterr().out
+    assert mark.read_text().strip() == str(tmp_path / "work"), "the pre-stage runs at the worktree's top"
+    assert len(started) == 1 and "pre-stage passed" in out
+
+
+def test_a_failing_check_prestage_starts_nothing_exits_non_zero_and_shows_its_tail(env, tmp_path, monkeypatch, capsys):
+    from ttp import checkprestage, cli
+    cmd = "for i in $(seq 1 100); do echo line-$i; done; echo boom-assert >&2; exit 3"
+    p, run, started = _prestage_setup(env, tmp_path, monkeypatch, cmd)
+    with pytest.raises(SystemExit) as failed:
+        cli.main(["checks", "--detach", "--", "true"])
+    out = capsys.readouterr().out
+    assert failed.value.code == 1 and not started, "a failed pre-stage starts no background checks"
+    assert "NOT started" in out and "boom-assert" in out and "line-100" in out
+    assert "line-1\n" not in out, f"only the last {checkprestage.TAIL_LINES} lines are shown"
+    assert not (run / cli.CHECKS_PID).exists() and not (run / cli.CHECKS_RC).exists()
+    # The escape hatch for a broken pre-stage: the full checks start without it.
+    cli.main(["checks", "--detach", "--no-prestage", "--", "true"])
+    assert len(started) == 1 and "pre-stage" not in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("cmd", ["no-such-prestage-command-xyz", 17, {"run": "true", "timeout_s": -1}],
+                         ids=["cannot-run", "malformed", "bad-timeout"])
+def test_a_check_prestage_that_cannot_run_never_holds_the_full_checks_back(env, tmp_path, monkeypatch, capsys, cmd):
+    from ttp import cli, project
+    p, run, started = _prestage_setup(env, tmp_path, monkeypatch, cmd)
+    cli.main(["checks", "--detach", "--", "true"])
+    out = capsys.readouterr().out
+    assert len(started) == 1 and "starting the full checks without it" in out
+    assert any("delivery.check_prestage" in x for x in project.config_problems({"delivery": {"check_prestage": cmd}})) \
+        == (cmd != "no-such-prestage-command-xyz")
+
+
+def test_a_check_prestage_that_times_out_is_stopped_and_the_full_checks_start_anyway(env, tmp_path, monkeypatch, capsys):
+    from ttp import cli
+    from ttp.daemon import _alive
+    pidf = tmp_path / "prestage.pid"
+    p, run, started = _prestage_setup(env, tmp_path, monkeypatch,
+                                      {"run": f"echo $$ > {pidf}; exec sleep 60", "timeout_s": 1})
+    t0 = time.monotonic()
+    cli.main(["checks", "--detach", "--", "true"])
+    out = capsys.readouterr().out
+    assert time.monotonic() - t0 < 30 and len(started) == 1 and "timed out after 1 s" in out
+    assert not _alive(int(pidf.read_text())), "a timed-out pre-stage is stopped, not left running"
+
+
+def test_without_a_check_prestage_detached_checks_start_as_before(env, tmp_path, monkeypatch, capsys):
+    from ttp import cli, project
+    count = tmp_path / "count"
+    p, run, started = _prestage_setup(env, tmp_path, monkeypatch, f"echo x >> {count}")
+    cli.main(["checks", "--detach", "--", "true"])
+    assert count.read_text() == "x\n" and "pre-stage" in capsys.readouterr().out
+    for unset in ("", None):
+        p.set_config("delivery.check_prestage", unset)
+        cli.main(["checks", "--detach", "--", "true"])
+        assert "pre-stage" not in capsys.readouterr().out
+    assert count.read_text() == "x\n" and len(started) == 3
+    # The foreground checks never run it: only a detached start does.
+    p.set_config("delivery.check_prestage", f"echo x >> {count}")
+    cli.main(["checks", "--", "true"])
+    assert count.read_text() == "x\n"
+    assert not project.config_problems({"delivery": {"check_prestage": {"run": "pytest -q t.py", "timeout_s": 120}}})
+
+
 @pytest.mark.parametrize('run_env', [None, ''], ids=['unset', 'empty'])
 def test_check_output_queued_push_rebuilt_after_restart(env, monkeypatch, capsys, run_env):
     from ttp import push

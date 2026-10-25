@@ -447,6 +447,7 @@ EXTRA_KEYS = {
                  "allow_protected_push_branch", "own_push", "own_push_remote", "deploy_restart_wait_s", "plugin_version_guard",
                  "checks_fast_globs", "checks_fast_exclude",   # these two: `ttp checks` fast path (push.FAST_GLOBS),
                  "checks_host",   # where checks run (remotecheck)
+                 "check_prestage",   # a short foreground run before `ttp checks --detach` (checkprestage)
                  "rebase_replace", "never_force"},   # whether a rebase replaces its branch (rebase_replace)
     "jev": {"via", "url", "model"},
     "power": {"keep_awake"},
@@ -757,6 +758,8 @@ def config_problems(raw: dict, root: Path | None = None) -> list[str]:
         if v is not None and not (isinstance(v, list) and all(isinstance(x, str) for x in v)):
             out.append(f"delivery.{k}: not a list of glob strings")
     out += [f"delivery.push_exclude_paths: {p}" for p in [scalar_problem(delivery.get("push_exclude_paths"))] if p]
+    from .checkprestage import problems as prestage_problems
+    out += prestage_problems(delivery.get("check_prestage"))
     if delivery.get("checks_host") not in (None, ""):
         from .remotecheck import host_problem
         out += [f"delivery.checks_host: {p}" for p in [host_problem(delivery["checks_host"])] if p]

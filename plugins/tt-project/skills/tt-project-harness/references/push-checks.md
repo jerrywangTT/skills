@@ -23,6 +23,13 @@ A project that lists globs there gets it: a diff whose paths all match them (nev
 `ttp checks --full` runs everything, also when queued or relaunched; a recorded full pass is reused.
 Known gap: the project owns its globs; one covering installed or test-asserted content (such as a plugin README that tests read) skips the checks those changes need.
 
+## Pre-stage before detached checks
+
+Opt-in, off by default. `delivery.check_prestage` names a short command (a string, or `{"run": "...", "timeout_s": 180}`; default 180 s, at most 900) that `ttp checks --detach` runs first, in the foreground, at the worktree's top.
+Pick fast tests that often catch mistakes (static invariants, lint), so a worker sees their failure in the same run instead of after the whole detached suite and a later wake.
+It fails: its output's tail is printed, nothing starts in the background and the command exits 1. It passes or times out: the full checks start as usual. A command the host lacks (exit 126/127) or a malformed setting is reported and skipped; `--no-prestage` skips it for one start.
+It only adds an early run: the full checks still run every command, and it never marks a check as passed. Foreground `ttp checks`, `--purpose harness` and the harness repo do not run it.
+
 ## Priority
 
 `ttp checks` and push checks share a host-wide slot cap (`checks.host_max`), waited for by project in turn, then task priority, then arrival; a required owner of an open obligation goes first in its project.
