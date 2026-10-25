@@ -98,11 +98,9 @@ def record_fault(state: Path, cmd: str, resource: str, task: str, rc: int | None
     d = state / DIR
     name = hashlib.sha1(f"{resource}\0{rc}".encode()).hexdigest()[:16] + ".json"
     rec = {"hook": cmd, "resource": resource, "task": task, "rc": rc, "said": said, "ts": time.time()}
+    from .project import durable_write
     try:
-        d.mkdir(parents=True, exist_ok=True)
-        tmp = d / f".{name}.{os.getpid()}"
-        tmp.write_text(json.dumps(rec))
-        os.replace(tmp, d / name)
+        durable_write(d / name, json.dumps(rec))
     except OSError:
         pass   # the check still holds; only its report is lost
 
