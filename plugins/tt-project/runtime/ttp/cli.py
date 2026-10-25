@@ -3919,13 +3919,21 @@ def cmd_lock(a) -> None:
             sys.exit(_logged("exclusive", run_held, lambda: subprocess.call(cmd, env=child_env)))
     what = ",".join(L["name"] for L in todo)   # what the messages and the retry_when name
     from . import pregrant
-    if check := pregrant.command(cfg):
-        # The project's own holds (pregrant.py): asked before queueing, so a held lock is never taken.
+    from .runner import PRE_GRANT_FRESH_S
+    check, asked_at, tries = pregrant.command(cfg), 0.0, 0
+
+    def _pre_grant_refusal() -> str | None:
+        # The project's own holds (pregrant.py): the refusal line when the check does not grant every lock.
+        nonlocal asked_at
+        asked_at = time.time()
         for L in todo:
             got = pregrant.check(check, p.root, L["name"], own, p.state, pregrant.timeout_s(cfg))
             if not got.granted:
-                die(f"{got.line}; hand the task back as waiting with retry_when "
-                    f"`ttp lock --probe {what}{f' --task {own}' if own.strip() else ''}`", 75)
+                return (f"{got.line}; hand the task back as waiting with retry_when "
+                        f"`ttp lock --probe {what}{f' --task {own}' if own.strip() else ''}`")
+        return None
+    if check and (why := _pre_grant_refusal()):
+        die(why, 75)   # asked before queueing, so nothing waits on a held lock
     # A waiter that holds locks already never waits behind one for several resources at once: that one
     # may wait for a lock this waiter's holder has, and neither would ever go on.
     past_multi = bool(held_locks or shared_locks or whole)
@@ -4004,6 +4012,17 @@ def cmd_lock(a) -> None:
     while True:
         _refuse_paused()
         fs, blocked = _take()
+        tries += 1
+        if fs and check and (tries > 1 or time.time() - asked_at >= PRE_GRANT_FRESH_S) \
+                and (why := _pre_grant_refusal()):
+            # Asked again holding the slots: a hold that began while this waited is never run over.
+            for f in fs:
+                f.close()
+            _end_wait()
+            for t in tickets:
+                lk.dequeue(t)
+            tickets.clear()
+            die(why, 75)
         if fs:
             _end_wait()
             for t in tickets:

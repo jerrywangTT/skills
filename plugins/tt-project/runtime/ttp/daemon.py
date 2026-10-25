@@ -334,6 +334,7 @@ STALL_GAP_S = 600      # checks further apart than this (a paused project): read
 STALL_LIST_MAX = 30    # ready tasks listed in one stall observation
 PRE_GRANT_KEY = "pre_grant_raised"   # kv: pregrant.fault_key -> when it was last raised
 PRE_GRANT_REUSE_S = 30                # dispatch reuses a pre-grant check's answer this long
+PRE_GRANT_TICK_S = 5                  # a tick starts no new pre-grant check once its checks took this long
 PRE_GRANT_RERAISE_S = 6 * 3600        # a broken pre-grant check is raised again at most this often
 STALE_HOLDS_KEY = "holds_stale"   # kv: run -> its hold alerted as kept for a closed task (Daemon.alert_stale_holds)
 WORKSPACE_RETRY_NOTE = "workspace retry"   # a queued task's note while its workspace is retried
@@ -663,6 +664,8 @@ class Daemon:
         self._escalated: dict[int, tuple[int, int]] = {}   # run id -> (size, mtime_ns) of its ESCALATE_FILE relayed
         self._start_failures = 0
         self._pre_grant_seen: dict[tuple[str, int], tuple[float, pregrant.Answer]] = {}
+        self._pre_grant_broken: dict[str, tuple[float, pregrant.Answer]] = {}   # resource -> its last broken answer
+        self._pre_grant_spent = (0.0, 0.0)   # (tick it was spent in, seconds of pre-grant checks in it)
         self._lock_fd: int | None = None
         self._started = time.time()
         # what code this process loaded, captured once before the first tick (never re-read)
@@ -9036,14 +9039,32 @@ class Daemon:
 
     def _pre_grant(self, check: str, res: str, tid: int) -> pregrant.Answer:
         """The pre-grant check's answer for a task and resource, reused for PRE_GRANT_REUSE_S: dispatch
-        and the stall checks ask every tick, and the grant itself (the run's take, `ttp lock`) asks again."""
+        and the stall checks ask every tick, and the grant itself (the run's take, `ttp lock`) asks again.
+        The checks run in the tick, so they are bounded there: a broken answer (a timeout, a bad exit)
+        does not depend on the task and is reused for every task on the resource, and once a tick's
+        checks took PRE_GRANT_TICK_S (or the check's timeout, if lower) it starts no more: the tasks not
+        asked are held until a later tick asks, with nothing recorded or raised."""
         now = time.time()
         got = self._pre_grant_seen.get((res, tid))
         if got and now - got[0] < PRE_GRANT_REUSE_S:
             return got[1]
-        ans = pregrant.check(check, self.p.root, res, tid, self.p.state, pregrant.timeout_s(self.cfg))
+        got = self._pre_grant_broken.get(res)
+        if got and now - got[0] < PRE_GRANT_REUSE_S:
+            return got[1]
+        timeout = pregrant.timeout_s(self.cfg)
+        tick, spent = self._pre_grant_spent
+        if not self._tick_began or tick != self._tick_began:
+            spent = 0.0
+        if spent >= min(PRE_GRANT_TICK_S, timeout):
+            return pregrant.Answer(False, None, False, f"{res}: the pre-grant check is asked in a later tick")
+        began = time.monotonic()
+        ans = pregrant.check(check, self.p.root, res, tid, self.p.state, timeout)
+        self._pre_grant_spent = (self._tick_began, spent + time.monotonic() - began)
         self._pre_grant_seen = {k: v for k, v in self._pre_grant_seen.items() if now - v[0] < PRE_GRANT_REUSE_S}
         self._pre_grant_seen[(res, tid)] = (now, ans)
+        self._pre_grant_broken = {k: v for k, v in self._pre_grant_broken.items() if now - v[0] < PRE_GRANT_REUSE_S}
+        if ans.broken:
+            self._pre_grant_broken[res] = (now, ans)
         if not ans.granted:
             log(self.p, f"task {tid}: {ans.line}")
         return ans

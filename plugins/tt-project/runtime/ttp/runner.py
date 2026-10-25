@@ -57,6 +57,7 @@ from .project import Project, durable_write, lower_priority
 LEASE_EVERY_S = 30
 KILL_AFTER_S = 30
 PRE_GRANT_EVERY_S = 30   # a whole-run take that waits asks the project's pre-grant check again this often
+PRE_GRANT_FRESH_S = 3    # a pre-grant answer older than this is asked again once the take has the slot
 POLL_S = 5
 WATCH_ERRORS_LOGGED = 20   # a watch error that repeats every poll is logged this many times
 BUDGET_EVERY_S = 10
@@ -634,8 +635,10 @@ def _take_exclusive(run_dir: Path, wanted: list[dict], env: dict, deadline: floa
     task keeps for its detached jobs (hold.py) is handed over, and those jobs go to `inherited`. The
     wait ends at the deadline or on a stop; None when it ended without the slots. With `pre_grant` (the
     project's pre-grant check, pregrant.py) each slot is tried only while the check grants it, asked
-    again every PRE_GRANT_EVERY_S of a wait; a check that holds ends the wait at once, without the slots,
-    so the task goes back to dispatch, which holds it model-free until the check grants it."""
+    again every PRE_GRANT_EVERY_S of a wait and once more when the slot is taken if its last answer is
+    older than PRE_GRANT_FRESH_S (a hold that began during the wait); a check that holds ends the wait at
+    once, without the slots, so the task goes back to dispatch, which holds it model-free until the check
+    grants it."""
     from . import hold, locks
     task = hold.who(env.get('TTP_TASK'))
     held, told, asked = [], 0.0, set()
@@ -646,23 +649,35 @@ def _take_exclusive(run_dir: Path, wanted: list[dict], env: dict, deadline: floa
         # A shared resource's holder names the project as well (shared.holder).
         mine = res.get("holder") or task
         asked_at = None
+
+        def _held_by_check() -> bool:
+            # The project's own holds: True (and the run does not start) when the check does not grant.
+            nonlocal asked_at
+            from . import pregrant
+            asked_at = time.time()
+            got = pregrant.check(pre_grant["cmd"], pre_grant["root"], res["resource"], env.get("TTP_TASK") or "",
+                                 pre_grant.get("state"), float(pre_grant.get("timeout_s") or pregrant.TIMEOUT_S))
+            if got.granted:
+                return False
+            for h in held:
+                h.close()
+            if mark:
+                locks.unreserve(mark, mine)
+            with open(run_dir / "progress.md", "a") as pf:
+                pf.write(f"{_clock(env)} {got.line}; the run did not start\n")
+            return True
+
         while True:
-            if pre_grant and (asked_at is None or time.time() - asked_at >= PRE_GRANT_EVERY_S):
-                from . import pregrant
-                asked_at = time.time()
-                got = pregrant.check(pre_grant["cmd"], pre_grant["root"], res["resource"], env.get("TTP_TASK") or "",
-                                     pre_grant.get("state"), float(pre_grant.get("timeout_s") or pregrant.TIMEOUT_S))
-                if not got.granted:
-                    for h in held:
-                        h.close()
-                    if mark:
-                        locks.unreserve(mark, mine)
-                    with open(run_dir / "progress.md", "a") as pf:
-                        pf.write(f"{_clock(env)} {got.line}; the run did not start\n")
-                    return None
+            if pre_grant and (asked_at is None or time.time() - asked_at >= PRE_GRANT_EVERY_S) and _held_by_check():
+                return None
             # Not in the `ttp lock` arrival queue: the reservation below already holds new commands
             # off, and a queued command that is waiting on the reservation must not hold this off.
             f = locks.try_take(paths, hold.label(mine, env.get("TTP_RUN_ID"), hold.WHOLE_RUN), "exclusive")
+            if f and pre_grant and time.time() - asked_at >= PRE_GRANT_FRESH_S:
+                held.append(f)   # asked again holding the slot, so no hold can begin between the answer and the take
+                if _held_by_check():
+                    return None
+                held.pop()
             if f:
                 held.append(f)
                 if mark:

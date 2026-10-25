@@ -502,3 +502,100 @@ def test_the_run_supervisor_takes_no_slot_the_pre_grant_check_holds(env, tmp_pat
     assert run["status"] == "resource_busy", dict(run)
     assert t["status"] == "queued" and not t["attempts"] and t["not_before"], dict(t)
     assert f"rig {tid} rig {tid}" in log.read_text(), log.read_text()
+
+
+def test_a_waiting_ttp_lock_asks_the_pre_grant_check_again_when_it_takes_the_lock(env, tmp_path):
+    """A hold that began while a `ttp lock` waited in the queue: the waiter takes the freed slot, asks
+    again, lets it go and exits 75 without running its command."""
+    from ttp import locks, shared
+    p = make(env)
+    verdict, log = _pre_grant_hook(p, tmp_path, rc=0)
+    env6, env7 = _lock_env(env, p, TTP_TASK="6", TTP_TEST_POLL_S="0.05"), _lock_env(env, p, TTP_TASK="7", TTP_TEST_POLL_S="0.05")
+    marks, go, ran = tmp_path / "marks", tmp_path / "go", tmp_path / "ran"
+    holder = _lock(env6, "rig", cmd=_mark(marks, "holder", go))
+    waiter = None
+    try:
+        assert _until_true(lambda: marks.exists() and "start holder" in marks.read_text()), holder.stderr.read()
+        waiter = _lock(env7, "rig", cmd=("touch", str(ran)))
+        assert _until_true(lambda: _queue_len(p, "rig") == 1), waiter.stderr.read()
+        verdict.write_text("75")   # the project's repair hold begins while the waiter is queued
+        go.touch()
+        rc = _ended([holder, waiter])
+        err = waiter.stderr.read()
+        assert rc == [0, 75] and not ran.exists(), (rc, err)
+        assert "held by the project's pre-grant check (exit 75)" in err and "`ttp lock --probe rig --task 7`" in err, err
+        assert _queue_len(p, "rig") == 0
+        assert locks.any_free(locks.slot_paths(shared.locks_dir(p, "rig", p.config()), "rig", 1))
+        assert [ln.split()[1] for ln in log.read_text().splitlines()] == ["6", "7", "7"], log.read_text()
+    finally:
+        go.touch()
+        for x in (holder, waiter):
+            if x and x.poll() is None:
+                x.kill()
+
+
+def test_the_run_supervisor_asks_the_pre_grant_check_again_once_it_has_the_slot(env, tmp_path, monkeypatch):
+    """An answer older than PRE_GRANT_FRESH_S is asked again holding the slot: a hold that began meanwhile
+    lets the slot go and the run does not start."""
+    from ttp import locks, runner
+    p = make(env)
+    log = tmp_path / "hook.log"
+    hook = tmp_path / "flip.sh"   # grants at the first ask, holds after
+    hook.write_text(f'#!/bin/sh\necho "$1" >> {shlex.quote(str(log))}\n'
+                    f'[ "$(wc -l < {shlex.quote(str(log))})" -le 1 ] && exit 0\necho "repair hold"\nexit 75\n')
+    hook.chmod(0o755)
+    monkeypatch.setattr(runner, "PRE_GRANT_FRESH_S", 0)
+    slot, run_dir = tmp_path / "rig.0.lock", tmp_path / "run"
+    run_dir.mkdir()
+    pg = {"cmd": str(hook), "root": str(p.root), "state": str(p.state)}
+    want = [{"resource": "rig", "paths": [str(slot)]}]
+    assert runner._take_exclusive(run_dir, want, {"TTP_TASK": "5"}, time.time() + 5, pre_grant=pg) is None
+    assert locks.any_free([slot]) and len(log.read_text().splitlines()) == 2
+    assert "held by the project's pre-grant check (exit 75)" in (run_dir / "progress.md").read_text()
+    # A fresh answer is not asked again.
+    log.unlink()
+    monkeypatch.setattr(runner, "PRE_GRANT_FRESH_S", 60)
+    held = runner._take_exclusive(run_dir, want, {"TTP_TASK": "5"}, time.time() + 5, pre_grant=pg)
+    assert held and len(log.read_text().splitlines()) == 1
+    held[0].close()
+
+
+def test_a_hanging_pre_grant_check_blocks_a_daemon_tick_for_about_one_timeout(env, tmp_path):
+    """A hook that never answers in time: one resource's broken answer serves every task on it, and a
+    tick starts no new check once its checks took the timeout, so the tick is not held for N timeouts."""
+    from ttp import daemon as dmod
+    p = make(env)
+    log = tmp_path / "hook.log"
+    hook = tmp_path / "hang.sh"
+    hook.write_text(f'#!/bin/sh\necho "$1 $2" >> {shlex.quote(str(log))}\nexec sleep 30\n')
+    hook.chmod(0o755)
+    p.set_config("locks.pre_grant_check", shlex.quote(str(hook)))
+    p.set_config("locks.pre_grant_timeout_s", 0.5)
+    d = dmod.Daemon(p.base)
+    tids = [p.db.add_task(f"T{i}", "s", kind="work", tier="light", origin="coordinator", labels=["resource:rig"])
+            for i in range(5)]
+    d._tick_began = time.monotonic()
+    t0 = time.monotonic()
+    assert not d._dispatchable()
+    d.dispatch()
+    assert time.monotonic() - t0 < 2.0, time.monotonic() - t0   # one 0.5 s timeout, not five
+    assert len(log.read_text().splitlines()) == 1, log.read_text()
+    for tid in tids:
+        rec = d._resource_hold(p.db.task(tid))
+        assert rec["kind"] == "pre_grant" and p.db.task(tid)["status"] == "queued", rec
+    d.raise_pre_grant_faults()
+    assert len(p.db.q("SELECT text FROM events WHERE source='daemon:pre-grant'")) == 1
+    # Five resources: the first check spends the tick's budget; the others are held unasked, unrecorded.
+    log.unlink()
+    other = [p.db.add_task(f"R{i}", "s", kind="work", tier="light", origin="coordinator", labels=[f"resource:rig{i}"])
+             for i in range(5)]
+    d._tick_began = time.monotonic()
+    t0 = time.monotonic()
+    recs = [d._resource_hold(p.db.task(tid)) for tid in other]
+    assert time.monotonic() - t0 < 2.0 and len(log.read_text().splitlines()) == 1, log.read_text()
+    assert all(r["kind"] == "pre_grant" for r in recs) and [r["rc"] for r in recs[1:]] == [None] * 4, recs
+    d.raise_pre_grant_faults()
+    assert len(p.db.q("SELECT text FROM events WHERE source='daemon:pre-grant'")) == 2
+    d._tick_began = time.monotonic()   # the next tick asks the next one
+    d._resource_hold(p.db.task(other[1]))
+    assert len(log.read_text().splitlines()) == 2
