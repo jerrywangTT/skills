@@ -1,6 +1,6 @@
 {
   "name": "tt-model-op-analysis",
-  "version": "0.11.0",
+  "version": "0.11.1",
   "description": "Kernel-op analysis of one implementation of a tt-metal model on its architecture (Blackhole, Wormhole or Quasar), with destinations, resumable measurements (Tracy, ttnn graph capture, kernel cache via elfray, TTsim), and a separate Google Sheets upload skill.",
   "author": {
     "name": "Tenstorrent"

@@ -53,11 +53,12 @@ another host, or open the cache in the extension ("Cache API Analyzer: Analyze a
 2. Probe the device: `python3 <plugin-root>/scripts/probe_device.py` through `tt-device-mcp`. The
    probed architecture and grid must equal the run's source profile in `run.json`; if the broker is
    unavailable, show the command and ask the user to run it in the built tt-metal environment.
-3. For `source:cache`, ask where the kernel cache goes: an empty directory outside the tt-metal
-   checkout and outside the run directory (a cache holds hundreds of MB to GB), recommended
-   `<workspace>/.tt-metal-cache-opa/<model>-<source>-<sha7>`. If the directory exists and is not
+3. For `source:cache`, ask where the kernel cache goes: an empty directory outside the run
+   directory (a cache holds hundreds of MB to GB). Recommend a per-run directory inside the
+   existing tt-metal checkout's already-ignored cache tree at
+   `<checkout>/.cache/op-analysis/<model>-<source>-<sha7>`. If the directory exists and is not
    empty, ask for another; never delete it without the user naming it. For `source:graph`, the
-   capture goes to `<workspace>/.tt-metal-cache-opa/<model>-<source>-<sha7>.graph_capture.json`,
+   capture goes to `<checkout>/.cache/op-analysis/<model>-<source>-<sha7>.graph_capture.json`,
    beside the cache directory when there is one (a long run writes GB). If the entry
    test runs in a CI workflow, record its `pytest_timeout` in `run.json` as `ci_pytest_timeout_s`.
 4. Run the entry test from `run.json` (`test`) through `tt-device-mcp`, once for each run the
