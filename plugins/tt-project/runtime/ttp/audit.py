@@ -237,9 +237,14 @@ def overrides(p: Project | None, db: DB, now: float, hours: float) -> list[str]:
     """Overrides held longer than `hours`: resource pauses, active mutes (not those of a schedule that is
     off or gone: they mute nothing), and temporary instructions whose end only a model can judge, listed
     as possibly over at least ends.RECHECK_S ago."""
+    from . import machines
     from .screen import mutes, off_schedule_mute
     out = []
-    for name, v in sorted(db.paused_resources(shared=False).items()):
+    paused = db.paused_resources(shared=False)
+    known = machines.load() if paused else {}
+    for name, v in sorted(paused.items()):
+        if machines.decommissioned_user_pause(name, v, known):
+            continue   # the user's pause of a retired machine: held as set, nothing to re-judge
         age = now - float(v.get("since") or now)
         until = float(v["until"]) if isinstance(v.get("until"), (int, float)) else None
         end = ("with no end" if until is None and not v.get("end_when")

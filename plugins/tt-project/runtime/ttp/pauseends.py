@@ -172,6 +172,15 @@ def owned(p: Project, db=None) -> dict[str, dict]:
     return out
 
 
+def _decommissioned(pauses: dict[str, dict]) -> set[str]:
+    """The user's pauses in `pauses` of machines the machines list retired (machines.decommissioned_user_pause)."""
+    from . import machines
+    if not any(v.get("by") == "user" for v in pauses.values()):
+        return set()
+    known = machines.load()
+    return {k for k, v in pauses.items() if machines.decommissioned_user_pause(k, v, known)}
+
+
 def _user_said(what: str, why: str, state: str, lift: str) -> str:
     """The observation for the user's pause or hold `what`: it stays; their word alone lifts it."""
     if state == "passed":
@@ -292,12 +301,15 @@ class PauseEnds:
         migrate(self.p, now)
         db = self.p.db
         pauses = owned(self.p)
+        gone = _decommissioned(pauses)
         if verdicts:   # each end_when's last verdict: the blocker sweep carries a hold its probe still says not yet
             kept = {k: v for k, v in (db.kv(sweep.PAUSE_PROBES_KEY) or {}).items() if k in pauses}
             kept.update({k: {"probe": rc[1], "rc": rc[0], "at": now} for k, rc in verdicts.items() if k in pauses})
             db.set_kv(sweep.PAUSE_PROBES_KEY, kept or None)
         sent = {k: v for k, v in (db.kv(DUE_KEY) or {}).items() if k in pauses}
         for name, v in sorted(pauses.items()):
+            if name in gone:
+                continue   # the user's pause of a retired machine: no end to report or probe; it stays as set
             probe, rc = v.get("end_when"), verdicts.get(name, (None, "", ""))
             if isinstance(probe, dict):
                 probe = None   # health results come from heal.run, never a shell probe; `until` still ends it
@@ -344,6 +356,7 @@ class PauseEnds:
             return due
         checks = {r["name"]: r for r, _ in heal.checks(db)}
         pauses = owned(self.p)
+        gone = _decommissioned(pauses)
 
         def stale(name: str, count: dict) -> bool:
             end = (pauses.get(name) or {}).get("end_when")
@@ -360,7 +373,7 @@ class PauseEnds:
             counts = kept
         for name, v in pauses.items():
             end, count = v.get("end_when"), counts.get(name, {})
-            if not isinstance(end, dict) or count.get("sig") != _sig(v) \
+            if name in gone or not isinstance(end, dict) or count.get("sig") != _sig(v) \
                     or count.get("n", 0) < end.get("healthy_n", HEALTHY_N) \
                     or count.get("last", 0) - count.get("first", 0) < end.get("clean_s", CLEAN_S):
                 continue

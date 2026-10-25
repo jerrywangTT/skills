@@ -816,9 +816,13 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
         for hold in sorted({v["machine"]: v for v in paused.values() if v.get("fleet")}):
             if h := fleethold.active().get(hold):
                 lines.append("- " + fleethold.line(h, p))
+        known = machines.load()
         for name, v in sorted(paused.items()):
             if v.get("fleet"):
                 continue   # its hold's one line above
+            if machines.decommissioned_user_pause(name, v, known):
+                lines.append(f"- {name}: the user's pause stays as set (machine decommissioned)")
+                continue
             lines.append(f"- {name}: paused {(now - float(v.get('since') or now)) / 3600:.1f}h ago by "
                          f"{v.get('by') or 'user'}" + (f" in project {v.get('project')} (shared by all projects)"
                                                       if v.get("shared") else "") + (f": {clip(v['reason'], NOTE_CHARS)}" if v.get("reason") else "")

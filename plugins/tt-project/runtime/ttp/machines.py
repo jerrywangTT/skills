@@ -271,6 +271,19 @@ def retired(m: dict | None) -> bool:
             or any(not NOT_YET_RE.search(note[:x.start()]) for x in RETIRED_NOTE_RE.finditer(note)))
 
 
+def decommissioned_user_pause(name: str, row: dict | None, known: dict[str, dict] | None = None) -> bool:
+    """Whether the pause `row` of resource `name` is the user's and its machine's list entry is retired
+    (retired()): the machine is gone, so the pause is no stuck work and its end needs no prompt. It stays
+    as set; only the user's word lifts it. The machine is the row's `machine` (a fleet hold), else the
+    alias `name` is or starts with ("box-a", "box-a-device", "box-a:0")."""
+    if not isinstance(row, dict) or row.get("by") != "user":
+        return False
+    known = load() if known is None else known
+    alias = row.get("machine") or next((a for a in sorted(known, key=len, reverse=True)
+                                        if name == a or name.startswith((a + "-", a + ":"))), None)
+    return bool(alias) and retired(known.get(alias))
+
+
 def push_skips(hosts: list[str], known: dict[str, dict] | None = None,
                outages: dict[str, dict] | None = None) -> dict[str, str]:
     """{host: why} of the hosts a copy of the list skips: its machine has an open known outage or the

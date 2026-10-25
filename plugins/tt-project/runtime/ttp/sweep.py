@@ -289,7 +289,11 @@ def items(db: DB, now: float | None = None, where=None) -> list[dict]:
                     "title": t["title"], "age_s": None if start is None else max(0.0, now - float(start)),
                     "since": start, "updated": t["updated"], "reason": reason, "status": t["status"], "spec_sha": _spec_sha(t),
                     "ends": ends, **({"cover": cover} if cover is not None else {})})
+    from . import machines
+    known = machines.load() if paused else {}
     for name, v in sorted(paused.items()):
+        if machines.decommissioned_user_pause(name, v, known):
+            continue   # the user's pause of a retired machine: it stays as set and is no stuck work
         since = v.get("since") if isinstance(v.get("since"), (int, float)) else None
         out.append({"key": f"resource:{name}", "kind": "paused", "task": None, "resource": name, "title": name,
                     "age_s": None if since is None else max(0.0, now - float(since)), "since": since,

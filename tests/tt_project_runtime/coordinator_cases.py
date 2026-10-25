@@ -7122,6 +7122,80 @@ def test_a_user_pause_until_that_passed_shows_as_a_signal_not_an_end(env):
     assert "(its end passed" not in coord.digest(p, {}, [], [])
 
 
+def _decommissioned_pauses(env, now):
+    """box-a is decommissioned, box-b live: the user's pauses of both, and the coordinator's of box-a."""
+    from ttp import coordinator as coord, machines
+    p = make(env)
+    machines.add("box-a", tags="device,decommissioned")
+    machines.add("box-b", tags="device")
+    for name, by in (("box-a-device", "user"), ("box-b-device", "user"), ("box-a", "coordinator")):
+        coord.pause_resource(p, name, True, reason="test", by=by, end={"until": now + 60})
+    return p
+
+
+def test_decommissioned_user_pause_is_only_the_users_pause_of_a_retired_machine_and_audit_shares_it(env):
+    from ttp import audit, machines
+    known = {"box-a": {"tags": ["decommissioned"]}, "box-ab": {"tags": ["device"]},
+             "box-c": {"note": "Retired. Do not use."}, "box-d": {"note": "Not yet decommissioned"}}
+    user = {"by": "user"}
+    assert machines.decommissioned_user_pause("box-a", user, known)
+    assert machines.decommissioned_user_pause("box-a-device", user, known)
+    assert machines.decommissioned_user_pause("box-a:0", user, known)
+    assert machines.decommissioned_user_pause("machine:box-c", {**user, "machine": "box-c"}, known)
+    assert not machines.decommissioned_user_pause("box-ab-device", user, known), "the longest alias wins"
+    assert not machines.decommissioned_user_pause("box-d", user, known)
+    assert not machines.decommissioned_user_pause("box-a", {"by": "coordinator"}, known)
+    assert not machines.decommissioned_user_pause("box-a", {}, known), "no owner is not the user"
+    assert not machines.decommissioned_user_pause("box-ax", user, known), "a prefix is not the alias"
+    assert not machines.decommissioned_user_pause("box-z", user, known) and not machines.decommissioned_user_pause("box-a", None, known)
+    now = time.time()
+    p = _decommissioned_pauses(env, now)
+    held = audit.overrides(p, p.db, now + 7200, 1)
+    assert not any("box-a-device" in x for x in held)
+    assert any("box-b-device" in x for x in held) and any(x.startswith("resource box-a paused") for x in held)
+
+
+def test_a_user_pause_of_a_decommissioned_machine_is_no_sweep_item(env):
+    from ttp import sweep
+    now = time.time()
+    p = _decommissioned_pauses(env, now)
+    before = p.db.paused_resources()
+    got = {i["resource"]: i for i in sweep.items(p.db, now + 7 * 3600) if i["kind"] == "paused"}
+    assert set(got) == {"box-a", "box-b-device"}
+    assert got["box-b-device"]["ends"] == "user" and got["box-a"]["ends"] is None
+    assert p.db.paused_resources() == before, "the pause stays exactly as set"
+
+
+def test_pause_ends_never_reports_or_probes_a_user_pause_of_a_decommissioned_machine(env):
+    from ttp import coordinator as coord, pauseends
+    now = time.time()
+    p = _decommissioned_pauses(env, now)
+    flag = p.root / "done"
+    flag.write_text("")
+    coord.pause_resource(p, "box-a-build", True, reason="test", by="user", end={"end_when": f"test -e {flag}"})
+    before = p.db.paused_resources()
+    pe = pauseends.PauseEnds(p)
+    due = _settle_end_probes(pe, now + 3600)
+    assert "box-b-device" in due and "box-a" in due
+    assert "box-a-device" not in due and "box-a-build" not in due and "box-a-build" not in pe._probed
+    texts = " ".join(r["text"] for r in p.db.q("SELECT text FROM events WHERE kind IN ('observation', 'pause_end_due')"))
+    assert "box-a-device" not in texts and "box-a-build" not in texts
+    assert _settle_end_probes(pe, now + 3600 + 2 * pauseends.PROBE_EVERY_S) == []
+    after = p.db.paused_resources()
+    assert all(after[k] == before[k] for k in ("box-a-device", "box-a-build", "box-b-device")), "never lifted or edited"
+
+
+def test_the_digest_shows_a_user_pause_of_a_decommissioned_machine_as_staying_as_set(env):
+    from ttp import coordinator as coord
+    now = time.time()
+    p = _decommissioned_pauses(env, now)
+    text = coord.digest(p, {}, [], [])
+    line = next(x for x in text.splitlines() if x.startswith("- box-a-device:"))
+    assert line == "- box-a-device: the user's pause stays as set (machine decommissioned)"
+    assert "set by the user; ends only on the user's word" in next(x for x in text.splitlines() if x.startswith("- box-b-device:"))
+    assert "by coordinator" in next(x for x in text.splitlines() if x.startswith("- box-a:"))
+
+
 def test_the_coordinator_prompt_says_a_user_pause_end_never_lifts_it():
     text = " ".join((RUNTIME.parent / "template" / "prompts" / "coordinator.md").read_text(encoding="utf-8").split())
     assert ("A pause the user set is lifted only on their word: its `end_when` or `until` only signals; say it is "
