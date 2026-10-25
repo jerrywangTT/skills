@@ -2852,6 +2852,84 @@ def test_keyed_issue_a_quiet_run_closed_only_counts_when_resent_within_the_windo
         assert wakes() == before + 1
 
 
+def test_keyed_watcher_error_a_run_repaired_only_counts_when_resent_within_the_window(env, monkeypatch):
+    """A keyed "error": true line a successful run repaired, sent again within screen.reraise_window_h at
+    the same or a lower severity, stays closed: no 'regressed after fix', no wake, no reopen churn. A
+    higher severity, a re-raise past the window and a repaired non-error keyed issue reopen as before."""
+    p = make(env)
+    from ttp import daemon as dm
+    from ttp import screen as scr
+    from ttp import watchdup
+    out = {"stdout": ""}
+    monkeypatch.setattr(dm.schedrun, "run_group", lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, out["stdout"], ""))
+    d = dm.Daemon(p.base)
+
+    def line(text, severity, key="tunnel", error=True):
+        return json.dumps({"text": text, "severity": severity, "key": key, **({"error": True} if error else {})})
+
+    def wakes():
+        return p.db.one("SELECT COUNT(*) AS n FROM events WHERE kind='observation'")["n"]
+
+    def issue(key="tunnel", source="watcher-error:hw"):
+        return p.db.one("SELECT * FROM issues WHERE fingerprint=?", (scr.key_fingerprint(source, key),))
+
+    def opens(source="watcher-error:hw"):   # what same_subject_warn counts for the source
+        return sum(len(keys) for _s, _k, keys in watchdup.groups(p.db, source, time.time()))
+
+    def regressed(row):
+        return [h for h in json.loads(row["history"] or "[]") if h.get("why") == "regressed after fix"]
+
+    def run(stdout):
+        out["stdout"] = stdout
+        d._run_command_watcher({"name": "hw"}, {"command": "x"})
+
+    run(line("tunnel to host-a: down", "high"))
+    assert wakes() == 1 and issue()["status"] == "open" and opens() == 1
+    first = issue()["id"]
+    # (a) Repaired, then back at the same severity within the window, several times: counted only.
+    for _ in range(3):
+        run("")
+        assert issue()["cleared_why"] == scr.REPAIRED_WHY
+        run(line("tunnel to host-a: down", "high"))
+    row = issue()
+    assert wakes() == 1 and row["id"] == first and row["status"] == "fixed" and row["count"] == 4
+    assert regressed(row) == [] and opens() == 1
+    # (b) Back at a lower severity: the same.
+    run(line("tunnel to host-a: down", "normal"))
+    assert wakes() == 1 and issue()["status"] == "fixed" and issue()["severity"] == "high" and opens() == 1
+    # (c) Back at a higher severity: reopens as a regression and wakes.
+    run(line("tunnel to host-a: down", "critical"))
+    row = issue()
+    assert wakes() == 2 and row["status"] == "open" and row["severity"] == "critical"
+    assert len(regressed(row)) == 1 and opens() == 2
+    # (d) Repaired, then back past the window: reopens as before.
+    run("")
+    assert issue()["cleared_why"] == scr.REPAIRED_WHY
+    p.db.x("UPDATE issues SET closed=? WHERE id=?", (time.time() - 7 * 3600, first))
+    run(line("tunnel to host-a: down", "critical"))
+    assert wakes() == 3 and issue()["status"] == "open" and len(regressed(issue())) == 2 and opens() == 3
+    # Off (0) restores the old rule for repaired errors too.
+    d.cfg["screen"]["reraise_window_h"] = 0
+    run("")
+    run(line("tunnel to host-a: down", "critical"))
+    assert wakes() == 4 and issue()["status"] == "open"
+    d.cfg["screen"]["reraise_window_h"] = 6
+    # (e) A keyed report (not an error) closed as repaired keeps today's rule: it reopens as regressed.
+    run(line("box-a: link down", "high", key="link", error=False))
+    assert wakes() == 5
+    p.db.x("UPDATE issues SET status='fixed', closed=?, cleared_why=? WHERE source='watcher:hw'",
+           (time.time(), scr.REPAIRED_WHY))
+    run(line("box-a: link down", "high", key="link", error=False))
+    row = issue("link", "watcher:hw")
+    assert wakes() == 6 and row["status"] == "open" and len(regressed(row)) == 1
+    # A keyed error closed for another reason (cleared, 24 h quiet) also reopens at once, as before.
+    for why in (scr.CLEARED_WHY, scr.QUIET_WHY):
+        p.db.x("UPDATE issues SET status='fixed', closed=?, cleared_why=? WHERE id=?", (time.time(), why, first))
+        before = wakes()
+        run(line("tunnel to host-a: down", "critical"))
+        assert wakes() == before + 1 and issue()["status"] == "open"
+
+
 def test_keyed_issue_new_episode_supersedes_the_old_issue_and_wakes_once(env, monkeypatch):
     p = make(env)
     from ttp import daemon as dm

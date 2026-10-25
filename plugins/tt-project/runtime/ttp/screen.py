@@ -87,6 +87,7 @@ def screen(db: DB, cfg: dict, source: str, text: str, hint: str | None = None, j
     A keyed issue a run that reported nothing closed, raised again under the same key within
     `screen.reraise_window_h` of that close at the same or a lower severity, only counts: it stays
     closed and wakes nobody (a watcher re-sending a known line each wake). A higher severity reopens and wakes.
+    The same holds for a keyed watcher error (watcher-error:<name>) a successful run repaired (REPAIRED_WHY).
     `episode` (a keyed line's "episode" field) names one occurrence of the keyed condition: a keyed issue
     that recorded another episode is closed as superseded and a new issue opens, judged as any new one
     (no reraise dedupe). The same episode, or none, changes nothing; an issue without one adopts it.
@@ -169,11 +170,15 @@ def _issue(db: DB, fp: str, source: str, title: str, retitle: str | None, hint: 
         if row["status"] == "fixed":
             # Seen again after it was fixed or closed: it wakes when this sighting is at or above the floor.
             sev = hint if seen_at >= 0 else row["severity"]
-            if reraise_s > 0 and not repeat and row.get("cleared_why") == CLEAN_RUN_WHY and row.get("closed") is not None \
+            why = row.get("cleared_why")
+            # A keyed watcher error a later run repaired flaps the same way (a tunnel down while a host sleeps).
+            flap = why == CLEAN_RUN_WHY or (why == REPAIRED_WHY and bool(watch_key)
+                                            and source.startswith("watcher-error:"))
+            if reraise_s > 0 and not repeat and flap and row.get("closed") is not None \
                     and now - float(row["closed"]) <= reraise_s and SEVERITY_RANK.get(sev, 1) <= rank:
-                # Closed by a quiet run moments ago and sent again unchanged: counted, not reopened.
-                return Verdict(False, row["severity"], f"back within {reraise_s / 3600:g} h of a quiet run",
-                               fp, row["id"], "dedupe")
+                # Closed by a quiet (or repairing) run moments ago and sent again unchanged: counted, not reopened.
+                return Verdict(False, row["severity"], f"back within {reraise_s / 3600:g} h of a "
+                               + ("quiet run" if why == CLEAN_RUN_WHY else "repairing run"), fp, row["id"], "dedupe")
             history = json.loads(row.get("history") or "[]")
             history.append({"ts": now, "action": "reopened", "by": "a new sighting", "why": "regressed after fix"})
             db.x("UPDATE issues SET status=?, severity=?, closed=NULL, cleared_why=NULL, opened=?, reopens=?, "
