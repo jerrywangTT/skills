@@ -5,6 +5,12 @@ It is overdue once that task is done, failed, cancelled or gone, and at the late
 A continuation task that still needs it re-extends it as its first step: `ttp machines change edit <cid> --until-task <its own id>`.
 The daily review lists open entries whose task is over.
 
+`--auto-undo` (on `add`, or `edit <cid> --auto-undo`) lets the project's own daemon run the undo once the entry is due, instead of paging someone to run it.
+Use it only for an undo that is idempotent, quick (well under 5 min) and safe to run unattended, such as removing a scratch directory or re-enabling a timer; leave it off for anything that needs judgment or touches running jobs.
+The undo runs once, in its own process group, with no stdin; exit 0 closes the entry, 1, 75 or 255 retry 5 min later (3 tries), and anything else, a timeout or an interrupted run pages with the output's tail.
+It waits, unpaged, while the machine is under an outage, a fleet hold or a resource pause.
+`add` and `edit` refuse it for a no-op undo, an undo that kills by name or pattern, an until-probe that always exits 0 and an `--until-task` end.
+
 A worker whose sandbox keeps the user's tt-project home read-only still runs `ttp machines change add` and `close` as usual: the CLI then queues the request in the project's own state, and the project's daemon records it within a few minutes (`ttp machines change list` shows it as queued until then).
 Running the command again adds nothing. `ttp machines change edit` is not queued (close the entry and add a new one), except `edit <id> --test` or `--no-test`.
 

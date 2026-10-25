@@ -5581,6 +5581,10 @@ def _machine_change(a) -> None:
         for c in got:
             print(ml.change_line(c, where=p) + (f" (closed {ml.ends.shown(c['closed'], p)}: {c.get('closed_why')})"
                                                 if c.get("closed") else ""))
+            for r in c.get("auto_undo_runs") or []:
+                tail = " ".join(str(r.get("tail") or "").split())[-200:]
+                print(f"  auto-undo try {r.get('try')} at {ml.ends.shown(float(r.get('at') or 0), p)}: "
+                      f"{r.get('outcome')}" + (f"; output: {tail}" if tail else ""))
         for r in ml.pending(p.state) if p else []:
             print(f"queued for this project's daemon (request {r['queued']}): {r['op']} "
                   + (f"#{r['fields'].get('id')}" if r["op"] == "close" else
@@ -5597,7 +5601,8 @@ def _machine_change(a) -> None:
         print(_queued_line(c) if c.get("queued") else f"closed machine change #{c['id']} on {c['alias']}")
         return
     if a.change == "edit":
-        flag_only = a.test is not None and not any((a.what, a.undo, a.expires, a.until_probe, a.until_task))
+        flag_only = a.test is not None and not any((a.what, a.undo, a.expires, a.until_probe, a.until_task)) \
+            and a.auto_undo is None
         try:
             if a.test is not None:
                 c = ml.set_test(a.id, by, a.test, queue=queue)
@@ -5613,7 +5618,7 @@ def _machine_change(a) -> None:
                 c = next((c for c in ml.changes() if c.get("id") == a.id), None)
                 _until_task_ok(p, c.get("by") if c else by, a.until_task)
             c = ml.edit_change(a.id, by or "user", a.what, a.undo, a.expires, a.until_probe, until_task=a.until_task,
-                               where=p)
+                               where=p, auto_undo=a.auto_undo)
         except ValueError as e:
             die(str(e))
         except OSError as e:
@@ -5629,8 +5634,9 @@ def _machine_change(a) -> None:
         die("run it inside a project, or say whose change it is: --by <project>")
     task = os.environ.get("TTP_TASK")
     tid = int(task) if task and task.isdigit() else None
-    if a.power_cycle_at and (a.undo or a.expires or a.until_probe or a.until_task):
-        die("a power cycle needs no --undo, --expires, --until-probe or --until-task: it closes itself after its time")
+    if a.power_cycle_at and (a.undo or a.expires or a.until_probe or a.until_task or a.auto_undo):
+        die("a power cycle needs no --undo, --expires, --until-probe, --until-task or --auto-undo: it closes itself "
+            "after its time")
     if a.expires and a.until_task:
         die("give --until-task without --expires: it ends with the task, at the latest after 7 days")
     if not a.power_cycle_at and not a.undo:
@@ -5646,7 +5652,8 @@ def _machine_change(a) -> None:
         c = ml.add_power_cycle(a.alias, a.power_cycle_at, by, a.what, tid, queue=queue,
                                 extra={"test": True} if a.test else None, where=p) if a.power_cycle_at else \
             ml.add_change(a.alias, a.what, a.undo, by, a.expires, a.until_probe, tid, expects=a.expect,
-                          until_task=a.until_task, queue=queue, test=a.test, since=since, where=p)
+                          until_task=a.until_task, queue=queue, test=a.test, since=since, where=p,
+                          auto_undo=a.auto_undo)
     except ValueError as e:
         die(str(e))
     print(_queued_line(c, p) if c.get("queued") else f"recorded {ml.change_line(c, where=p)}")
@@ -8184,6 +8191,10 @@ def main(argv: list[str] | None = None) -> None:
     c.add_argument("--test", action="store_true",
                    help="the change is made for a test: `ttp ttr` labels this project's incidents on the machine "
                         "that start while it is open as tests, outside its TTR stats")
+    c.add_argument("--auto-undo", dest="auto_undo", action="store_true",
+                   help="this project's daemon runs the undo itself, unattended, once the end passes (the until-probe "
+                        "passed twice, or --expires), and closes the entry on exit 0; for quick, idempotent "
+                        "undos safe to run alone (remove a scratch dir, clear a hold), never a kill by name")
     c.add_argument("--since", metavar="T",
                    help="backdate the change's start, for one already made: a delay back (2h) or an ISO time "
                         "(home zone unless it names one); not in the future, at most 7 days back")
@@ -8217,6 +8228,11 @@ def main(argv: list[str] | None = None) -> None:
                            "machine's recovery owner may")
     flag.add_argument("--no-test", dest="test", action="store_false",
                       help="clear its test flag: its incidents count in TTR again")
+    auto = c.add_mutually_exclusive_group()
+    auto.add_argument("--auto-undo", dest="auto_undo", action="store_true", default=None,
+                      help="let this project's daemon run its undo once its end passes (as `change add --auto-undo`)")
+    auto.add_argument("--no-auto-undo", dest="auto_undo", action="store_false",
+                      help="page for its undo again instead")
     c.add_argument("--by", help="who edits it (default: the project you are in)")
     s.set_defaults(fn=cmd_machines)
 

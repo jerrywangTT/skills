@@ -45,7 +45,7 @@ cancelled or gone; a probe-only or task-only entry also expires after PROBE_END_
 re-extends it with `ttp machines change edit <id> --until-task <its own id>`. The daily review lists the
 project's open entries whose task is over (task_lines). An overdue entry pages the project that made it, then the machine's
 owner, then its fallback, each after the one before cannot act for UNAVAILABLE_S or let REPAGE_S pass,
-then the user. Nothing is undone automatically: whoever is paged runs the undo and closes the entry
+then the user. Nothing is undone automatically unless asked (Auto-undo): whoever is paged runs the undo and closes the entry
 (`ttp machines change close <id>`). An entry whose undo is a no-op (noop_undo: empty, `true`, `:`, or
 `none` as a word, as in `none: <why>`) is never paged: once its until-probe passed PROBE_PASSES times in a row
 (not one ends.always_succeeds refuses, nor a pass whose job failed) or, with no until-probe or until-task, its
@@ -58,6 +58,23 @@ timeout) queues one low `change_probe_broken` event per kind of breakage; the sa
 states. `ttp machines change edit <id> [--what] [--undo] [--expires] [--until-probe | --until-task]`
 corrects an open entry in place (same id), with an edit trail in the entry; giving its until-probe again, even
 the same one, drops its result and passes so far: it is judged afresh after PROBE_GRACE_S.
+
+Auto-undo. `ttp machines change add ... --auto-undo` (or `edit <id> --auto-undo`; `--no-auto-undo` turns it
+off) asks the recording project's daemon to run the undo itself, model-free, once the entry is due as the
+auto-close judges it (_due: its until-probe passed PROBE_PASSES times in a row, or its --expires passed with no
+until-probe). It fits a quick, idempotent undo that is safe to run unattended (remove a scratch dir, clear a
+hold). Add and edit refuse it (check_auto_undo) for a no-op undo (the auto-close covers it), an undo killscan
+flags (a kill by name or pattern), an until-probe that always exits 0, and an --until-task end. Before each run
+the daemon records a claim under the lock (try, time, its pid); the undo then runs from the project's root with
+stdin from /dev/null, in a session and process group of its own, and is killed with its whole group after
+AUTO_UNDO_TIMEOUT_S. Exit 0 closes the entry ("auto-undo ok", closed_by `auto-undo`); 1, 75 or 255 (not yet,
+in use, host unreachable) retries after PROBE_GRACE_S, up to AUTO_UNDO_TRIES runs; any other exit, a timeout,
+or a claim no running daemon holds (a restart interrupted the run: it is never run again) gives up
+(`auto_undo_failed`, quoting the claim), and route then pages as for any overdue entry, with the output's tail.
+Until then route pages nobody while that project can act. Every run, with its last AUTO_UNDO_TAIL_CHARS of
+output, is kept in `auto_undo_runs` (`ttp machines change list --all`, `--json`). While the machine is under a
+known outage, held machine-wide, or a resource on it is paused (the project's own pause or a shared one), the
+undo waits, unrun and unpaged, and runs once that ends.
 
 Test changes. `ttp machines change add ... --test` marks a change made for a test: `ttp ttr` labels the
 recording project's incidents on that machine that start inside its window as tests (ttr.test_windows).
@@ -105,7 +122,9 @@ import hashlib
 import json
 import os
 import re
+import signal
 import subprocess
+import tempfile
 import time
 from datetime import datetime
 from pathlib import Path
@@ -187,7 +206,7 @@ def _one_line(text: Any, chars: int = TEXT_CHARS) -> str:
 def add_change(alias: str, what: str, undo: str, by: str, expires: Any = None, until_probe: str | None = None,
                task: int | None = None, now: float | None = None, expects=None, extra: dict | None = None,
                until_task: int | None = None, queue: Path | None = None, test: bool = False,
-               since: float | None = None, where=None) -> dict:
+               since: float | None = None, where=None, auto_undo: bool = False) -> dict:
     """Record a live change to machine `alias` made by project `by`; returns the entry. `queue`: the project's
     state dir, where the change is queued for its daemon when the shared ledger is read-only here (returns
     the request then, with `queued`: its id; see Queued requests). `expects`: the
@@ -197,7 +216,8 @@ def add_change(alias: str, what: str, undo: str, by: str, expires: Any = None, u
     (check_task validates it). `test`: the change is made for a test, so `ttp ttr` labels this project's
     incidents on `alias` that start while it is open as tests (ttr.test_windows). `since`: an epoch time the
     change started before it was recorded (parse_since): its window starts there. `where`: the zone a
-    zone-less --expires is read in (ends.parse_expires)."""
+    zone-less --expires is read in (ends.parse_expires). `auto_undo`: the recording project's daemon runs the
+    undo itself once the entry is due (module doc: Auto-undo; check_auto_undo refuses unsafe ones)."""
     now = time.time() if now is None else now
     if since is not None and not now - SINCE_MAX_S <= float(since) <= now:
         raise ValueError(f"--since must lie within the last {SINCE_MAX_S / 86400:g} days, not in the future")
@@ -213,12 +233,14 @@ def add_change(alias: str, what: str, undo: str, by: str, expires: Any = None, u
     if probe:
         ends.check_sh(probe, "--until-probe")
         ends.check_not_trivial(probe, "--until-probe")
+    if auto_undo:
+        check_auto_undo(undo, probe, until_task)
     end = float(expires) if isinstance(expires, (int, float)) else \
         ends.parse_expires(expires, now, where=where) if expires else now + PROBE_END_S   # a number: an epoch time
     fields = {"alias": alias, "what": what, "undo": undo, "by": by, "task": task, "added": now, "expires": end,
               "probe": probe or None, **({"until_task": int(until_task)} if until_task else {}),
               **({"test": True} if test else {}), **({"since": float(since)} if since is not None else {}),
-              **(extra or {})}
+              **({"auto_undo": True} if auto_undo else {}), **(extra or {})}
     if expects:
         fields["expects"] = [_one_line(x, 200) for x in expects if _one_line(x, 200)]
     try:
@@ -547,14 +569,16 @@ def _set_test(cid: int, by: str, test: bool, now: float) -> dict:
 
 def edit_change(cid: int, by: str, what: str | None = None, undo: str | None = None, expires: Any = None,
                 until_probe: str | None = None, now: float | None = None, until_task: int | None = None,
-                where=None) -> dict:
+                where=None, auto_undo: bool | None = None) -> dict:
     """Correct open entry #cid in place: its text, undo command or end (--expires, --until-probe or
     --until-task, as add_change takes them, an --until-probe with an --expires too; the same until-task again
     restarts its PROBE_END_S, so a continuation task re-extends the entry, and the same until-probe again keeps
     its end but is judged afresh). Keeps its id, alias, author and creation time; records who edited it, when
     and the values it replaced in `edits`. A new end starts afresh (`page_from`): its until-probe result and overdue
     pages are dropped. Refuses a closed or unknown id, a power-cycle intent's undo or end, and an edit
-    that changes nothing. `where`: the zone a zone-less --expires is read in (ends.parse_expires)."""
+    that changes nothing. `where`: the zone a zone-less --expires is read in (ends.parse_expires). `auto_undo`:
+    turn the auto-undo on (True, checked by check_auto_undo against the entry's undo and probe as edited) or
+    off (False); refused while one runs. A new undo, end or auto-undo setting starts its tries afresh."""
     now = time.time() if now is None else now
     if sum(map(bool, (expires, until_probe, until_task))) > 1 and not (expires and until_probe and not until_task):
         raise ValueError("give one end: --expires, --until-probe (with or without --expires) or --until-task")
@@ -578,8 +602,10 @@ def edit_change(cid: int, by: str, what: str | None = None, undo: str | None = N
     elif expires:
         new.update(probe=None, until_task=None, expires=float(expires) if isinstance(expires, (int, float))
                    else ends.parse_expires(expires, now, where=where))
+    if auto_undo is not None:
+        new["auto_undo"] = bool(auto_undo)
     if not new:
-        raise ValueError("say what to change: --what, --undo, --expires, --until-probe or --until-task")
+        raise ValueError("say what to change: --what, --undo, --expires, --until-probe, --until-task or --auto-undo")
     with _locked():
         doc = _read(LEDGER, {"next": 1, "changes": []})
         c = next((c for c in doc.get("changes", []) if isinstance(c, dict) and c.get("id") == cid), None)
@@ -590,18 +616,31 @@ def edit_change(cid: int, by: str, what: str | None = None, undo: str | None = N
         if c.get("kind") == POWER_CYCLE and set(new) - {"what"}:
             raise ValueError(f"machine change #{cid} is a planned power cycle: only --what can change; "
                              f"close it and record a new one for another time")
+        if c.get("kind") == POWER_CYCLE and auto_undo:
+            raise ValueError(f"machine change #{cid} is a planned power cycle: it has no undo to run")
+        if c.get("auto_undo_claim") and {"undo", "auto_undo"} & set(new):
+            raise ValueError(f"machine change #{cid}: its auto-undo is running (claimed "
+                             f"{ends.shown(float(c['auto_undo_claim'].get('at') or now), where)}); edit it once it ended")
+        if new.get("auto_undo", c.get("auto_undo")) and ({"undo", "auto_undo", "probe", "until_task"} & set(new)):
+            check_auto_undo(new.get("undo", c.get("undo")), new.get("probe", c.get("probe")),
+                            new.get("until_task", c.get("until_task")))
         reprobe = until_probe is not None and new["probe"] == c.get("probe")
         if reprobe:   # the same until-probe again keeps its end (unless --expires gives one) but starts afresh
             del new["probe"]
             if not expires:
                 del new["expires"]
-        was = {k: c.get(k) for k, v in new.items() if c.get(k) != v}
+        was = {k: c.get(k) for k, v in new.items() if (bool(c.get(k)) if k == "auto_undo" else c.get(k)) != v}
         if reprobe:
             was["probe_passed"] = c.get("probe_passed")
         if not was:
             raise ValueError(f"machine change #{cid} already says that: nothing to change")
         for k in set(was) & set(new):
             c[k] = new[k]
+        if c.get("auto_undo") is False:
+            del c["auto_undo"]
+        if "expires" in was or reprobe or {"undo", "auto_undo"} & set(was):
+            for k in AUTO_UNDO_STATE:   # a new undo or end gets its tries afresh (its runs stay in the history)
+                c.pop(k, None)
         if "expires" in was or reprobe:
             for k in ("probe_passed", "probe_job_failed", "probe_out", "task_ended", "page"):
                 c.pop(k, None)
@@ -666,19 +705,102 @@ def noop_undo(undo: Any) -> bool:
     return isinstance(undo, str) and NOOP_UNDO.fullmatch(undo.strip()) is not None
 
 
-def auto_close_rule(c: dict, now: float) -> str:
-    """The rule that closes open entry `c` with no page ("" when none does): its undo is a no-op and its
-    until-probe passed PROBE_PASSES times in a row (never a probe that always exits 0, nor a pass whose job
-    failed), or it has no until-probe or until-task and its time passed. A still failing, broken or timed
-    out probe never closes it, even past its --expires."""
-    if c.get("closed") or c.get("kind") == POWER_CYCLE or not noop_undo(c.get("undo")):
+def _due(c: dict, now: float) -> str:
+    """Why open entry `c`'s undo is due with nobody paged ("" when it is not): its until-probe passed
+    PROBE_PASSES times in a row (never a probe that always exits 0, nor a pass whose job failed), or it has no
+    until-probe or until-task and its time passed. A still failing, broken or timed out probe never makes it
+    due, even past its --expires."""
+    if c.get("closed") or c.get("kind") == POWER_CYCLE:
         return ""
     if c.get("probe"):
         ok = c.get("probe_passed") and not c.get("probe_job_failed") and not trivial_probe(c)
-        return f"no-op undo, until-probe passed {PROBE_PASSES} times" if ok else ""
+        return f"until-probe passed {PROBE_PASSES} times" if ok else ""
     if c.get("until_task"):
         return ""
-    return "no-op undo, expired" if float(c.get("expires") or 0) <= now else ""
+    return "expired" if float(c.get("expires") or 0) <= now else ""
+
+
+def auto_close_rule(c: dict, now: float) -> str:
+    """The rule that closes open entry `c` with no page ("" when none does): its undo is a no-op and it is
+    due (_due)."""
+    if not noop_undo(c.get("undo")):
+        return ""
+    due = _due(c, now)
+    return f"no-op undo, {due}" if due else ""
+
+
+# Auto-undo (module doc): the recording project's daemon runs an --auto-undo entry's undo once it is due.
+AUTO_UNDO = "auto-undo"         # closed_by of an entry its auto-undo closed; closed_why "auto-undo ok"
+AUTO_UNDO_TIMEOUT_S = 300       # an undo still running after this is killed, its whole process group
+AUTO_UNDO_TRIES = 3             # runs that exit 1, 75 or 255 (not yet, in use, host unreachable) before a page
+AUTO_UNDO_RETRY_RCS = (1, 75, 255)
+AUTO_UNDO_TAIL_CHARS = 2000     # of each run's output, kept in its history
+AUTO_UNDO_PAGE_TAIL_CHARS = 600   # of the last run's output, quoted in the page
+AUTO_UNDO_RUNS_KEPT = 10        # history entries kept per change
+# the per-episode state an edit of the undo or the end clears (the run history stays)
+AUTO_UNDO_STATE = ("auto_undo_claim", "auto_undo_tries", "auto_undo_next", "auto_undo_failed")
+
+
+def check_auto_undo(undo: Any, probe: Any = None, until_task: Any = None) -> None:
+    """Refuse --auto-undo for an undo that does nothing (the auto-close covers it), one that kills by name or
+    pattern (killscan: unattended, it could end other projects' work), an until-probe that always exits 0
+    (it would run the undo at once, while the change is still in use), or an until-task end (never due
+    unpaged: _due)."""
+    if noop_undo(undo):
+        raise ValueError("--auto-undo needs an undo that does something: a no-op undo (empty, `true`, `:` or "
+                         "`none: <why>`) already closes itself once its end passes")
+    from . import killscan
+    hits = killscan.scan(str(undo))
+    if hits:
+        raise ValueError(f"--auto-undo refuses an undo that kills by name or pattern ({hits[0][1]}: "
+                         f"`{hits[0][2][:120]}`): run unattended, it could end other work; kill by a recorded pid, "
+                         f"or leave out --auto-undo and undo it yourself")
+    if probe and ends.always_succeeds(str(probe)):
+        raise ValueError("--auto-undo needs an until-probe that can say \"not yet\": this one always exits 0, so "
+                         "the undo would run at once; end the test with `|| exit 1`")
+    if until_task:
+        raise ValueError("--auto-undo runs once an --until-probe passed or an --expires passed; an --until-task "
+                         "end is paged instead: give the entry one of those ends, or leave out --auto-undo")
+
+
+def auto_undo_due(c: dict, now: float) -> str:
+    """Why open entry `c`'s auto-undo should run now ("" when not): it has --auto-undo, a real undo, is due
+    (_due), has not given up (auto_undo_failed) and no retry waits (auto_undo_next)."""
+    if not c.get("auto_undo") or c.get("auto_undo_failed") or noop_undo(c.get("undo")):
+        return ""
+    if float(c.get("auto_undo_next") or 0) > now:
+        return ""
+    return _due(c, now)
+
+
+def auto_undo_waits(c: dict, now: float) -> bool:
+    """Whether route leaves overdue entry `c` to its project's auto-undo (no page): it is due or waits for a
+    retry or runs, and has not given up."""
+    if not c.get("auto_undo") or c.get("auto_undo_failed") or c.get("closed") or noop_undo(c.get("undo")):
+        return False
+    return bool(c.get("auto_undo_claim") or c.get("auto_undo_next") or _due(c, now))
+
+
+def auto_undo_paused(c: dict, p, now: float) -> str:
+    """Why `c`'s auto-undo must wait ("" when it may run): a known outage of its machine, a machine-wide hold,
+    or a pause of a resource on it (this project's own, or a shared one)."""
+    from . import fleethold, shared
+    from . import responsibilities as rs
+    alias = c.get("alias") or ""
+    o = outages(now).get(alias)
+    if o:
+        return f"known outage of {alias}: {o.get('why')}"
+    if fleethold.active().get(alias):
+        return f"{alias} is held machine-wide"
+    on = on_machine(alias)
+    db = getattr(p, "db", None)
+    for res in sorted((db.paused_resources() if db is not None else {}) or {}):
+        if on(res):
+            return f"resource {res} is paused"
+    for res in sorted(rs._shared_resources(alias)):
+        if shared.read_pause(res):
+            return f"shared resource {res} is paused"
+    return ""
 
 
 def change_line(c: dict, now: float | None = None, where=None, clip: int | None = None) -> str:
@@ -693,6 +815,8 @@ def change_line(c: dict, now: float | None = None, where=None, clip: int | None 
     by = c.get("by", "?") + (f" #{c['task']}" if c.get("task") else "")
     end += f"; expects {', '.join(c['expects'])}" if c.get("expects") else ""
     end += "; a test" if c.get("test") else ""
+    end += ("; auto-undo" + (f" gave up: {part(c['auto_undo_failed'].get('why'))}" if c.get("auto_undo_failed")
+                             else "")) if c.get("auto_undo") else ""
     end += (f"; its until-probe always exits 0, so it never ends this: fix it with `ttp machines change edit "
             f"{c['id']} --until-probe '<test> || exit 1'`") if trivial_probe(c) else ""
     end += f"; backdated to {ends.shown(c['since'], where)}" if isinstance(c.get("since"), (int, float)) else ""
@@ -1244,14 +1368,24 @@ def route(now: float | None = None, able: Callable[[str], tuple[bool, str]] | No
                 changed = True
                 shut.append(f"machine change #{c['id']} on {c['alias']} auto-closed ({rule}): {c['what']}")
                 continue
+            if auto_undo_waits(c, now) and able(str(c.get("by") or ""))[0]:
+                # its project's daemon runs the undo (Probes); paged only once that gave up
+                if (c.get("page") or {}).pop("pending", None) is not None:
+                    changed = True
+                continue
             page = c.setdefault("page", {})
             target = _step(page, chain(c["alias"], c.get("by")), now, able)
             changed = True
+            gave_up = c.get("auto_undo_failed") or {}
             if target:
                 _pending(page, target, "machine_change_overdue", f"machine-change:{c['id']}", c["alias"],
                          float(c.get("page_from") or c["added"]),
                          f"Machine change #{c['id']} on {c['alias']} is overdue ({late}): {c['what']} "
-                         f"(by {c.get('by')}). Page {page['stage'] + 1}: undo it with `{c['undo']}`, "
+                         f"(by {c.get('by')}). "
+                         + (f"Its auto-undo gave up ({gave_up.get('why')})"
+                            + (f"; its output ended: {_clip(str(gave_up['tail'])[-AUTO_UNDO_PAGE_TAIL_CHARS:], AUTO_UNDO_PAGE_TAIL_CHARS)}"
+                               if gave_up.get("tail") else "") + ". " if gave_up else "")
+                         + f"Page {page['stage'] + 1}: undo it with `{c['undo']}`, "
                          f"then `ttp machines change close {c['id']}`.")
             claim(page)
         if changed:
@@ -1394,6 +1528,8 @@ class Probes:
         self._errs: dict[int, Any] = {}   # id(proc) -> its stderr file
         self._reported: dict[int, str] = {}   # change id -> the broken kind ("exit 2", "timeout") already reported
         self._passes: dict[int, tuple[str, float, int]] = {}   # change id -> (probe, set at, its passes in a row)
+        self._undos: dict[int, tuple[subprocess.Popen, float, Any, dict]] = {}   # id -> (proc, started, output, claim)
+        self._undo_waits: dict[int, str] = {}   # id -> why its auto-undo waits (a pause, an outage), logged once
 
     def tick(self, now: float | None = None) -> None:
         now = time.time() if now is None else now
@@ -1430,6 +1566,7 @@ class Probes:
         if passed or any((c.get("id"), c.get("probe")) in unpassed and c.get("probe_passed") for c in changes()):
             self._mark(passed, unpassed, now)
         self._tasks(now)
+        self._auto_undos(now)
         for c in changes():
             if c.get("kind") == POWER_CYCLE and float(c.get("expires") or 0) <= now:   # any daemon: the maker's may be gone
                 with contextlib.suppress(ValueError):   # another daemon closed it first
@@ -1492,6 +1629,107 @@ class Probes:
                     c.update(task_ended=now, task_end_why=over[(c["id"], c["until_task"])])
             _write(LEDGER, doc)
 
+    def _auto_undos(self, now: float) -> None:
+        """Run the undo of this project's --auto-undo entries once due (module doc: Auto-undo): reap the runs
+        that ended or ran past AUTO_UNDO_TIMEOUT_S (their whole group killed), settle a claim no run of this
+        daemon holds (a restart interrupted it) without running it again, then claim and start the due ones
+        whose machine is not paused or out."""
+        for cid, (proc, started, out, claim) in list(self._undos.items()):
+            rc = proc.poll()
+            if rc is None and now - started < AUTO_UNDO_TIMEOUT_S:
+                continue
+            del self._undos[cid]
+            if rc is None:
+                _kill_group(proc)
+            self._settle_undo(cid, claim, "timeout" if rc is None else rc, _tail(out), now)
+        for c in changes():
+            claim = c.get("auto_undo_claim")
+            if c.get("by") == self.p.name and isinstance(claim, dict) and c.get("id") not in self._undos:
+                self._settle_undo(int(c["id"]), claim, "interrupted", "", now)
+        for c in changes():
+            cid = c.get("id")
+            if c.get("by") != self.p.name or cid in self._undos or not auto_undo_due(c, now):
+                continue
+            why = auto_undo_paused(c, self.p, now)
+            if why:   # waits, unpaged, until the pause or outage ends
+                if self._undo_waits.get(cid) != why:
+                    self._undo_waits[cid] = why
+                    self.log(f"machine change #{cid}: its auto-undo waits: {why}")
+                continue
+            self._undo_waits.pop(cid, None)
+            claim = self._claim_undo(int(cid), now)
+            if not claim:
+                continue
+            out = tempfile.TemporaryFile()
+            try:   # its own session and process group, never the daemon's; no stdin
+                proc = subprocess.Popen(claim["undo"], shell=True, cwd=str(self.p.root),
+                                        env=project.command_env(self.p), stdin=subprocess.DEVNULL, stdout=out,
+                                        stderr=subprocess.STDOUT, start_new_session=True)
+            except OSError as e:
+                out.close()
+                self._settle_undo(int(cid), claim, "could not start", str(e), now)
+                continue
+            self._undos[int(cid)] = (proc, now, out, claim)
+            self.log(f"machine change #{cid}: auto-undo try {claim['try']} of {AUTO_UNDO_TRIES} started "
+                     f"(pid {proc.pid}): {claim['undo'][:200]}")
+
+    def _claim_undo(self, cid: int, now: float) -> dict | None:
+        """Record the run before it starts, under the lock, so a restart never runs it twice: the claim, or
+        None when the entry is no longer due or another run holds it."""
+        with _locked():
+            doc = _read(LEDGER, {"next": 1, "changes": []})
+            c = next((c for c in doc.get("changes", []) if isinstance(c, dict) and c.get("id") == cid), None)
+            if c is None or c.get("auto_undo_claim") or not auto_undo_due(c, now):
+                return None
+            n = int(c.get("auto_undo_tries") or 0) + 1
+            claim = {"at": now, "by": self.p.name, "daemon_pid": os.getpid(), "try": n, "undo": c["undo"],
+                     "token": os.urandom(6).hex()}
+            c.update(auto_undo_claim=claim, auto_undo_tries=n)
+            c.pop("auto_undo_next", None)
+            _write(LEDGER, doc)
+        return claim
+
+    def _settle_undo(self, cid: int, claim: dict, rc, tail: str, now: float) -> None:
+        """Record one run's outcome in the entry's history (auto_undo_runs) and act on it: exit 0 closes the
+        entry; 1, 75 or 255 retries after PROBE_GRACE_S up to AUTO_UNDO_TRIES runs; anything else (a timeout,
+        a failed start, a run a restart interrupted) gives up, which route pages with the tail."""
+        tail = str(tail or "")[-AUTO_UNDO_TAIL_CHARS:]
+        n = int(claim.get("try") or 1)
+        retry = rc in AUTO_UNDO_RETRY_RCS and n < AUTO_UNDO_TRIES
+        code = rc if isinstance(rc, str) else f"exit {rc}"
+        if rc == 0:
+            outcome = "ok"
+        elif retry:
+            outcome = f"{code}; retry after {PROBE_GRACE_S}s"
+        elif rc in AUTO_UNDO_RETRY_RCS:
+            outcome = f"gave up: {code} on each of {AUTO_UNDO_TRIES} tries"
+        elif rc == "timeout":
+            outcome = f"gave up: timed out after {AUTO_UNDO_TIMEOUT_S}s (its process group killed)"
+        elif rc == "interrupted":
+            outcome = (f"gave up: a daemon restart interrupted its run, so it is not run again (claim: try {n}, "
+                       f"{ends.shown(float(claim.get('at') or now), self.p)} by {claim.get('by')}, daemon pid "
+                       f"{claim.get('daemon_pid')})")
+        else:
+            outcome = f"gave up: {code}"
+        with _locked():
+            doc = _read(LEDGER, {"next": 1, "changes": []})
+            c = next((c for c in doc.get("changes", []) if isinstance(c, dict) and c.get("id") == cid), None)
+            if c is None or (c.get("auto_undo_claim") or {}).get("token") != claim.get("token"):
+                return   # settled already, or the entry is gone
+            c.pop("auto_undo_claim", None)
+            run = {"at": claim.get("at"), "ended": now, "try": n, "rc": rc, "outcome": outcome, "tail": tail}
+            c["auto_undo_runs"] = (list(c.get("auto_undo_runs") or []) + [run])[-AUTO_UNDO_RUNS_KEPT:]
+            if rc == 0:
+                (c.get("page") or {}).pop("pending", None)
+                c.update(closed=now, closed_why="auto-undo ok", closed_by=AUTO_UNDO,
+                         auto_undone={"at": now, "try": n})
+            elif retry:
+                c["auto_undo_next"] = now + PROBE_GRACE_S
+            else:
+                c["auto_undo_failed"] = {"at": now, "why": outcome.removeprefix("gave up: "), "tail": tail}
+            _write(LEDGER, doc)
+        self.log(f"machine change #{cid}: auto-undo try {n}: {outcome}" + (f": {tail[-300:]}" if tail else ""))
+
     def _broken(self, cid: int, probe: str, rc, err: str, now: float) -> None:
         """Log a broken until-probe and queue one low event for the coordinator, keyed on the change, the
         probe and how it broke (its exit code or "timeout"), never its stderr: once across restarts too."""
@@ -1516,6 +1754,36 @@ class Probes:
 
     def stop(self) -> None:
         ends.stop_probes(self._procs, self._errs)
+        for cid, (proc, _, out, claim) in list(self._undos.items()):   # nothing runs unobserved: paged as interrupted
+            del self._undos[cid]
+            _kill_group(proc)
+            with contextlib.suppress(Exception):
+                self._settle_undo(cid, claim, "interrupted", _tail(out), time.time())
+
+
+def _kill_group(proc: subprocess.Popen) -> None:
+    """End an auto-undo and whatever it started: its own process group, never the daemon's."""
+    try:
+        pgid = os.getpgid(proc.pid)
+        if pgid != os.getpgrp():
+            os.killpg(pgid, signal.SIGKILL)
+    except OSError:
+        pass
+    with contextlib.suppress(subprocess.SubprocessError, OSError):
+        proc.wait(timeout=5)
+
+
+def _tail(out: Any) -> str:
+    """The last AUTO_UNDO_TAIL_CHARS of a run's output file, which is then closed."""
+    try:
+        out.seek(0, os.SEEK_END)
+        out.seek(max(0, out.tell() - 4 * AUTO_UNDO_TAIL_CHARS))
+        return out.read().decode("utf-8", "replace")[-AUTO_UNDO_TAIL_CHARS:]
+    except (OSError, ValueError):
+        return ""
+    finally:
+        with contextlib.suppress(OSError):
+            out.close()
 
 
 # digest -------------------------------------------------------------------------------------------

@@ -3655,3 +3655,269 @@ def test_two_concurrent_sweepers_close_a_noop_undo_change_once(env):
     assert len(logs) == 1, logs
     [c] = [c for c in ml.changes(open_only=False) if c["id"] == cid]
     assert c["closed"] and c["auto_closed"]["sweeper"] == logs[0][0]
+
+
+def _auto_change(ml, p, undo, now, **kw):
+    """An --auto-undo entry on box-a by project `p`, due an hour after `now` (its --expires)."""
+    kw.setdefault("expires", "1h")
+    return ml.add_change("box-a", "a scratch dir for a repro", undo, p.name, now=now, auto_undo=True, **kw)["id"]
+
+
+def _undo_round(probes, at):
+    """One Probes tick (it reaps the last auto-undo run and may start one), then waits for what it started."""
+    probes.tick(at)
+    for proc, _, _, _ in list(probes._undos.values()):
+        proc.wait(30)
+
+
+def _change_entry(ml, cid):
+    return next(c for c in ml.changes(open_only=False) if c["id"] == cid)
+
+
+def _overdue_pages(ml, at, claimer="alpha"):
+    return [x for x in ml.route(at, able=lambda n: (True, ""), claimer=claimer) if x["kind"] == "machine_change_overdue"]
+
+
+def _undo_gone(pid):
+    """Whether process `pid` ended (gone, or a zombie nobody reaped yet)."""
+    import os
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    try:
+        return open(f"/proc/{pid}/stat").read().rsplit(")", 1)[1].split()[0] == "Z"
+    except OSError:
+        return False
+
+
+def test_an_auto_undo_change_runs_its_undo_once_due_in_its_own_project_and_exit_0_closes_it(env, tmp_path, capsys):
+    """Not before it is due, only in the recording project's daemon, once: the claim is recorded before the run,
+    exit 0 closes it as 'auto-undo ok', nobody is paged, and list and --json show the run."""
+    from ttp import cli
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    p = make(env)
+    mm.add("box-a", tags="device")
+    t0 = time.time()
+    ran = tmp_path / "ran"
+    cid = _auto_change(ml, p, f"echo ran >> {ran}; echo removed the scratch dir", t0)
+    other = ml.add_change("box-a", "someone else's", f"echo other >> {ran}", "alpha", expires="1h", now=t0,
+                          auto_undo=True)["id"]
+    probes = ml.Probes(p, log=lambda m: None)
+    _undo_round(probes, t0 + 60)
+    assert not ran.exists() and not probes._undos, "not due yet"
+    due = t0 + 3601
+    assert f"machine-change:{cid}" not in {x["key"] for x in _overdue_pages(ml, due)}, "left to its auto-undo"
+    probes.tick(due)
+    claim = _change_entry(ml, cid)["auto_undo_claim"]
+    assert claim["try"] == 1 and claim["by"] == p.name and claim["at"] == due, "claimed before it ran"
+    assert set(probes._undos) == {cid}, "only its own project's entries run"
+    for proc, _, _, _ in probes._undos.values():
+        proc.wait(30)
+    _undo_round(probes, due + 1)
+    c = _change_entry(ml, cid)
+    assert c["closed"] == due + 1 and c["closed_why"] == "auto-undo ok" and c["closed_by"] == "auto-undo"
+    assert "auto_undo_claim" not in c and "page" not in c
+    [run] = c["auto_undo_runs"]
+    assert run["rc"] == 0 and run["outcome"] == "ok" and "removed the scratch dir" in run["tail"]
+    for at in (due + 2, due + 400, due + 4000):
+        _undo_round(probes, at)
+    assert ran.read_text() == "ran\n", "once"
+    assert f"machine-change:{cid}" not in {x["key"] for x in _overdue_pages(ml, due + 4000)}
+    cli.main(["machines", "change", "list", "--all"])
+    out = capsys.readouterr().out
+    assert ": auto-undo ok)" in out and "auto-undo try 1 at" in out and "removed the scratch dir" in out, out
+    cli.main(["machines", "change", "list", "--all", "--json"])
+    rows = {c["id"]: c for c in json.loads(capsys.readouterr().out)}
+    assert rows[cid]["auto_undo_runs"][0]["outcome"] == "ok" and rows[cid]["auto_undo"] is True
+
+
+@pytest.mark.parametrize("rc", [1, 75, 255])
+def test_an_auto_undo_that_exits_not_yet_retries_after_the_grace_then_pages_with_its_tail(env, tmp_path, rc):
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    p = make(env)
+    mm.add("box-a", tags="device")
+    t0 = time.time()
+    ran = tmp_path / "ran"
+    cid = _auto_change(ml, p, f"echo try >> {ran}; echo still in use; exit {rc}", t0)
+    probes = ml.Probes(p, log=lambda m: None)
+    at = t0 + 3601
+    for n in range(1, ml.AUTO_UNDO_TRIES + 1):
+        _undo_round(probes, at)
+        assert ran.read_text().count("try") == n
+        _undo_round(probes, at + 1)   # reaps it
+        c = _change_entry(ml, cid)
+        assert len(c["auto_undo_runs"]) == n and c["auto_undo_runs"][-1]["rc"] == rc
+        if n < ml.AUTO_UNDO_TRIES:
+            assert c["auto_undo_next"] == at + 1 + ml.PROBE_GRACE_S and not c.get("auto_undo_failed")
+            _undo_round(probes, at + 2)
+            assert not probes._undos and ran.read_text().count("try") == n, "not before the grace"
+            assert not _overdue_pages(ml, at + 2), "a retry waits: nobody paged"
+            at = c["auto_undo_next"]
+    c = _change_entry(ml, cid)
+    assert not c.get("closed") and c["auto_undo_failed"]["why"] == \
+        f"exit {rc} on each of {ml.AUTO_UNDO_TRIES} tries"
+    [page] = _overdue_pages(ml, at + 2)
+    assert page["target"] == p.name and "auto-undo gave up" in page["text"] and "still in use" in page["text"]
+    _undo_round(probes, at + 5000)
+    assert ran.read_text().count("try") == ml.AUTO_UNDO_TRIES, "no run after it gave up"
+
+
+def test_an_auto_undo_with_another_exit_or_a_timeout_pages_at_once_and_kills_only_its_own_group(env, tmp_path,
+                                                                                                monkeypatch):
+    import os
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    p = make(env)
+    mm.add("box-a", tags="device")
+    t0 = time.time()
+    grp, kid = tmp_path / "pgid", tmp_path / "kid"
+    bad = _auto_change(ml, p, f"ps -o pgid= -p $$ > {grp}; echo $$ >> {grp}; echo boom; exit 2", t0)
+    slow = _auto_change(ml, p, f"echo started; sleep 60 & echo $! > {kid}; wait", t0)
+    monkeypatch.setattr(ml, "AUTO_UNDO_TIMEOUT_S", 30)
+    probes = ml.Probes(p, log=lambda m: None)
+    at = t0 + 3601
+    probes.tick(at)
+    probes._undos[bad][0].wait(30)
+    for _ in range(100):
+        if kid.exists() and kid.read_text().strip():
+            break
+        time.sleep(0.05)
+    sleeper = int(kid.read_text())
+    probes.tick(at + 10)   # reaps the failed one; the slow one still runs
+    assert slow in probes._undos and not _undo_gone(sleeper)
+    pgid, shell = grp.read_text().split()
+    assert pgid == shell and int(pgid) != os.getpgrp(), "its own process group, never the daemon's"
+    c = _change_entry(ml, bad)
+    assert c["auto_undo_failed"]["why"] == "exit 2" and len(c["auto_undo_runs"]) == 1
+    probes.tick(at + 31)   # past its timeout: its whole group is killed
+    assert slow not in probes._undos
+    for _ in range(100):
+        if _undo_gone(sleeper):
+            break
+        time.sleep(0.05)
+    assert _undo_gone(sleeper), "the timeout kills what the undo started too"
+    s = _change_entry(ml, slow)
+    assert s["auto_undo_runs"][-1]["rc"] == "timeout" and "timed out after 30s" in s["auto_undo_failed"]["why"]
+    assert "started" in s["auto_undo_failed"]["tail"]
+    pages = {x["key"]: x["text"] for x in _overdue_pages(ml, at + 32)}
+    assert "boom" in pages[f"machine-change:{bad}"] and "exit 2" in pages[f"machine-change:{bad}"]
+    assert "timed out" in pages[f"machine-change:{slow}"] and "started" in pages[f"machine-change:{slow}"]
+
+
+def test_auto_undo_is_refused_for_a_noop_a_pattern_kill_a_trivial_probe_or_an_until_task_at_add_and_edit(env, capsys):
+    from ttp import cli
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    p = make(env)
+    mm.add("box-a", tags="device")
+    t0 = time.time()
+    for undo in ("none: nothing left", "true", ":"):
+        with pytest.raises(ValueError, match="no-op undo"):
+            _auto_change(ml, p, undo, t0)
+    for undo in ("pkill -f repro", "killall repro", "kill $(pgrep repro)", "rm -rf /tmp/x; /usr/bin/pkill x"):
+        with pytest.raises(ValueError, match="kills by name or pattern"):
+            _auto_change(ml, p, undo, t0)
+    with pytest.raises(ValueError, match="always exits 0"):
+        _auto_change(ml, p, "rm -rf /tmp/x", t0, until_probe="test -e /tmp/y || true")
+    with pytest.raises(ValueError, match="until-task"):
+        ml.check_auto_undo("rm -rf /tmp/x", None, 7)
+    assert not ml.changes(), "nothing recorded"
+    plain = ml.add_change("box-a", "plain", "pkill repro", p.name, expires="1h", now=t0)["id"]
+    with pytest.raises(ValueError, match="kills by name or pattern"):
+        ml.edit_change(plain, p.name, auto_undo=True, now=t0)
+    auto = _auto_change(ml, p, "rm -rf /tmp/x", t0)
+    with pytest.raises(ValueError, match="no-op undo"):
+        ml.edit_change(auto, p.name, undo="none", now=t0)
+    with pytest.raises(ValueError, match="kills by name or pattern"):
+        ml.edit_change(auto, p.name, undo="killall x", now=t0)
+    old = ml.add_change("box-a", "old probe", "rm -rf /tmp/x", p.name, until_probe="test -e /tmp/y || exit 1",
+                        now=t0)["id"]
+    with ml._locked():   # stored before add and edit refused trivial probes
+        doc = ml._read(ml.LEDGER, {"next": 1, "changes": []})
+        next(c for c in doc["changes"] if c["id"] == old)["probe"] = "test -e /tmp/y || true"
+        ml._write(ml.LEDGER, doc)
+    with pytest.raises(ValueError, match="always exits 0"):
+        ml.edit_change(old, p.name, auto_undo=True, now=t0)
+    assert not any(c.get("auto_undo") for c in ml.changes() if c["id"] != auto)
+    c = ml.edit_change(auto, p.name, auto_undo=False, now=t0)
+    assert "auto_undo" not in c and c["edits"][-1]["was"] == {"auto_undo": True}
+    with pytest.raises(SystemExit):
+        cli.main(["machines", "change", "add", "box-a", "x", "--undo", "pkill -f x", "--expires", "1h",
+                  "--auto-undo", "--by", p.name])
+    assert "kills by name or pattern" in capsys.readouterr().err
+    cli.main(["machines", "change", "edit", str(auto), "--auto-undo", "--by", p.name])
+    assert _change_entry(ml, auto)["auto_undo"] is True and "; auto-undo" in capsys.readouterr().out
+
+
+def test_an_auto_undo_claim_survives_a_restart_and_is_paged_never_run_twice(env, tmp_path):
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    p = make(env)
+    mm.add("box-a", tags="device")
+    t0 = time.time()
+    ran, gate = tmp_path / "ran", tmp_path / "gate"
+    cid = _auto_change(ml, p, f"echo ran >> {ran}; while ! test -e {gate}; do sleep 0.05; done", t0)
+    crashed = _auto_change(ml, p, f"echo crashed >> {ran}", t0)
+    at = t0 + 3601
+    first = ml.Probes(p, log=lambda m: None)
+    assert first._claim_undo(crashed, at), "claimed, then the daemon died before it started the run"
+    first.tick(at)   # starts the other one (the crashed claim is first's own record, not a run of first's)
+    assert cid in first._undos
+    logs = []
+    second = ml.Probes(p, log=logs.append)   # the daemon restarted while the run went on
+    _undo_round(second, at + 60)
+    _undo_round(second, at + 4000)
+    gate.touch()
+    for proc, _, _, _ in first._undos.values():
+        proc.wait(30)
+    first.tick(at + 4001)   # the old run's outcome no longer counts: it was settled as interrupted
+    assert ran.read_text() == "ran\n", "never run again after a restart"
+    for i in (cid, crashed):
+        c = _change_entry(ml, i)
+        assert not c.get("closed") and "auto_undo_claim" not in c and len(c["auto_undo_runs"]) == 1
+        assert c["auto_undo_runs"][0]["rc"] == "interrupted"
+        assert "interrupted" in c["auto_undo_failed"]["why"] and "claim: try 1" in c["auto_undo_failed"]["why"]
+    pages = {x["key"]: x["text"] for x in _overdue_pages(ml, at + 4002)}
+    assert set(pages) == {f"machine-change:{cid}", f"machine-change:{crashed}"}
+    assert all("daemon restart interrupted" in t and "claim: try 1" in t for t in pages.values())
+    assert any("auto-undo try 1: gave up: a daemon restart" in m for m in logs)
+
+
+@pytest.mark.parametrize("hold", ["outage", "own pause", "shared pause"])
+def test_an_auto_undo_waits_unrun_and_unpaged_while_its_machine_is_out_or_paused(env, tmp_path, hold):
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    from ttp import shared
+    from ttp.db import PAUSED_RESOURCES_KEY
+    p = make(env)
+    mm.add("box-a", tags="device")
+    t0 = time.time()
+    ran = tmp_path / "ran"
+    cid = _auto_change(ml, p, f"echo ran >> {ran}", t0)
+    at = t0 + 3601
+    if hold == "outage":
+        ml.set_outage("box-a", "hardware repair", "user", "2h", now=at - 10)
+    elif hold == "own pause":
+        p.db.set_kv(PAUSED_RESOURCES_KEY, {"box-a-device": {"reason": "user hold", "since": at}})
+    else:
+        (shared.root() / "box-a-device").mkdir(parents=True, exist_ok=True)
+        (shared.root() / "box-a-device" / shared.PAUSE_FILE).write_text(json.dumps({"reason": "hold", "by": "x"}))
+    logs = []
+    probes = ml.Probes(p, log=logs.append)
+    for i in range(3):
+        _undo_round(probes, at + i * 700)
+        assert not _overdue_pages(ml, at + i * 700)
+    assert not ran.exists() and not probes._undos and "auto_undo_claim" not in _change_entry(ml, cid)
+    assert sum("its auto-undo waits" in m for m in logs) == 1, logs
+    if hold == "outage":
+        ml.clear_outage("box-a", "user", now=at + 2200)
+    elif hold == "own pause":
+        p.db.set_kv(PAUSED_RESOURCES_KEY, {})
+    else:
+        (shared.root() / "box-a-device" / shared.PAUSE_FILE).unlink()
+    _undo_round(probes, at + 2300)
+    _undo_round(probes, at + 2301)
+    assert ran.read_text() == "ran\n" and _change_entry(ml, cid)["closed_why"] == "auto-undo ok"
