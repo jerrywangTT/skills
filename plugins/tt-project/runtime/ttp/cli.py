@@ -8187,7 +8187,8 @@ def main(argv: list[str] | None = None) -> None:
     c.add_argument("--since", metavar="T",
                    help="backdate the change's start, for one already made: a delay back (2h) or an ISO time "
                         "(home zone unless it names one); not in the future, at most 7 days back")
-    c = cs.add_parser("list", help="the open changes")
+    c = cs.add_parser("list", help="the open changes (--all: closed ones too, with who or which auto-close rule "
+                                   "closed them: a no-op undo such as `none: <why>` closes itself once its end passes)")
     c.add_argument("alias", nargs="?", help="only this machine")
     c.add_argument("--all", action="store_true", help="closed ones too")
     c.add_argument("--json", action="store_true", help="print JSON")

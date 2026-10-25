@@ -1527,7 +1527,8 @@ class Daemon:
             log(self.p, "power-cycle notices failed\n" + traceback.format_exc())
         try:
             self._machine_probes.tick(now)
-            pages = machine_ledger.route(now, claimer=self.p.name, budgets=outagetask.budgets(self.cfg))
+            pages = machine_ledger.route(now, claimer=self.p.name, budgets=outagetask.budgets(self.cfg),
+                                          log=lambda m: log(self.p, m))
         except Exception:
             log(self.p, "routing shared-machine pages failed\n" + traceback.format_exc())
             return

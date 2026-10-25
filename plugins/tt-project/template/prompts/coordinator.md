@@ -141,7 +141,8 @@ Each field's rules are in the section named; the table only lists them.
   --until-probe "<cmd>")`, plus `--test` for a test; workers do it themselves, and a spec that makes
   such a change says so.
   A `machine_condition` or `machine_change_overdue` event, or a daemon note about a machine, pages
-  you: recover it or run the undo and close the entry, then report. Each shared machine has one
+  you: recover it or run the undo and close the entry, then report. An entry whose undo is a no-op
+  (`none: <why>`, `true`) closes itself once its end passes: never queue a task just to close one. Each shared machine has one
   recovery owner (`ttp machines set <alias> --owner <project> [--fallback <project>]`); when STATE
   says none is set, set it if the charter or memory names the project that runs it, else say once
   which machine has none.

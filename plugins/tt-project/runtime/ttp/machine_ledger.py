@@ -46,7 +46,11 @@ re-extends it with `ttp machines change edit <id> --until-task <its own id>`. Th
 project's open entries whose task is over (task_lines). An overdue entry pages the project that made it, then the machine's
 owner, then its fallback, each after the one before cannot act for UNAVAILABLE_S or let REPAGE_S pass,
 then the user. Nothing is undone automatically: whoever is paged runs the undo and closes the entry
-(`ttp machines change close <id>`). Probes run only in the daemon of the project that made the entry,
+(`ttp machines change close <id>`). An entry whose undo is a no-op (noop_undo: empty, `true`, `:`, or
+`none` as a word, as in `none: <why>`) is never paged: once its until-probe passed PROBE_PASSES times in a row
+(not one ends.always_succeeds refuses, nor a pass whose job failed) or, with no until-probe or until-task, its
+time passed, the first daemon's route closes it under the lock, model-free and once (auto_close_rule), with
+`auto_closed` and closed_by naming the rule. Probes run only in the daemon of the project that made the entry,
 from its root, as end probes do, starting PROBE_GRACE_S after the entry; a probe counts as passed only after
 PROBE_PASSES passes in a row (each logged with its output's tail), keeps running while the entry is open, and a
 later "not yet" (1 or 75) clears the pass and its pages; a broken one (an exit code other than 0, 1, 75 or ssh's own 255, or a
@@ -651,6 +655,32 @@ def trivial_probe(c: dict) -> bool:
     return bool(c.get("probe")) and not c.get("closed") and ends.always_succeeds(c["probe"])
 
 
+# An undo that does nothing: empty, `true`, `:`, or `none` (any case) alone or followed by `:`, `;`, `-` or
+# whitespace and a reason (`none: nothing left to undo`). Nothing else, not `true && x` nor `none_cleanup.sh`.
+NOOP_UNDO = re.compile(r"(?:true|:|(?i:none)(?:[:;\s-].*)?)?", re.S)
+AUTO_CLOSE = "auto-close"   # closed_by of an entry route closed itself: f"{AUTO_CLOSE}: <rule>"
+
+
+def noop_undo(undo: Any) -> bool:
+    """Whether undo command `undo` does nothing (NOOP_UNDO, after trimming whitespace)."""
+    return isinstance(undo, str) and NOOP_UNDO.fullmatch(undo.strip()) is not None
+
+
+def auto_close_rule(c: dict, now: float) -> str:
+    """The rule that closes open entry `c` with no page ("" when none does): its undo is a no-op and its
+    until-probe passed PROBE_PASSES times in a row (never a probe that always exits 0, nor a pass whose job
+    failed), or it has no until-probe or until-task and its time passed. A still failing, broken or timed
+    out probe never closes it, even past its --expires."""
+    if c.get("closed") or c.get("kind") == POWER_CYCLE or not noop_undo(c.get("undo")):
+        return ""
+    if c.get("probe"):
+        ok = c.get("probe_passed") and not c.get("probe_job_failed") and not trivial_probe(c)
+        return f"no-op undo, until-probe passed {PROBE_PASSES} times" if ok else ""
+    if c.get("until_task"):
+        return ""
+    return "no-op undo, expired" if float(c.get("expires") or 0) <= now else ""
+
+
 def change_line(c: dict, now: float | None = None, where=None, clip: int | None = None) -> str:
     """Entry `c` on one line. `clip`: at most about that many characters (the coordinator digest): the
     reason is cut first, then a long undo, probe or overdue cause, so the id, alias, author, the start of
@@ -1100,13 +1130,16 @@ def _task_step(c: dict, key: str, targets: list[str], page: dict, now: float,
 def route(now: float | None = None, able: Callable[[str], tuple[bool, str]] | None = None,
           claimer: str = "", healthy: Callable[[str, str, float, str], list[str]] | None = None,
           quiet: Callable[[dict, float, dict], tuple[str, bool]] | None = None,
-          budgets: dict | None = None, task_status: Callable[[str, str], str | None] | None = None) -> list[dict]:
+          budgets: dict | None = None, task_status: Callable[[str, str], str | None] | None = None,
+          log: Callable[[str], None] | None = None) -> list[dict]:
     """The pages to deliver now, model-free: [{target, kind, key, alias, stage, id, text}]. Each due
     page is recorded as pending; the pending pages nobody holds (or whose claim lapsed after CLAIM_S)
     are claimed for `claimer` and returned. Mark each `delivered` once it went out, or `release` it.
     `quiet` (default quiet_reason) stops a condition's escalation, or every page of it. `budgets`
-    (outagetask.budgets) times the outage task; `task_status` reads its state (outagetask.task_status)."""
+    (outagetask.budgets) times the outage task; `task_status` reads its state (outagetask.task_status).
+    An overdue entry with nothing to undo is closed instead of paged (auto_close_rule), logged to `log`."""
     now = time.time() if now is None else now
+    log = log or (lambda m: None)
     able = able or can_act
     quiet = quiet or quiet_reason
     b = budgets or outagetask.budgets(None)
@@ -1202,6 +1235,14 @@ def route(now: float | None = None, able: Callable[[str], tuple[bool, str]] | No
         for c in ledger.get("changes", []):
             late = overdue(c, now)
             if not late:
+                continue
+            rule = auto_close_rule(c, now)
+            if rule:   # nothing to undo: closed here, under the lock, so once across daemons and restarts
+                (c.get("page") or {}).pop("pending", None)
+                c.update(closed=now, closed_why=f"auto-closed: {rule}", closed_by=f"{AUTO_CLOSE}: {rule}",
+                         auto_closed={"at": now, "rule": rule, "sweeper": claimer})
+                changed = True
+                log(f"machine change #{c['id']} on {c['alias']} auto-closed ({rule}): {c['what']}")
                 continue
             page = c.setdefault("page", {})
             target = _step(page, chain(c["alias"], c.get("by")), now, able)

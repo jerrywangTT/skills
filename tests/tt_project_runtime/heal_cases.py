@@ -3497,3 +3497,161 @@ def test_machine_change_with_a_stored_trivial_until_probe_is_never_ended_by_it_a
                                     [dict(ml.changes()[0], task=t)], later + 3600)
     assert got == [], "no due undo from its pass"
     assert ml.overdue(ml.changes()[0], now + 2 * 86400 + 1).startswith("expired"), "its time still ends it"
+
+
+NOOP_UNDOS = ("true", ":", "none", "NONE: nothing left to undo", "None - gone with the reboot", "none;",
+              "  none\tnothing  ", "")
+NOT_NOOP_UNDOS = ("true && rm x", "none_cleanup.sh", "nonexistent", "true;", ": ; rm x", "falsetrue",
+                  "systemctl start svc", "none.sh", "rm -f drop-in; true")
+
+
+def _set_undo(ml, cid, undo):
+    """Store `undo` as is (add refuses an empty one; an older entry may hold it)."""
+    with ml._locked():
+        doc = ml._read(ml.LEDGER, {"next": 1, "changes": []})
+        next(c for c in doc["changes"] if c["id"] == cid)["undo"] = undo
+        ml._write(ml.LEDGER, doc)
+
+
+def _probe_round(probes, at):
+    """One Probes tick that reaps the last run and starts the next, then waits for it to end."""
+    probes._probed.clear()
+    probes.tick(at)
+    for proc, _, _ in list(probes._procs.values()):
+        proc.wait(30)
+
+
+def test_noop_undo_grammar_is_strict():
+    from ttp import machine_ledger as ml
+    assert all(ml.noop_undo(u) for u in NOOP_UNDOS)
+    assert not any(ml.noop_undo(u) for u in NOT_NOOP_UNDOS) and not ml.noop_undo(None)
+
+
+def test_an_expired_change_with_a_noop_undo_closes_itself_once_and_a_real_undo_still_pages(env, capsys):
+    """Each no-op undo form closes at the first route past its expiry, model-free and with no page; a
+    near-miss or real undo pages as before. A second route (a restarted daemon) closes nothing again."""
+    from ttp import cli
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    make(env)
+    mm.add("box-a", tags="device")
+    t0 = time.time()
+    noop = {ml.add_change("box-a", f"noop {i}", "x", "alpha", expires="1h", now=t0)["id"]: u
+            for i, u in enumerate(NOOP_UNDOS)}
+    real = {ml.add_change("box-a", f"real {i}", u, "alpha", expires="1h", now=t0)["id"]: u
+            for i, u in enumerate(NOT_NOOP_UNDOS)}
+    for cid, u in noop.items():
+        _set_undo(ml, cid, u)
+    logs = []
+    assert ml.route(t0 + 60, able=lambda n: (True, ""), log=logs.append) == [] and not logs, "not yet expired"
+    assert len(ml.changes()) == len(noop) + len(real)
+    later = t0 + 3600 + 1
+    pages = ml.route(later, able=lambda n: (True, ""), claimer="alpha", log=logs.append)
+    paged = {int(x["key"].split(":")[1]) for x in pages if x["kind"] == "machine_change_overdue"}
+    assert paged == set(real), "a real or near-miss undo pages as before"
+    assert {c["id"] for c in ml.changes()} == set(real)
+    closed = {c["id"]: c for c in ml.changes(open_only=False) if c.get("closed")}
+    assert set(closed) == set(noop)
+    for cid, c in closed.items():
+        assert c["closed"] == later and c["closed_why"] == "auto-closed: no-op undo, expired"
+        assert c["closed_by"] == "auto-close: no-op undo, expired" and "page" not in c
+        assert c["auto_closed"] == {"at": later, "rule": "no-op undo, expired", "sweeper": "alpha"}
+    assert len(logs) == len(noop) and all("auto-closed (no-op undo, expired)" in m and "box-a" in m for m in logs)
+    assert any(f"#{min(noop)} on box-a auto-closed" in m and "noop 0" in m for m in logs)
+    # A restarted daemon (or a co-tenant's) sweeping again: no second close, no second record.
+    before = ml.changes(open_only=False)
+    ml.route(later + 600, able=lambda n: (True, ""), claimer="beta", log=logs.append)
+    assert len(logs) == len(noop)
+    assert [c for c in ml.changes(open_only=False) if c["id"] in noop] == [c for c in before if c["id"] in noop]
+    # The listing's history and --json show it and the rule that closed it.
+    cli.main(["machines", "change", "list", "--all"])
+    out = capsys.readouterr().out
+    assert out.count(": auto-closed: no-op undo, expired)") == len(noop), out
+    cli.main(["machines", "change", "list", "--all", "--json"])
+    rows = {c["id"]: c for c in json.loads(capsys.readouterr().out)}
+    assert all(rows[cid]["closed_by"] == "auto-close: no-op undo, expired" for cid in noop)
+
+
+def test_a_noop_undo_change_closes_only_after_its_until_probe_passes_twice_in_a_row(env, tmp_path):
+    """An until-probe entry with a no-op undo closes once its probe passed PROBE_PASSES times in a row,
+    never after one pass, while it still fails (even past its --expires), nor when its probe always exits 0."""
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    p = make(env)
+    mm.add("box-a", tags="device")
+    t0 = time.time()
+    flag = tmp_path / "over"
+    probe = f"test -e {flag} || exit 1"
+    ids = [ml.add_change("box-a", f"held {i}", u, p.name, until_probe=probe, expires="1h", now=t0)["id"]
+           for i, u in enumerate(NOOP_UNDOS[:4])]
+    real = ml.add_change("box-a", "held for real", "release it", p.name, until_probe=probe, now=t0)["id"]
+    probes, able = ml.Probes(p, log=lambda m: None), (lambda n: (True, ""))
+    at = t0 + ml.PROBE_GRACE_S + 1
+    for i in range(3):   # still failing: open (past its --expires: the next test)
+        _probe_round(probes, at + i)
+        assert ml.route(at + i, able=able) == []
+    assert {c["id"] for c in ml.changes()} >= set(ids), "a failing probe never closes it"
+    flag.touch()
+    _probe_round(probes, at + 10)   # reaps the last failing run, starts a passing one
+    _probe_round(probes, at + 11)   # pass 1 of 2
+    ml.route(at + 11, able=able)
+    assert {c["id"] for c in ml.changes()} >= set(ids), "one pass is not enough"
+    _probe_round(probes, at + 12)   # pass 2 of 2: marked passed
+    pages = ml.route(at + 12, able=able, claimer=p.name)
+    left = {c["id"] for c in ml.changes()}
+    assert not left & set(ids) and real in left
+    assert [x["key"] for x in pages if x["kind"] == "machine_change_overdue"] == [f"machine-change:{real}"]
+    for c in ml.changes(open_only=False):
+        if c["id"] in ids:
+            rule = f"no-op undo, until-probe passed {ml.PROBE_PASSES} times"
+            assert c["closed_why"] == f"auto-closed: {rule}" and c["closed_by"] == f"auto-close: {rule}"
+
+
+def test_a_noop_undo_change_with_a_failing_broken_or_trivial_probe_is_never_auto_closed(env):
+    """Past its --expires, an entry whose probe still fails, broke, or always exits 0 (ends.always_succeeds)
+    keeps paging, as does a pass whose job failed."""
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    p = make(env)
+    mm.add("box-a", tags="device")
+    t0 = time.time()
+    cases = {"failing": {}, "trivial": {"probe": "test -e /tmp/kit || true", "probe_passed": t0},
+             "job failed": {"probe_passed": t0, "probe_job_failed": "exit 3"}}
+    ids = {}
+    for name, fields in cases.items():
+        ids[name] = ml.add_change("box-a", name, "none: nothing to undo", p.name,
+                                  until_probe="test -e /tmp/kit || exit 1", expires="1h", now=t0)["id"]
+        with ml._locked():
+            doc = ml._read(ml.LEDGER, {"next": 1, "changes": []})
+            next(c for c in doc["changes"] if c["id"] == ids[name]).update(fields)
+            ml._write(ml.LEDGER, doc)
+    pages = ml.route(t0 + 7200, able=lambda n: (True, ""))
+    assert {x["key"] for x in pages if x["kind"] == "machine_change_overdue"} == \
+        {f"machine-change:{i}" for i in ids.values()}
+    assert len(ml.changes()) == 3 and all(not ml.auto_close_rule(c, t0 + 7200) for c in ml.changes())
+
+
+def test_two_concurrent_sweepers_close_a_noop_undo_change_once(env):
+    """Co-tenant daemons route at the same moment: the ledger lock lets one close it; the other sees it
+    closed and records nothing."""
+    import threading
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    make(env)
+    mm.add("box-a", tags="device")
+    t0 = time.time()
+    cid = ml.add_change("box-a", "a repro driver", "none", "alpha", expires="1h", now=t0)["id"]
+    logs, start = [], threading.Barrier(4)
+
+    def sweep(name):
+        start.wait()
+        ml.route(t0 + 3601, able=lambda n: (True, ""), claimer=name, log=lambda m: logs.append((name, m)))
+
+    threads = [threading.Thread(target=sweep, args=(f"d{i}",)) for i in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(30)
+    assert len(logs) == 1, logs
+    [c] = [c for c in ml.changes(open_only=False) if c["id"] == cid]
+    assert c["closed"] and c["auto_closed"]["sweeper"] == logs[0][0]
