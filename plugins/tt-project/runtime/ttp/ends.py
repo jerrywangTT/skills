@@ -504,6 +504,26 @@ def spawn_probe(p: Project, probe: str, errs: dict[int, Any], stdout: bool = Fal
     return proc
 
 
+def probe_once(p: Project, probe: str, timeout_s: float) -> tuple[Any, str]:
+    """Run shell probe `probe` once as the daemon does (spawn_probe), waiting at most `timeout_s`:
+    (its exit code, "timeout" (killed) or "cannot run: <why>", its output tail)."""
+    errs: dict[int, Any] = {}
+    try:
+        proc = spawn_probe(p, probe, errs, stdout=True)
+    except OSError as e:
+        return f"cannot run: {e}", ""
+    try:
+        rc: Any = proc.wait(timeout=timeout_s)
+    except subprocess.TimeoutExpired:
+        _kill(proc)
+        rc = "timeout"
+    except BaseException:   # interrupted: leave no probe running
+        _kill(proc)
+        _err_tail(errs, proc)
+        raise
+    return rc, _err_tail(errs, proc)
+
+
 def _err_tail(errs: dict[int, Any], proc: subprocess.Popen) -> str:
     """The bounded end of a finished probe's stderr, once (its file is closed after)."""
     f = errs.pop(id(proc), None)

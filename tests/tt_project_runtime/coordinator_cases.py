@@ -14658,7 +14658,8 @@ def test_a_sandboxed_worker_queues_machine_changes_for_its_daemon_when_the_share
         cli.main(add + ["--expires", "2h"])
         out = capsys.readouterr().out
         assert out.startswith("queued machine change on box-a: staged tree") and "read-only here" in out
-    cli.main(["machines", "change", "add", "box-a", "drop-in", "--undo", "rm drop-in", "--until-probe", "test -d /"])
+    cli.main(["machines", "change", "add", "box-a", "drop-in", "--undo", "rm drop-in", "--until-probe",
+              "test -d /no/such/dir"])
     capsys.readouterr()
     assert ml.changes() == [] and len(ml.pending(p.state)) == 2
     cli.main(["machines", "change", "list"])
@@ -14678,7 +14679,7 @@ def test_a_sandboxed_worker_queues_machine_changes_for_its_daemon_when_the_share
     staged, drop = ml.changes()
     assert (staged["what"], staged["undo"], staged["by"], staged["task"]) == ("staged tree", "rm -r tree", p.name, task)
     assert staged["expires"] == pytest.approx(now + 7200, abs=60) and staged["request"]
-    assert drop["probe"] == "test -d /" and drop["undo"] == "rm drop-in"
+    assert drop["probe"] == "test -d /no/such/dir" and drop["undo"] == "rm drop-in"
     # A retry once recorded, or a request left behind by a daemon killed after the write, adds nothing.
     monkeypatch.setattr(ml, "_locked", read_only)
     cli.main(add + ["--expires", "2h"])

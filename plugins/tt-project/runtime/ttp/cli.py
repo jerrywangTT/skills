@@ -5721,6 +5721,8 @@ def _machine_change(a) -> None:
         die(ml.END_HINT)
     if a.since and a.power_cycle_at:
         die("a power cycle cannot be backdated: --since is for a change already made")
+    if a.allow_met_probe and not a.until_probe:
+        die("--allow-met-probe goes with --until-probe")
     try:
         since = ml.parse_since(a.since, where=p) if a.since else None
         if a.until_task:
@@ -5729,7 +5731,8 @@ def _machine_change(a) -> None:
                                 extra={"test": True} if a.test else None, where=p) if a.power_cycle_at else \
             ml.add_change(a.alias, a.what, a.undo, by, a.expires, a.until_probe, tid, expects=a.expect,
                           until_task=a.until_task, queue=queue, test=a.test, since=since, where=p,
-                          auto_undo=a.auto_undo)
+                          auto_undo=a.auto_undo, allow_met_probe=a.allow_met_probe,
+                          project=p if p and p.name == by else local_project(by) or p)
     except ValueError as e:
         die(str(e))
     print(_queued_line(c, p) if c.get("queued") else f"recorded {ml.change_line(c, where=p)}")
@@ -8256,7 +8259,9 @@ def main(argv: list[str] | None = None) -> None:
                                      "e.g. 2026-10-26T15:30 or 2026-10-26T15:30-07:00); with --until-probe, at the latest")
     end = c.add_mutually_exclusive_group()
     end.add_argument("--until-probe", dest="until_probe",
-                     help="a command that exits 0 once the change should be undone (checked every 10 min)")
+                     help="a command that exits 0 once the change should be undone (checked every 10 min); it "
+                          "must still fail when you record the change: add runs it once and refuses one that "
+                          "passes already")
     end.add_argument("--until-task", dest="until_task", type=int, metavar="ID",
                      help="use it when a staged artifact (such as a build tree) must outlive its builder only "
                           "while this task of the project is open: it ends once that task is done, failed "
@@ -8276,6 +8281,9 @@ def main(argv: list[str] | None = None) -> None:
                    help="this project's daemon runs the undo itself, unattended, once the end passes (the until-probe "
                         "passed twice, or --expires), and closes the entry on exit 0; for quick, idempotent "
                         "undos safe to run alone (remove a scratch dir, clear a hold), never a kill by name")
+    c.add_argument("--allow-met-probe", dest="allow_met_probe", action="store_true",
+                   help="record it even though its --until-probe passes already (the entry is overdue at once); "
+                        "prints a warning")
     c.add_argument("--since", metavar="T",
                    help="backdate the change's start, for one already made: a delay back (2h) or an ISO time "
                         "(home zone unless it names one); not in the future, at most 7 days back")

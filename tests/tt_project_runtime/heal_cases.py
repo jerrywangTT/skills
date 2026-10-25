@@ -3460,6 +3460,70 @@ def test_machine_change_add_and_edit_refuse_an_until_probe_that_always_exits_0(e
         ml.edit_change(1, p.name, until_probe="x; true")
 
 
+def test_machine_change_add_refuses_an_until_probe_that_passes_already_unless_allowed(env, capsys):
+    """An until-probe that exits 0 when the change is recorded makes the entry overdue at once: add runs it
+    once, from the project root as the daemon does, and refuses it on one line, writing nothing;
+    --allow-met-probe records it with a warning, and a probe that says "not yet" records with none."""
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    from ttp.cli import main
+    p = make(env)
+    mm.add("box-a", tags="device")
+    (p.root / "staged").write_text("x")   # relative: the probe runs in the project root
+    add = ["machines", "change", "add", "box-a", "staged a file", "--undo", "rm staged", "--by", p.name]
+    with pytest.raises(SystemExit) as e:
+        main(add + ["--until-probe", "test -e staged"])
+    assert e.value.code != 0
+    err = capsys.readouterr().err
+    assert "already passes" in err and "overdue at once" in err and "--expires" in err, err
+    assert "--allow-met-probe" in err and len(err.strip().splitlines()) == 1, err
+    assert ml.changes() == [], "nothing written"
+    main(add + ["--until-probe", "test -e staged", "--allow-met-probe"])
+    out, err = capsys.readouterr()
+    assert out.startswith("recorded ") and "warning" in err and "already passes" in err, (out, err)
+    assert [c["probe"] for c in ml.changes()] == ["test -e staged"]
+    main(add + ["--until-probe", "test ! -e staged"])
+    out, err = capsys.readouterr()
+    assert out.startswith("recorded ") and not err, (out, err)
+    with pytest.raises(SystemExit):
+        main(add + ["--expires", "2h", "--allow-met-probe"])
+    assert "goes with --until-probe" in capsys.readouterr().err and len(ml.changes()) == 2
+
+
+@pytest.mark.parametrize("probe,says", [("sleep 30", "did not finish"), ("exit 3", "exits 3"),
+                                        ("exit 255", "exits 255")])
+def test_machine_change_add_records_a_timed_out_or_broken_until_probe_with_a_warning(env, monkeypatch, capsys,
+                                                                                    probe, says):
+    """Only exit 0 refuses: a probe that times out (killed within add's short timeout), or exits with a code
+    the daemon reads as broken, or 255 (unreachable or broken), is recorded with a warning naming it."""
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    from ttp.cli import main
+    p = make(env)
+    mm.add("box-a", tags="device")
+    monkeypatch.setattr(ml, "ADD_PROBE_TIMEOUT_S", 0.5)
+    t0 = time.monotonic()
+    main(["machines", "change", "add", "box-a", "paused", "--undo", "resume", "--until-probe", probe,
+          "--by", p.name])
+    assert time.monotonic() - t0 < 10
+    out, err = capsys.readouterr()
+    assert out.startswith("recorded ") and "warning" in err and says in err, (out, err)
+    assert [c["probe"] for c in ml.changes()] == [probe]
+
+
+def test_machine_change_add_with_expires_only_runs_no_probe(env, monkeypatch, capsys):
+    from ttp import ends
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    from ttp.cli import main
+    p = make(env)
+    mm.add("box-a", tags="device")
+    monkeypatch.setattr(ends, "probe_once", lambda *a, **k: pytest.fail("no probe to run"))
+    main(["machines", "change", "add", "box-a", "paused", "--undo", "resume", "--expires", "2h", "--by", p.name])
+    out, err = capsys.readouterr()
+    assert out.startswith("recorded ") and not err and ml.changes()[0]["probe"] is None
+
+
 def test_machine_change_with_a_stored_trivial_until_probe_is_never_ended_by_it_and_is_reported(env):
     """An entry stored before add refused such probes (or written by an older version) never turns
     overdue because its probe passed, even with a pass recorded: Probes does not run it and queues one

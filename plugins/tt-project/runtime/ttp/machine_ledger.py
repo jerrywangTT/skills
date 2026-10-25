@@ -39,7 +39,8 @@ recorded with `ttp machines change add <alias> "<what>" --undo "<cmd>" (--expire
 "<cmd>" | --until-task <id>)`, or an until-probe with an --expires (it ends at whichever comes first): who made it (the project), why (the text), how to undo it and when it ends. Each co-tenant's
 digest lists the open entries for machines in its Resources, one line each. An entry is overdue when it
 expires, its until-probe passes (exit 0: what it waited for is over, so the undo is due; add and edit refuse
-a probe that always exits 0, ends.always_succeeds, and Probes reports an older one instead of running it) or its until-task
+a probe that always exits 0, ends.always_succeeds, and Probes reports an older one instead of running it; add
+also runs its probe once, check_probe_unmet, and refuses one that passes already, unless --allow-met-probe) or its until-task
 (a task of the project that made it, such as the follow-up that uses a staged build tree) is done, failed,
 cancelled or gone; a probe-only or task-only entry also expires after PROBE_END_S, and a continuation task
 re-extends it with `ttp machines change edit <id> --until-task <its own id>`. The daily review lists the
@@ -125,6 +126,7 @@ import os
 import re
 import signal
 import subprocess
+import sys
 import tempfile
 import time
 from datetime import datetime
@@ -147,6 +149,7 @@ CONDITION_GONE_S = 3 * 3600  # a condition nobody reported this long is over
 PROBE_END_S = 7 * 86400      # an entry with only an until-probe or until-task is overdue after this anyway
 PROBE_GRACE_S = 300          # an until-probe first runs this long after its entry (or its new probe) was made
 PROBE_PASSES = 2             # passes in a row before an until-probe counts as passed
+ADD_PROBE_TIMEOUT_S = 10     # how long `change add` waits for its until-probe's first run (check_probe_unmet)
 CLOSED_KEPT_S = 30 * 86400   # closed entries kept this long
 SINCE_MAX_S = 7 * 86400      # `change add --since` backdates a start at most this far
 TEXT_CHARS = 300
@@ -207,7 +210,8 @@ def _one_line(text: Any, chars: int = TEXT_CHARS) -> str:
 def add_change(alias: str, what: str, undo: str, by: str, expires: Any = None, until_probe: str | None = None,
                task: int | None = None, now: float | None = None, expects=None, extra: dict | None = None,
                until_task: int | None = None, queue: Path | None = None, test: bool = False,
-               since: float | None = None, where=None, auto_undo: bool = False) -> dict:
+               since: float | None = None, where=None, auto_undo: bool = False, project=None,
+               allow_met_probe: bool = False, warn: Callable[[str], None] | None = None) -> dict:
     """Record a live change to machine `alias` made by project `by`; returns the entry. `queue`: the project's
     state dir, where the change is queued for its daemon when the shared ledger is read-only here (returns
     the request then, with `queued`: its id; see Queued requests). `expects`: the
@@ -218,7 +222,9 @@ def add_change(alias: str, what: str, undo: str, by: str, expires: Any = None, u
     incidents on `alias` that start while it is open as tests (ttr.test_windows). `since`: an epoch time the
     change started before it was recorded (parse_since): its window starts there. `where`: the zone a
     zone-less --expires is read in (ends.parse_expires). `auto_undo`: the recording project's daemon runs the
-    undo itself once the entry is due (module doc: Auto-undo; check_auto_undo refuses unsafe ones)."""
+    undo itself once the entry is due (module doc: Auto-undo; check_auto_undo refuses unsafe ones). `project`
+    (a Project): run the until-probe once first, as its daemon would (check_probe_unmet; `allow_met_probe`,
+    `warn`)."""
     now = time.time() if now is None else now
     if since is not None and not now - SINCE_MAX_S <= float(since) <= now:
         raise ValueError(f"--since must lie within the last {SINCE_MAX_S / 86400:g} days, not in the future")
@@ -236,6 +242,8 @@ def add_change(alias: str, what: str, undo: str, by: str, expires: Any = None, u
         ends.check_not_trivial(probe, "--until-probe")
     if auto_undo:
         check_auto_undo(undo, probe, until_task)
+    if probe and project is not None:
+        check_probe_unmet(project, probe, allow_met_probe, warn)
     end = float(expires) if isinstance(expires, (int, float)) else \
         ends.parse_expires(expires, now, where=where) if expires else now + PROBE_END_S   # a number: an epoch time
     fields = {"alias": alias, "what": what, "undo": undo, "by": by, "task": task, "added": now, "expires": end,
@@ -250,6 +258,38 @@ def add_change(alias: str, what: str, undo: str, by: str, expires: Any = None, u
         if queue is None or e.errno not in UNWRITABLE:
             raise
         return _queue(queue, "add", fields)
+
+
+def check_probe_unmet(p, probe: str, allow_met: bool = False, warn: Callable[[str], None] | None = None) -> None:
+    """`change add`: run until-probe `probe` once in project `p`'s context, as Probes does (ends.probe_once),
+    for at most ADD_PROBE_TIMEOUT_S. Exit 0 means the change is over already, so the entry would be overdue at
+    once: raises ValueError, unless `allow_met` (then a warning). A timeout, a probe that cannot run or one
+    that exits with a code other than "not yet" (ends.NOT_YET_RCS) is recorded anyway, with a warning naming
+    it; a 255 too, since only the daemon tells an unreachable host from a broken probe."""
+    warn = warn or (lambda msg: print(msg, file=sys.stderr))
+    rc, out = ends.probe_once(p, probe, ADD_PROBE_TIMEOUT_S)
+    tail = f": {_one_line(out, 200)}" if out.strip() else ""
+    if rc == 0:
+        if not allow_met:
+            raise ValueError(f"the --until-probe already passes (exit 0 now), so the entry would be overdue at "
+                             f"once: give a probe that stays false until the change should end, or use --expires "
+                             f"(--allow-met-probe records it anyway)")
+        warn(f"warning: the --until-probe already passes (exit 0 now): the entry is overdue at once "
+             f"(recorded, --allow-met-probe){tail}")
+    elif rc == "timeout":
+        warn(f"warning: the --until-probe did not finish within {ADD_PROBE_TIMEOUT_S}s (killed): recorded; the "
+             f"daemon gives it {ends.PROBE_TIMEOUT_S}s and reports it broken if it times out there too")
+    elif isinstance(rc, str):
+        warn(f"warning: the --until-probe {rc}: recorded; the daemon reports it broken until it runs")
+    elif rc == 255:
+        warn(f"warning: the --until-probe exits 255 now (ssh could not reach a host, or the probe is broken): "
+             f"recorded; the daemon tells which{tail}")
+    elif rc not in ends.NOT_YET_RCS and detach.failed_check(probe, rc):
+        warn(f"warning: the detached job the --until-probe waits on ended but failed (exit {rc} now): recorded, "
+             f"but the entry is overdue at once{tail}")
+    elif rc not in ends.NOT_YET_RCS:
+        warn(f"warning: the --until-probe exits {rc} now, which the daemon treats as a broken probe (only 0 = "
+             f"over, 1 or 75 = not yet): recorded{tail}")
 
 
 def parse_since(raw: str, now: float | None = None, where=None) -> float:
