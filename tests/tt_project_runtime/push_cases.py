@@ -6969,6 +6969,74 @@ def test_without_a_check_prestage_detached_checks_start_as_before(env, tmp_path,
     assert not project.config_problems({"delivery": {"check_prestage": {"run": "pytest -q t.py", "timeout_s": 120}}})
 
 
+@pytest.mark.parametrize("sig", [signal.SIGTERM, signal.SIGHUP], ids=["term", "hup"])
+def test_a_check_prestage_is_stopped_when_ttp_checks_is_killed(tmp_path, sig):
+    import ttp
+    from ttp.daemon import _alive
+    pidf = tmp_path / "prestage.pid"
+    code = ("from ttp import checkprestage; import os, sys; "
+            f"checkprestage.run({{'run': 'echo $$ > {pidf}; exec sleep 60', 'timeout_s': 30}}, "
+            f"{str(tmp_path)!r}, dict(os.environ), print); sys.exit(9)")
+    env = {**os.environ, "PYTHONPATH": str(pathlib.Path(ttp.__file__).parent.parent)}
+    proc = subprocess.Popen([sys.executable, "-c", code], env=env, stdout=subprocess.DEVNULL)
+    try:
+        deadline = time.monotonic() + 20
+        while not (pidf.exists() and pidf.read_text().strip()) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        child = int(pidf.read_text())
+        assert _alive(child)
+        proc.send_signal(sig)
+        assert proc.wait(timeout=15) == -sig, "the signal still ends `ttp checks` as it would have"
+        deadline = time.monotonic() + 5
+        while _alive(child) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert not _alive(child), "the pre-stage outlived the `ttp checks` that started it"
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+        if pidf.exists() and pidf.read_text().strip() and _alive(int(pidf.read_text())):
+            os.kill(int(pidf.read_text()), signal.SIGKILL)
+
+
+def test_a_check_prestage_is_skipped_on_a_tree_whose_checks_already_passed(env, tmp_path, monkeypatch, capsys):
+    from ttp import cli
+    p, run, started = _prestage_setup(env, tmp_path, monkeypatch, "echo flaky; exit 3")
+    cli.main(["checks", "--", "true"])   # records a pass of these checks on this tree
+    capsys.readouterr()
+    cli.main(["checks", "--detach", "--", "true"])
+    out = capsys.readouterr().out
+    assert len(started) == 1 and "skipped: these checks already passed" in out and "flaky" not in out
+    with pytest.raises(SystemExit) as failed:   # --fresh runs them all again, the pre-stage first
+        cli.main(["checks", "--detach", "--fresh", "--", "true"])
+    assert failed.value.code == 1 and len(started) == 1 and "flaky" in capsys.readouterr().out
+    # Other commands than the recorded ones: the pre-stage runs.
+    with pytest.raises(SystemExit):
+        cli.main(["checks", "--detach", "--", "true", "--version"])
+    assert len(started) == 1
+
+
+def test_a_check_prestage_is_skipped_on_a_fast_path_diff(env, tmp_path, monkeypatch, capsys):
+    from ttp import cli
+    p, run, started = _prestage_setup(env, tmp_path, monkeypatch, "echo flaky; exit 3")
+    repo = tmp_path / "work"
+    git = ["git", "-C", str(repo), "-c", "user.email=t@example.com", "-c", "user.name=t"]
+    p.set_config("delivery.push_branch", "work")
+    p.set_config("delivery.checks_fast_globs", ["*.md"])
+    p.set_config("delivery.push_checks", ["true"])
+    base = subprocess.run([*git, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+    subprocess.run([*git, "update-ref", "refs/remotes/origin/work", base], check=True)
+    (repo / "n.md").write_text("hi\n")
+    subprocess.run([*git, "add", "-A"], check=True)
+    subprocess.run([*git, "commit", "-qm", "docs"], check=True)
+    cli.main(["checks", "--detach"])
+    out = capsys.readouterr().out
+    assert len(started) == 1 and "skipped: the fast path" in out and "flaky" not in out
+    with pytest.raises(SystemExit) as failed:
+        cli.main(["checks", "--detach", "--full"])
+    assert failed.value.code == 1 and len(started) == 1 and "flaky" in capsys.readouterr().out
+
+
 @pytest.mark.parametrize('run_env', [None, ''], ids=['unset', 'empty'])
 def test_check_output_queued_push_rebuilt_after_restart(env, monkeypatch, capsys, run_env):
     from ttp import push

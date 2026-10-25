@@ -2255,6 +2255,31 @@ def _warn_broken_venvs(p: Project | None, top: str, say) -> None:
             f"make it again with: {push.venv_rebuild_cmd(venv)}")
 
 
+def _prestage_skip(a, p: Project | None, top: str, head: str, tree: str, cmds: list, own: list, vpy: str,
+                   purpose: str) -> str:
+    """Why `ttp checks --detach` skips delivery.check_prestage on this head, or "": the detached checks
+    would only reuse a recorded pass, run none of them, or take the fast path past the project's
+    checks (as the foreground path decides; `--fresh` and `--full` turn those off)."""
+    from . import push
+    if a.fresh:
+        return ""
+    base = _checks_base(p, Path(top), cmds)
+    try:
+        todo, _ = push.applicable(Path(top), head, cmds, lambda m: None, base, candidate=purpose == "candidate")
+    except push.ScopeError:
+        return ""
+    todo, _ = _ran_again(todo, own, vpy)
+    if not todo:
+        return "no check applies on this head"
+    if _recorded_pass(p, tree, todo, purpose):
+        return "these checks already passed on this tree and the detached run reuses that pass; `--fresh` runs it"
+    fcfg = p.config() if p else None
+    if not a.full and not any(getattr(c, "if_changed", ()) for c in todo) \
+            and push.fast_path(Path(top), base, head, push.fast_globs(fcfg), push.fast_exclude(fcfg)):
+        return "the fast path skips the project's checks on this docs/data-only diff; `--full` runs it"
+    return ""
+
+
 def cmd_checks(a) -> None:
     """(inside a run) Run the local checks on this worktree's commit and record the result in the
     run's directory: the harness's gh opens a PR (even a draft) only after they passed on HEAD. The
@@ -2392,7 +2417,9 @@ def cmd_checks(a) -> None:
             if purpose == "candidate" and not harness_unset and not getattr(a, "no_prestage", False) \
                     and d.get(checkprestage.KEY) is not None and not _checks_owner(Path(run_dir), top, purpose):
                 pre_env = {**push.check_env("checks"), "PWD": top, **venv_vars}
-                if checkprestage.run(d.get(checkprestage.KEY), top, pre_env,
+                if why := _prestage_skip(a, p, top, head, tree, cmds, own, vpy, purpose):
+                    print(f"ttp checks: pre-stage (delivery.{checkprestage.KEY}) skipped: {why}", flush=True)
+                elif checkprestage.run(d.get(checkprestage.KEY), top, pre_env,
                                      lambda m: print(f"ttp checks: {m}", flush=True)):
                     sys.exit(1)
             _checks_detach(a, Path(run_dir), p, top, head)

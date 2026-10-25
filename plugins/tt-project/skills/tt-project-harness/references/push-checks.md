@@ -25,10 +25,10 @@ Known gap: the project owns its globs; one covering installed or test-asserted c
 
 ## Pre-stage before detached checks
 
-Opt-in, off by default. `delivery.check_prestage` names a short command (a string, or `{"run": "...", "timeout_s": 180}`; default 180 s, at most 900) that `ttp checks --detach` runs first, in the foreground, at the worktree's top.
+Opt-in, off by default. `delivery.check_prestage` names a short command (a string, or `{"run": "...", "timeout_s": 60}`; default 90 s, at most 900) that `ttp checks --detach` runs first, in the foreground, at the worktree's top. The tool call that runs `ttp checks --detach` needs a timeout above it; a signal that ends that command (SIGTERM, SIGHUP, Ctrl-C) also stops the pre-stage.
 Pick fast tests that often catch mistakes (static invariants, lint), so a worker sees their failure in the same run instead of after the whole detached suite and a later wake.
 It fails: its output's tail is printed, nothing starts in the background and the command exits 1. It passes or times out: the full checks start as usual. A command the host lacks (exit 126/127) or a malformed setting is reported and skipped; `--no-prestage` skips it for one start.
-It only adds an early run: the full checks still run every command, and it never marks a check as passed. Foreground `ttp checks`, `--purpose harness` and the harness repo do not run it.
+It only adds an early run: the full checks still run every command, and it never marks a check as passed. Foreground `ttp checks`, `--purpose harness` and the harness repo do not run it. It is skipped, with a line saying why, where the detached checks would run nothing new: a recorded pass of the same checks on this tree (`--fresh` runs it) or a fast-path docs/data diff (`--full` runs it).
 
 ## Priority
 

@@ -14,10 +14,17 @@ import tempfile
 import time
 
 KEY = "check_prestage"
-DEFAULT_TIMEOUT_S = 180.0
+DEFAULT_TIMEOUT_S = 90.0     # under the 120 s a Bash tool call gets by default, so the caller outlives it
 MAX_TIMEOUT_S = 900.0
 TAIL_LINES = 60
 CANNOT_RUN = (126, 127)   # the shell found no such command or could not run it: a setting fault
+STOP_ON = (signal.SIGTERM, signal.SIGHUP)   # what ends `ttp checks` (a tool timeout, a run's group kill)
+
+
+class _Signalled(BaseException):
+    def __init__(self, signum: int):
+        super().__init__(signum)
+        self.signum = signum
 
 
 def parse(v) -> tuple[str, float] | None:
@@ -73,12 +80,9 @@ def run(v, cwd: str, env: dict, say) -> int:
             say(f"pre-stage not started ({e}); starting the full checks without it")
             return 0
         try:
-            rc = proc.wait(timeout=timeout)
+            rc = _wait(proc, timeout)
         except subprocess.TimeoutExpired:
             rc = None
-        except BaseException:   # interrupted: never leave its process group running
-            _stop(proc)
-            raise
         if rc is None:
             _stop(proc)
             say(f"pre-stage timed out after {timeout:.0f} s; starting the full checks anyway")
@@ -98,6 +102,42 @@ def run(v, cwd: str, env: dict, say) -> int:
         "in this run. If the pre-stage itself is broken, not the change, `--no-prestage` starts the full checks "
         "without it")
     return 1
+
+
+def _wait(proc: subprocess.Popen, timeout: float) -> int:
+    """proc.wait(timeout), but a SIGTERM or SIGHUP to this process, or any interruption, first ends
+    the pre-stage's group: it runs in a session of its own, so the signal that ends `ttp checks`
+    never reaches it. The signal then takes its course as if no handler had been set."""
+    old: dict = {}
+    def caught(signum, frame):
+        raise _Signalled(signum)
+    try:
+        for sig in STOP_ON:
+            if signal.getsignal(sig) is not signal.SIG_IGN:
+                old[sig] = signal.signal(sig, caught)
+    except ValueError:   # not the main thread: no handlers, the except below still covers it
+        pass
+    try:
+        return proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise
+    except BaseException as e:   # interrupted: never leave its process group running
+        _stop(proc)
+        if not isinstance(e, _Signalled):
+            raise
+        prior = old.get(e.signum, signal.SIG_DFL)
+        for sig, h in old.items():
+            signal.signal(sig, h if h is not None else signal.SIG_DFL)
+        old = {}
+        if callable(prior):
+            prior(e.signum, None)
+        else:
+            signal.signal(e.signum, signal.SIG_DFL)
+            os.kill(os.getpid(), e.signum)
+        raise SystemExit(128 + e.signum)
+    finally:
+        for sig, h in old.items():
+            signal.signal(sig, h if h is not None else signal.SIG_DFL)
 
 
 def _stop(proc: subprocess.Popen) -> None:
