@@ -3921,3 +3921,43 @@ def test_an_auto_undo_waits_unrun_and_unpaged_while_its_machine_is_out_or_paused
     _undo_round(probes, at + 2300)
     _undo_round(probes, at + 2301)
     assert ran.read_text() == "ran\n" and _change_entry(ml, cid)["closed_why"] == "auto-undo ok"
+
+
+def test_an_auto_undo_retry_whose_probe_says_not_yet_again_is_paged_once_expired(env, tmp_path):
+    """A retry holds back the page only while the entry stays due: once its until-probe says "not yet" again
+    the episode ends, and past --expires route pages it. An exit 0 after a close by hand keeps who closed it."""
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    p = make(env)
+    mm.add("box-a", tags="device")
+    t0 = time.time()
+    probe = f"test -e {tmp_path / 'done'} || exit 1"
+    cid = _auto_change(ml, p, "echo busy; exit 75", t0, until_probe=probe, expires="2h")
+    probes = ml.Probes(p, log=lambda m: None)
+    probes._mark({(cid, probe): (0, "")}, set(), t0 + 60)
+    assert ml.auto_undo_due(_change_entry(ml, cid), t0 + 60)
+    claim = probes._claim_undo(cid, t0 + 60)
+    probes._settle_undo(cid, claim, 75, "busy", t0 + 61)
+    assert _change_entry(ml, cid)["auto_undo_next"] == t0 + 61 + ml.PROBE_GRACE_S
+    assert not _overdue_pages(ml, t0 + 62), "a retry waits while due"
+    probes._mark({}, {(cid, probe)}, t0 + 120)
+    c = _change_entry(ml, cid)
+    assert "auto_undo_next" not in c and "auto_undo_tries" not in c, "a later pass starts afresh"
+    late = t0 + 3 * 3600
+    assert ml.overdue(c, late) and not ml.auto_undo_waits(c, late)
+    assert f"machine-change:{cid}" in {x["key"] for x in _overdue_pages(ml, late)}
+    # a stored retry with no probe pass (as before this fix's _mark) is paged too
+    other = _auto_change(ml, p, "echo busy; exit 75", t0, until_probe=probe, expires="2h")
+    with ml._locked():
+        doc = ml._read(ml.LEDGER, {})
+        next(x for x in doc["changes"] if x["id"] == other).update(auto_undo_next=late + 600, auto_undo_tries=1)
+        ml._write(ml.LEDGER, doc)
+    assert f"machine-change:{other}" in {x["key"] for x in _overdue_pages(ml, late)}
+    # closed by hand while its undo ran: the run is recorded, the close is theirs
+    hand = _auto_change(ml, p, "echo ok", t0)
+    claim = probes._claim_undo(hand, t0 + 3601)
+    ml.close_change(hand, "undone by hand", "alpha", now=t0 + 3602)
+    probes._settle_undo(hand, claim, 0, "ok", t0 + 3603)
+    c = _change_entry(ml, hand)
+    assert c["closed"] == t0 + 3602 and c["closed_by"] == "alpha" and c["closed_why"] == "undone by hand"
+    assert c["auto_undo_runs"][-1]["outcome"] == "ok" and c["auto_undone"]["try"] == 1

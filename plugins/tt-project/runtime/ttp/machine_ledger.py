@@ -71,7 +71,8 @@ AUTO_UNDO_TIMEOUT_S. Exit 0 closes the entry ("auto-undo ok", closed_by `auto-un
 in use, host unreachable) retries after PROBE_GRACE_S, up to AUTO_UNDO_TRIES runs; any other exit, a timeout,
 or a claim no running daemon holds (a restart interrupted the run: it is never run again) gives up
 (`auto_undo_failed`, quoting the claim), and route then pages as for any overdue entry, with the output's tail.
-Until then route pages nobody while that project can act. Every run, with its last AUTO_UNDO_TAIL_CHARS of
+Until then route pages nobody while that project can act and the entry stays due: an until-probe that says "not
+yet" again ends the episode (a later pass starts afresh) and route pages it as any overdue entry. Every run, with its last AUTO_UNDO_TAIL_CHARS of
 output, is kept in `auto_undo_runs` (`ttp machines change list --all`, `--json`). While the machine is under a
 known outage, held machine-wide, or a resource on it is paused (the project's own pause or a shared one), the
 undo waits, unrun and unpaged, and runs once that ends.
@@ -774,11 +775,12 @@ def auto_undo_due(c: dict, now: float) -> str:
 
 
 def auto_undo_waits(c: dict, now: float) -> bool:
-    """Whether route leaves overdue entry `c` to its project's auto-undo (no page): it is due or waits for a
-    retry or runs, and has not given up."""
+    """Whether route leaves overdue entry `c` to its project's auto-undo (no page): it runs, or it is still due
+    (a retry waits only while it is), and has not given up. One no longer due (its until-probe says "not yet"
+    again) is paged as any overdue entry."""
     if not c.get("auto_undo") or c.get("auto_undo_failed") or c.get("closed") or noop_undo(c.get("undo")):
         return False
-    return bool(c.get("auto_undo_claim") or c.get("auto_undo_next") or _due(c, now))
+    return bool(c.get("auto_undo_claim") or _due(c, now))
 
 
 def auto_undo_paused(c: dict, p, now: float) -> str:
@@ -1609,8 +1611,8 @@ class Probes:
                 elif key in unpassed and c.get("probe_passed"):
                     self.log(f"machine change #{c['id']}: its until-probe passed before but says not yet now: "
                              f"no longer overdue")
-                    for k in ("probe_passed", "probe_job_failed", "probe_out"):
-                        c.pop(k, None)
+                    for k in ("probe_passed", "probe_job_failed", "probe_out", "auto_undo_next", "auto_undo_tries"):
+                        c.pop(k, None)   # a later pass starts a fresh auto-undo episode too
                     if c.pop("page", None) is not None:
                         c["page_from"] = now   # a later pass starts a new page episode
             _write(LEDGER, doc)
@@ -1721,8 +1723,9 @@ class Probes:
             c["auto_undo_runs"] = (list(c.get("auto_undo_runs") or []) + [run])[-AUTO_UNDO_RUNS_KEPT:]
             if rc == 0:
                 (c.get("page") or {}).pop("pending", None)
-                c.update(closed=now, closed_why="auto-undo ok", closed_by=AUTO_UNDO,
-                         auto_undone={"at": now, "try": n})
+                if not c.get("closed"):   # one closed by hand during the run keeps who closed it
+                    c.update(closed=now, closed_why="auto-undo ok", closed_by=AUTO_UNDO)
+                c["auto_undone"] = {"at": now, "try": n}
             elif retry:
                 c["auto_undo_next"] = now + PROBE_GRACE_S
             else:
