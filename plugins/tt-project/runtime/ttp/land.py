@@ -217,8 +217,8 @@ def record(p: Project, tid: int | None, head: str, new: str, branch: str, dry: b
         return []
     lines = [f"a landing of task #{tid} as {new[:10]} on {push.LOCAL}/{branch} (task_landings; `landed:#{tid}` passes)"]
     if not dry:
-        p.db.x("INSERT INTO task_landings(marker, task, sha, target) VALUES(?,?,?,?) ON CONFLICT(marker) DO NOTHING",
-               (f"land-t{tid}-{new}", tid, new, f"{push.LOCAL}/{branch}"))
+        p.db.x("INSERT INTO task_landings(marker, task, sha, target, ts) VALUES(?,?,?,?,?) "
+               "ON CONFLICT(marker) DO NOTHING", (f"land-t{tid}-{new}", tid, new, f"{push.LOCAL}/{branch}", time.time()))
     if task.get("kind") == "review" and new != head and (rec := reviewreuse.recorded(task)) and rec[0] == head:
         labels = push._labels(task)
         lines.append(f"review #{tid}'s verdict on {head[:10]} also for {new[:10]} (reviewreuse)")

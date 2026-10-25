@@ -122,7 +122,7 @@ CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT, ts REAL);
 
 -- Successful detached pushes, retained after their markers and task worktrees are pruned.
 CREATE TABLE IF NOT EXISTS task_landings (
-  marker TEXT PRIMARY KEY, task INTEGER NOT NULL, sha TEXT NOT NULL, target TEXT NOT NULL);
+  marker TEXT PRIMARY KEY, task INTEGER NOT NULL, sha TEXT NOT NULL, target TEXT NOT NULL, ts REAL);
 CREATE INDEX IF NOT EXISTS task_landings_task ON task_landings(task);
 
 -- A task's work that landed on the push branch as another commit (a re-land after a push conflict):
@@ -336,6 +336,7 @@ class DB:
         self._migrate_jev_changed()
         self._migrate_issue_lifecycle()
         self._migrate_push_landed()
+        self._migrate_landing_ts()
         self._migrate_issue_opened()
         self._migrate_issue_episode()
         self._migrate_issue_history()
@@ -534,6 +535,15 @@ END""")
         with self.tx():
             if "landed_sha" not in {r["name"] for r in self.q("PRAGMA table_info(push_queue)")}:
                 self.x("ALTER TABLE push_queue ADD COLUMN landed_sha TEXT")
+
+    def _migrate_landing_ts(self) -> None:
+        # When each landing was pushed (tried.landing_times). Older rows keep NULL: the ledger shows
+        # their task's finish time.
+        if "ts" in {r["name"] for r in self.q("PRAGMA table_info(task_landings)")}:
+            return
+        with self.tx():
+            if "ts" not in {r["name"] for r in self.q("PRAGMA table_info(task_landings)")}:
+                self.x("ALTER TABLE task_landings ADD COLUMN ts REAL")
 
     def _migrate_push_queue(self) -> None:
         if self.meta(PUSH_QUEUE_MIGRATION) is not None:

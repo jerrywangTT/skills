@@ -46,9 +46,10 @@ _STOP = set("a an the of to for and or in on at by with from into vs via is be a
 # Words that say how work is queued, not what it is.
 _GENERIC = set("code work task try retry again rerun redo new next continue follow up followup re requeue "
                "queue another more".split())
-# Summary wording, checked in this order when the hand-off names no outcome.
+# Summary wording, checked in this order when the hand-off names no outcome and the task has not
+# landed. A bare 'reverted' is not a shelving: 'tests fail with the change reverted' describes a test.
 _SAID = (("shelved", re.compile(r"\b(shelv\w*|parked|abandon\w*|not worth\w*|no (?:gain|win|improvement)|"
-                                r"reverted|backed out)\b", re.I)),
+                                r"backed (?:it |the \w+ )?out|reverted (?:it|the (?:change|commit|lever|fix)))\b", re.I)),
          ("rejected", re.compile(r"\b(rejected|ruled out)\b", re.I)),
          ("kept", re.compile(r"\b(kept|keeping)\b", re.I)))
 _DATES = re.compile(r"\d{4}-\d{2}-\d{2}(?:[T ]\d{1,2}:\d{2}(?::\d{2})?Z?)?|\b\d{1,2}:\d{2}(?::\d{2})?\b|#\d+")
@@ -169,19 +170,25 @@ def similar(title1: str, spec1: str, title2: str, spec2: str, usual: frozenset =
 
 def _outcome(task: dict, result: dict, landed: bool) -> str:
     """The task's outcome. 'landed' only with a recorded landing (`landed`): a hand-off that says or
-    claims it ('#12's fix landed', outcome: landed) has not shown its own commits on the branch."""
+    claims it ('#12's fix landed', outcome: landed) has not shown its own commits on the branch. A
+    landed task is 'landed' unless its hand-off's own outcome says otherwise: its summary's wording
+    ('tests fail with the change reverted') says nothing about the work on the branch."""
     said = str(result.get("outcome") or "").strip().lower()
     if said in OUTCOMES and (said != "landed" or landed):
         return said
     if task["status"] in ("failed", "cancelled"):
         return task["status"]
+    if landed:
+        return "landed"
     text = str(result.get("summary") or "")
     for name, rx in _SAID:
-        if name == "kept" and landed:
-            break
         if rx.search(text):
             return name
-    return "landed" if landed else "done"
+    return "done"
+
+
+def _earliest(a: float | None, b: float | None) -> float | None:
+    return b if a is None else a if b is None else min(a, b)
 
 
 def landed_tasks(db) -> set[int]:
@@ -190,14 +197,24 @@ def landed_tasks(db) -> set[int]:
     branch, or a recorded supersession; of the task that landed and of each task it carries on (the
     subject of a review, the task a fix or continuation follows, a rebased or carried branch's owner:
     landed.carriers read backwards)."""
-    queue = db.q("SELECT task, branch FROM push_queue WHERE status IN ('pushed','landed') "
+    return set(landing_times(db))
+
+
+def landing_times(db) -> dict[int, float | None]:
+    """landed_tasks with when each first landed: the push queue row's push, or the detached push's
+    record; None where no record has a time (a supersession, a landing recorded before times were)."""
+    queue = db.q("SELECT task, branch, updated FROM push_queue WHERE status IN ('pushed','landed') "
                  "AND COALESCE(landed_sha, pushed_sha) IS NOT NULL")
     owner = {r["branch"]: r["id"] for r in db.q("SELECT id, branch FROM tasks WHERE branch IS NOT NULL "
                                                 "AND branch != '' ORDER BY id")}
-    done = {r["task"] for r in queue} | {owner[r["branch"]] for r in queue if r["branch"] in owner}
-    done |= {r["task"] for r in db.q("SELECT task FROM task_landings UNION SELECT task FROM task_superseded")}
-    if not done:
-        return set()
+    when: dict[int, float | None] = {}
+    for tid, ts in [(r["task"], r["updated"]) for r in queue] + \
+            [(owner[r["branch"]], r["updated"]) for r in queue if r["branch"] in owner] + \
+            [(r["task"], r["ts"]) for r in db.q("SELECT task, ts FROM task_landings")] + \
+            [(r["task"], None) for r in db.q("SELECT task FROM task_superseded")]:
+        when[tid] = _earliest(when.get(tid), float(ts) if ts is not None else None)
+    if not when:
+        return {}
     follows: dict[int, set[int]] = {}
     for r in db.q("SELECT id, kind, branch, labels, title FROM tasks WHERE kind='review' OR labels LIKE '%continues:%' "
                   "OR labels LIKE '%review_fix:%' OR labels LIKE '%rebases:%' OR labels LIKE '%pr_branch:%' "
@@ -216,13 +233,13 @@ def landed_tasks(db) -> set[int]:
                 and (n := lb.partition(":")[2]) in owner}
         if ids := {i for i in ids if i < r["id"]}:   # a successor always has a later id
             follows[r["id"]] = ids
-    todo = list(done)
-    while todo:
-        for i in follows.get(todo.pop(), ()):
-            if i not in done:
-                done.add(i)
-                todo.append(i)
-    return done
+    # A successor's id is always later: going down the ids settles each task's time before it is
+    # passed on to the tasks it carries.
+    for tid in sorted(follows, reverse=True):
+        if tid in when:
+            for i in follows[tid]:
+                when[i] = _earliest(when.get(i), when[tid]) if i in when else when[tid]
+    return when
 
 
 def _line(text) -> str:
@@ -233,19 +250,21 @@ def _line(text) -> str:
 
 
 def entries(db, where=None, now: float | None = None, days: float = LEDGER_DAYS) -> list[dict]:
-    """The ledger, newest first: {id, title, spec, key, outcome, ts, date, result}."""
+    """The ledger, newest first: {id, title, spec, key, outcome, ts, date, result}. `ts` is when the
+    task finished, or for a landed task when it landed, where that is recorded."""
     now = time.time() if now is None else now
     rows = db.q("SELECT id, title, spec, kind, status, attempts, spent_usd, result, "
                 "COALESCE(updated, created, 0) ts FROM tasks WHERE status IN ('done','failed','cancelled') "
                 "AND kind != 'review' AND COALESCE(updated, created, 0) >= ? ORDER BY ts DESC, id DESC LIMIT ?",
                 (now - days * 86400, LEDGER_ROWS))
-    landed = landed_tasks(db) if rows else set()
+    landed = landing_times(db) if rows else {}
     out = []
     for t in rows:
         if t["status"] == "cancelled" and not t["attempts"] and not t["spent_usd"]:
             continue   # never ran: nothing was tried
         res = load_result(t["result"])
-        base = {"id": t["id"], "ts": float(t["ts"]), "date": timefmt.long(float(t["ts"]), where)}
+        ts = float(t["ts"])
+        base = {"id": t["id"], "ts": ts, "date": timefmt.long(ts, where)}
         items = [i for i in (res.get("tried") or []) if isinstance(i, dict) and str(i.get("title") or "").strip()] \
             if isinstance(res.get("tried"), list) else []
         for i in items:
@@ -254,8 +273,11 @@ def entries(db, where=None, now: float | None = None, days: float = LEDGER_DAYS)
             out.append({**base, "title": title, "spec": f"{i.get('spec') or ''} {i.get('result') or ''}",
                         "key": subject_key(title), "outcome": said if said in OUTCOMES else "done",
                         "result": _line(i.get("result"))})
+        outcome = _outcome(t, res, t["id"] in landed)
+        if outcome == "landed" and landed.get(t["id"]) is not None:
+            base = {**base, "ts": landed[t["id"]], "date": timefmt.long(landed[t["id"]], where)}
         out.append({**base, "title": t["title"] or "", "spec": t["spec"] or "", "key": subject_key(t["title"] or ""),
-                    "outcome": _outcome(t, res, t["id"] in landed),
+                    "outcome": outcome,
                     "result": _line(res.get("result") or res.get("summary") or t.get("spec"))})
     return out
 

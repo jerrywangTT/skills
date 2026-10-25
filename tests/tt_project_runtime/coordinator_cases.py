@@ -3788,6 +3788,73 @@ def test_task_add_rejects_a_reworded_repeat_of_work_shelved_or_landed_the_same_d
 
 
 
+def test_tried_ledger_labels_a_landed_task_landed_whatever_its_summary_says_and_shows_its_landing_time(env, monkeypatch):
+    # Replays a review fix that landed through its re-review's push queue row being shown as
+    # 'shelved' because its summary said 'tests fail with the runtime change reverted', and a landed
+    # task's line showing its finish time instead of when it was pushed.
+    p = make(env)
+    from ttp import timefmt, tried
+    db = p.db
+    now = time.time()
+    said = "Added the guard. 3 tests fail with the runtime change reverted and pass with it."
+
+    def done(title, summary, ago, **res):
+        tid = db.add_task(title, "s", kind="code", origin="user")
+        db.update_task(tid, status="done", attempts=1, result=json.dumps({"status": "done", "summary": summary, **res}))
+        db.x("UPDATE tasks SET updated=? WHERE id=?", (now - ago, tid))
+        return tid
+
+    def pushed(tid, at):
+        db.x("INSERT INTO push_queue(task,branch,head,target,status,created,updated,pushed_sha) "
+             "VALUES(?,?,?,?,?,?,?,?)", (tid, f"b{tid}", "h", "t", "pushed", at - 60, at, "a" * 40))
+
+    code = done("code: a short foreground pre-stage", "Added the pre-stage.", 7200)
+    fix = done("Fix review: the pre-stage", said, 5400)
+    db.x("UPDATE tasks SET labels=? WHERE id=?", (json.dumps([f"review_fix:{code}"]), fix))
+    rereview = db.add_task(f"Re-review #{fix}", "s", kind="review", origin="user")
+    db.update_task(rereview, status="done")
+    db.x("UPDATE tasks SET labels=? WHERE id=?", (json.dumps([f"auto_review:{fix}"]), rereview))
+    pushed(rereview, now - 1800)                          # landed half an hour ago, through the re-review
+    direct = done("code: a direct landing", said, 4000)
+    pushed(direct, now - 600)
+    untimed = done("code: an old landing", "Landed the cap.", 3000)
+    db.x("INSERT INTO task_landings(marker, task, sha, target) VALUES('m1', ?, 'abc1234', 'work')", (untimed,))
+    timed = done("code: a detached landing", "Landed the gate.", 2900)
+    db.x("INSERT INTO task_landings(marker, task, sha, target, ts) VALUES('m2', ?, 'abc1235', 'work', ?)",
+         (timed, now - 300))
+    own = done("code: a landed lever", "Landed, then measured.", 2800, outcome="shelved")
+    pushed(own, now - 200)
+    plain = done("code: never landed", said, 2000)
+    backed = done("code: backed out", "Backed out the lever: 1.01x.", 1900)
+    reverted = done("code: reverted", "Reverted the change after a regression.", 1800)
+
+    got = {e["id"]: e for e in tried.entries(db, p)}
+    # Landed: the summary's 'reverted' is not read; only the hand-off's own outcome overrides.
+    assert {i: got[i]["outcome"] for i in (code, fix, direct, untimed, timed, own)} == \
+        {code: "landed", fix: "landed", direct: "landed", untimed: "landed", timed: "landed", own: "shelved"}
+    # Not landed: a bare 'reverted' is no shelving; stronger wording still is.
+    assert {i: got[i]["outcome"] for i in (plain, backed, reverted)} == \
+        {plain: "done", backed: "shelved", reverted: "shelved"}
+    # The landing time where one is recorded (push queue row, timed task_landings row); else the finish time.
+    assert got[code]["ts"] == got[fix]["ts"] == now - 1800 and got[direct]["ts"] == now - 600
+    assert got[timed]["ts"] == now - 300 and got[untimed]["ts"] == now - 3000 and got[plain]["ts"] == now - 2000
+    assert got[direct]["date"] == timefmt.long(now - 600, p)
+    assert tried.landed_tasks(db) == {code, fix, rereview, direct, untimed, timed, own}
+    monkeypatch.setattr(tried, "DIGEST_ROWS", 40)
+    lines = tried.digest_lines(db, p, now)
+    line = next(x for x in lines if x.startswith(f"- #{fix} "))
+    assert line.startswith(f"- #{fix} landed {timefmt.short(now - 1800, p, now)}:"), line
+    assert next(x for x in lines if x.startswith(f"- #{direct} ")).startswith(
+        f"- #{direct} landed {timefmt.short(now - 600, p, now)}:")
+    # A landing recorded by a detached push keeps its push's end time.
+    from pathlib import Path
+    from ttp import landed
+    late = done("code: a pushed task", "Pushed.", 100)
+    landed.record_push(p, Path("push-x.json"), {"status": "pushed", "task": late, "sha": "b" * 40,
+                                                 "target": "origin/work", "ended": now - 50})
+    assert tried.landing_times(db)[late] == now - 50
+
+
 def test_tried_work_ledger_does_not_match_unrelated_work_sharing_numbered_steps_and_boilerplate(env):
     # Replays the false rejections of real history: unrelated tasks whose specs share only list
     # numbers, counts, a release number, the project's usual job limits and the Restrictions block.

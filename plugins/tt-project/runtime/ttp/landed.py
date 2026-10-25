@@ -194,8 +194,10 @@ def record_push(p, marker: Path, m: dict) -> None:
         return
     if not p.db.task(int(task)):
         return
-    p.db.x("INSERT INTO task_landings(marker, task, sha, target) VALUES(?,?,?,?) "
-           "ON CONFLICT(marker) DO NOTHING", (marker.name, int(task), sha, target))
+    ended = m.get("ended")
+    ts = float(ended) if isinstance(ended, (int, float)) and not isinstance(ended, bool) else time.time()
+    p.db.x("INSERT INTO task_landings(marker, task, sha, target, ts) VALUES(?,?,?,?,?) "
+           "ON CONFLICT(marker) DO NOTHING", (marker.name, int(task), sha, target, ts))
 
 
 def reconcile_pushes(p, tid: int) -> None:
