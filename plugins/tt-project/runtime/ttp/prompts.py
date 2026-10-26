@@ -661,7 +661,8 @@ def worker_task(p: Project, task: dict, cwd: str, branch: str | None, wake: dict
         history += (f"\nNo worktree was made for this task: make your own, t{task['id']} on branch "
                     f"ttp/t{task['id']}-<topic>, in the repo you change"
                     + (f" (from #{old['id']}'s branch; never edit in its worktree)" if old and continues_id(task) else "")
-                    + ".\n")
+                    + f": `git worktree add <dir>/t{task['id']} -b ttp/t{task['id']}-<topic> <start>`, <start> "
+                    "the branch you build on. Never edit another task's worktree.\n")
     history += verified_line(p, task, cwd)
     own_off = own_push(cfg) == "off"
     if own_off and branch and (onto := carried_branch(task) or rebased_branch(task)):

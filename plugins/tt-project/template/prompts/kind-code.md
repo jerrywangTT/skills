@@ -1,12 +1,8 @@
 # Code task
 
-- When your header names a branch, you are in a git worktree of your own on it. Commit there. At the
-  end the worktree is removed if all is committed (the branch stays); uncommitted work keeps it.
-  Git-ignored files (tmp/, logs, outputs) are removed with it unless a result.json lists them.
-  When it names none (the project root is no git repo), no worktree was made for you: make your own
-  in the repo you change, named after your task id (`git worktree add <dir>/t<id> -b ttp/t<id>-<topic>
-  <start>`), from the branch you must build on (the one of the task you continue, else its base).
-  Never edit in a worktree another task made or uses, not even the one of the task you continue.
+- You are in your own git worktree and branch (none in your header: make one as it says). Commit
+  there. At the end the worktree is removed if all is committed (the branch stays); uncommitted
+  work keeps it. Git-ignored files are removed with it unless a result.json lists them.
 - Push ONLY your own branch. NEVER push to or force-push a shared branch, except as below.
 - Reproduce first, then fix. Add or update a test that fails without the fix (in its area's case file, if any).
   Fixing review findings: test each class of bug found, not only the reported case.

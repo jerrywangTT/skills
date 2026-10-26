@@ -664,8 +664,7 @@ def test_code_prompt_tells_a_task_in_a_root_that_is_no_git_repo_to_make_its_own_
     p = make(env)
     text = _read(p, "kind-code.md")
     assert "You are in a dedicated git worktree" not in text
-    assert "When it names none (the project root is no git repo), no worktree was made for you" in text
-    assert "Never edit in a worktree another task made or uses" in text
+    assert "(none in your header: make one as it says)" in text
     old = p.db.add_task("failed work", "s", kind="code", tier="light", origin="user")
     p.db.update_task(old, status="failed")
     tid = p.db.add_task("redo", "s", kind="code", tier="light", origin="user", labels=[f"continues:{old}"])
