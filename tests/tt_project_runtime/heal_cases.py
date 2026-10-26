@@ -3524,6 +3524,105 @@ def test_machine_change_add_with_expires_only_runs_no_probe(env, monkeypatch, ca
     assert out.startswith("recorded ") and not err and ml.changes()[0]["probe"] is None
 
 
+def test_machine_change_edit_refuses_a_new_until_probe_that_passes_already_unless_allowed(env, capsys):
+    """edit runs a new until-probe once, from the project root, as add does: exit 0 is refused on one line
+    and the entry is left unchanged; --allow-met-probe stores it with a warning; "not yet" stores it quietly."""
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    from ttp.cli import main
+    p = make(env)
+    mm.add("box-a", tags="device")
+    (p.root / "staged").write_text("x")   # relative: the probe runs in the project root
+    main(["machines", "change", "add", "box-a", "staged a file", "--undo", "rm staged", "--expires", "2h",
+          "--by", p.name])
+    capsys.readouterr()
+    before = ml.changes()
+    edit = ["machines", "change", "edit", "1", "--by", p.name]
+    for extra in ([], ["--expires", "3h"]):
+        with pytest.raises(SystemExit) as e:
+            main(edit + ["--until-probe", "test -e staged", *extra])
+        assert e.value.code != 0
+        err = capsys.readouterr().err
+        assert "already passes" in err and "overdue at once" in err and "--allow-met-probe" in err, err
+        assert len(err.strip().splitlines()) == 1, err
+        assert ml.changes() == before, "the entry is unchanged"
+    main(edit + ["--until-probe", "test -e staged", "--allow-met-probe"])
+    out, err = capsys.readouterr()
+    assert out.startswith("edited ") and "warning" in err and "already passes" in err, (out, err)
+    assert ml.changes()[0]["probe"] == "test -e staged"
+    # The same probe again is judged afresh, so it is checked again too.
+    with pytest.raises(SystemExit):
+        main(edit + ["--until-probe", "test -e staged"])
+    assert "already passes" in capsys.readouterr().err
+    main(edit + ["--until-probe", "test ! -e staged"])
+    out, err = capsys.readouterr()
+    assert out.startswith("edited ") and not err and ml.changes()[0]["probe"] == "test ! -e staged", (out, err)
+    with pytest.raises(SystemExit):
+        main(edit + ["--what", "x", "--allow-met-probe"])
+    assert "goes with --until-probe" in capsys.readouterr().err and ml.changes()[0]["what"] == "staged a file"
+
+
+@pytest.mark.parametrize("probe,says", [("sleep 30", "did not finish"), ("exit 3", "exits 3"),
+                                        ("exit 255", "exits 255")])
+def test_machine_change_edit_stores_a_timed_out_or_broken_until_probe_with_a_warning(env, monkeypatch, capsys,
+                                                                                    probe, says):
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    from ttp.cli import main
+    p = make(env)
+    mm.add("box-a", tags="device")
+    main(["machines", "change", "add", "box-a", "paused", "--undo", "resume", "--expires", "2h", "--by", p.name])
+    capsys.readouterr()
+    monkeypatch.setattr(ml, "ADD_PROBE_TIMEOUT_S", 0.5)
+    t0 = time.monotonic()
+    main(["machines", "change", "edit", "1", "--until-probe", probe, "--by", p.name])
+    assert time.monotonic() - t0 < 10
+    out, err = capsys.readouterr()
+    assert out.startswith("edited ") and "warning" in err and says in err, (out, err)
+    assert ml.changes()[0]["probe"] == probe
+
+
+def test_machine_change_edit_stores_an_until_probe_that_cannot_run_with_a_warning(env, monkeypatch, capsys):
+    from ttp import ends
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    from ttp.cli import main
+    p = make(env)
+    mm.add("box-a", tags="device")
+    main(["machines", "change", "add", "box-a", "paused", "--undo", "resume", "--expires", "2h", "--by", p.name])
+    capsys.readouterr()
+    monkeypatch.setattr(ends, "probe_once", lambda *a, **k: ("cannot run: no shell", ""))
+    main(["machines", "change", "edit", "1", "--until-probe", "check-it", "--by", p.name])
+    out, err = capsys.readouterr()
+    assert out.startswith("edited ") and "warning" in err and "cannot run" in err, (out, err)
+    assert ml.changes()[0]["probe"] == "check-it"
+
+
+def test_machine_change_edit_without_an_until_probe_runs_no_probe(env, monkeypatch, capsys):
+    """Edits of the text, undo, --expires or --until-task run no probe, nor do edits of a closed or unknown id."""
+    from ttp import ends
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    from ttp.cli import main
+    p = make(env)
+    mm.add("box-a", tags="device")
+    main(["machines", "change", "add", "box-a", "paused", "--undo", "resume", "--until-probe", "test -e /no/such",
+          "--by", p.name])
+    capsys.readouterr()
+    monkeypatch.setattr(ends, "probe_once", lambda *a, **k: pytest.fail("no probe to run"))
+    for extra in (["--what", "paused the queue"], ["--undo", "resume-queue"], ["--expires", "3h"]):
+        main(["machines", "change", "edit", "1", *extra, "--by", p.name])
+        out, err = capsys.readouterr()
+        assert out.startswith("edited ") and not err, (out, err)
+    c = ml.changes()[0]
+    assert (c["what"], c["undo"], c["probe"]) == ("paused the queue", "resume-queue", None)
+    ml.close_change(1, "done", p.name)
+    for cid, says in (("1", "is closed"), ("9", "no machine change #9")):
+        with pytest.raises(SystemExit):
+            main(["machines", "change", "edit", cid, "--until-probe", "test -e /x", "--by", p.name])
+        assert says in capsys.readouterr().err
+
+
 def test_machine_change_with_a_stored_trivial_until_probe_is_never_ended_by_it_and_is_reported(env):
     """An entry stored before add refused such probes (or written by an older version) never turns
     overdue because its probe passed, even with a pass recorded: Probes does not run it and queues one

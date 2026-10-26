@@ -5679,6 +5679,8 @@ def _machine_change(a) -> None:
     if a.change == "edit":
         flag_only = a.test is not None and not any((a.what, a.undo, a.expires, a.until_probe, a.until_task)) \
             and a.auto_undo is None
+        if a.allow_met_probe and not a.until_probe:
+            die("--allow-met-probe goes with --until-probe")
         try:
             if a.test is not None:
                 c = ml.set_test(a.id, by, a.test, queue=queue)
@@ -5690,11 +5692,16 @@ def _machine_change(a) -> None:
                           f"`ttp ttr` labels the incidents inside its window afresh")
             if flag_only:
                 return
-            if a.until_task:
+            owner = None
+            if a.until_task or a.until_probe:
                 c = next((c for c in ml.changes() if c.get("id") == a.id), None)
-                _until_task_ok(p, c.get("by") if c else by, a.until_task)
+                owner = c.get("by") if c else by
+            if a.until_task:
+                _until_task_ok(p, owner, a.until_task)
             c = ml.edit_change(a.id, by or "user", a.what, a.undo, a.expires, a.until_probe, until_task=a.until_task,
-                               where=p, auto_undo=a.auto_undo)
+                               where=p, auto_undo=a.auto_undo, allow_met_probe=a.allow_met_probe,
+                               project=(p if p and p.name == owner else local_project(owner) or p)
+                               if a.until_probe else None)
         except ValueError as e:
             die(str(e))
         except OSError as e:
@@ -8306,7 +8313,8 @@ def main(argv: list[str] | None = None) -> None:
     end = c.add_mutually_exclusive_group()
     end.add_argument("--until-probe", dest="until_probe",
                      help="a new end: a command that exits 0 once the change should be undone; the same "
-                          "one again is judged afresh")
+                          "one again is judged afresh; it must still fail now: edit runs it once and refuses one "
+                          "that passes already")
     end.add_argument("--until-task", dest="until_task", type=int, metavar="ID",
                      help="a new end: once this open task ends; a continuation task gives its own id "
                           "to re-extend the entry (again 7 days at the latest)")
@@ -8322,6 +8330,9 @@ def main(argv: list[str] | None = None) -> None:
                       help="let this project's daemon run its undo once its end passes (as `change add --auto-undo`)")
     auto.add_argument("--no-auto-undo", dest="auto_undo", action="store_false",
                       help="page for its undo again instead")
+    c.add_argument("--allow-met-probe", dest="allow_met_probe", action="store_true",
+                   help="store the new --until-probe even though it passes already (the entry is overdue at once); "
+                        "prints a warning")
     c.add_argument("--by", help="who edits it (default: the project you are in)")
     s.set_defaults(fn=cmd_machines)
 

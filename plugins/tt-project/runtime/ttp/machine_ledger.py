@@ -40,7 +40,7 @@ recorded with `ttp machines change add <alias> "<what>" --undo "<cmd>" (--expire
 digest lists the open entries for machines in its Resources, one line each. An entry is overdue when it
 expires, its until-probe passes (exit 0: what it waited for is over, so the undo is due; add and edit refuse
 a probe that always exits 0, ends.always_succeeds, and Probes reports an older one instead of running it; add
-also runs its probe once, check_probe_unmet, and refuses one that passes already, unless --allow-met-probe) or its until-task
+and edit also run a new probe once, check_probe_unmet, and refuse one that passes already, unless --allow-met-probe) or its until-task
 (a task of the project that made it, such as the follow-up that uses a staged build tree) is done, failed,
 cancelled or gone; a probe-only or task-only entry also expires after PROBE_END_S, and a continuation task
 re-extends it with `ttp machines change edit <id> --until-task <its own id>`. The daily review lists the
@@ -149,7 +149,7 @@ CONDITION_GONE_S = 3 * 3600  # a condition nobody reported this long is over
 PROBE_END_S = 7 * 86400      # an entry with only an until-probe or until-task is overdue after this anyway
 PROBE_GRACE_S = 300          # an until-probe first runs this long after its entry (or its new probe) was made
 PROBE_PASSES = 2             # passes in a row before an until-probe counts as passed
-ADD_PROBE_TIMEOUT_S = 10     # how long `change add` waits for its until-probe's first run (check_probe_unmet)
+ADD_PROBE_TIMEOUT_S = 10     # how long `change add` and `edit` wait for its until-probe's first run (check_probe_unmet)
 CLOSED_KEPT_S = 30 * 86400   # closed entries kept this long
 SINCE_MAX_S = 7 * 86400      # `change add --since` backdates a start at most this far
 TEXT_CHARS = 300
@@ -261,7 +261,7 @@ def add_change(alias: str, what: str, undo: str, by: str, expires: Any = None, u
 
 
 def check_probe_unmet(p, probe: str, allow_met: bool = False, warn: Callable[[str], None] | None = None) -> None:
-    """`change add`: run until-probe `probe` once in project `p`'s context, as Probes does (ends.probe_once),
+    """`change add` and `edit`: run until-probe `probe` once in project `p`'s context, as Probes does (ends.probe_once),
     for at most ADD_PROBE_TIMEOUT_S. Exit 0 means the change is over already, so the entry would be overdue at
     once: raises ValueError, unless `allow_met` (then a warning). A timeout, a probe that cannot run or one
     that exits with a code other than "not yet" (ends.NOT_YET_RCS) is recorded anyway, with a warning naming
@@ -610,7 +610,8 @@ def _set_test(cid: int, by: str, test: bool, now: float) -> dict:
 
 def edit_change(cid: int, by: str, what: str | None = None, undo: str | None = None, expires: Any = None,
                 until_probe: str | None = None, now: float | None = None, until_task: int | None = None,
-                where=None, auto_undo: bool | None = None) -> dict:
+                where=None, auto_undo: bool | None = None, project=None, allow_met_probe: bool = False,
+                warn: Callable[[str], None] | None = None) -> dict:
     """Correct open entry #cid in place: its text, undo command or end (--expires, --until-probe or
     --until-task, as add_change takes them, an --until-probe with an --expires too; the same until-task again
     restarts its PROBE_END_S, so a continuation task re-extends the entry, and the same until-probe again keeps
@@ -619,7 +620,9 @@ def edit_change(cid: int, by: str, what: str | None = None, undo: str | None = N
     pages are dropped. Refuses a closed or unknown id, a power-cycle intent's undo or end, and an edit
     that changes nothing. `where`: the zone a zone-less --expires is read in (ends.parse_expires). `auto_undo`:
     turn the auto-undo on (True, checked by check_auto_undo against the entry's undo and probe as edited) or
-    off (False); refused while one runs. A new undo, end or auto-undo setting starts its tries afresh."""
+    off (False); refused while one runs. A new undo, end or auto-undo setting starts its tries afresh. `project`
+    (a Project): run a given until-probe once first, outside the ledger lock, as add_change does
+    (check_probe_unmet; `allow_met_probe`, `warn`); refused, the entry is left unchanged."""
     now = time.time() if now is None else now
     if sum(map(bool, (expires, until_probe, until_task))) > 1 and not (expires and until_probe and not until_task):
         raise ValueError("give one end: --expires, --until-probe (with or without --expires) or --until-task")
@@ -647,6 +650,10 @@ def edit_change(cid: int, by: str, what: str | None = None, undo: str | None = N
         new["auto_undo"] = bool(auto_undo)
     if not new:
         raise ValueError("say what to change: --what, --undo, --expires, --until-probe, --until-task or --auto-undo")
+    if "probe" in new and project is not None:   # not for an id the locked read below refuses anyway
+        cur = next((c for c in _read(LEDGER, {}).get("changes", []) if isinstance(c, dict) and c.get("id") == cid), None)
+        if cur and not cur.get("closed") and cur.get("kind") != POWER_CYCLE:
+            check_probe_unmet(project, new["probe"], allow_met_probe, warn)
     with _locked():
         doc = _read(LEDGER, {"next": 1, "changes": []})
         c = next((c for c in doc.get("changes", []) if isinstance(c, dict) and c.get("id") == cid), None)
