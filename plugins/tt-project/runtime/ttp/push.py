@@ -11,6 +11,8 @@ Pushes of one project to one branch take turns: each holds the lock `push:<remot
 its first fetch to its push, so two reviewers never race each other through rounds. The lock is an
 OS file lock (locks.py): a killed push or a reboot frees it. A waiting push waits as long as the
 last measured check run takes, with a margin, up to 2 h (`delivery.push_wait_s` overrides it).
+Each check runs at most four times the last measured check run, at least 4 h
+(`delivery.push_checks_timeout_s` overrides it, 0 for no limit): one past it is ended and fails the push.
 
 With `delivery.version_bump` set, the push also owns the version bump: after each rebase it sets the
 listed files one patch version above the tip's and adds a changeset, in one commit of its own. The
@@ -49,6 +51,8 @@ DEFAULT_ROUNDS = 3
 DEFAULT_WAIT_S = 900       # the lock wait with no measured check run, and its floor otherwise
 WAIT_MARGIN_S = 60          # on top of two check runs: the holder may start over once
 MAX_DEFAULT_WAIT_S = 7200  # the measured wait's ceiling; only an explicit push_wait_s waits longer
+CHECK_LIMIT_FLOOR_S = 4 * 3600   # a push check's time limit with no measured check run, and its floor otherwise
+CHECK_LIMIT_FACTOR = 4           # times the last measured check run
 TIMINGS = "push_checks.json"   # under the project's state: how long the last full check run took
 BUMP_TRAILER = "Ttp-Version-Bump"   # marks the bump commit ttp push made, so a rerun replaces it
 VERSION_RE = re.compile(r"""(version(?:__)?["']?\s*[:=]\s*["'])(\d+)\.(\d+)\.(\d+)(["'])""", re.I)
@@ -2799,6 +2803,23 @@ def wait_of(v: Any) -> float:
         raise ValueError(f"delivery.push_wait_s must be a number of seconds, not {v!r}") from None
 
 
+def check_limit_of(v: Any, last_s: float | None) -> float | None:
+    """`delivery.push_checks_timeout_s` as the seconds one push check may run, None for no limit (0).
+    Unset: CHECK_LIMIT_FACTOR times the last measured check run, at least CHECK_LIMIT_FLOOR_S.
+    ValueError when it is not a number."""
+    if v is None or v == "":
+        return max(float(CHECK_LIMIT_FLOOR_S), CHECK_LIMIT_FACTOR * (last_s or 0.0))
+    if isinstance(v, bool) or not isinstance(v, (int, float, str)):
+        raise ValueError(f"delivery.push_checks_timeout_s must be a number of seconds, not {v!r}")
+    try:
+        f = float(v)
+    except ValueError:
+        raise ValueError(f"delivery.push_checks_timeout_s must be a number of seconds, not {v!r}") from None
+    if not math.isfinite(f) or f < 0:
+        raise ValueError(f"delivery.push_checks_timeout_s must be 0 or more seconds, not {v!r}")
+    return f or None
+
+
 def last_check_s(p: Project) -> float | None:
     """Seconds the project's last full, passing check run took, or None when none was measured."""
     try:
@@ -3475,14 +3496,45 @@ def _rounds(repo: Path, remote: str, branch: str, checks: list[str], rounds: int
     return KEPT_MOVING
 
 
+def _kill_tree(pid: int) -> None:
+    """SIGKILL process `pid` and every descendant /proc shows (Linux; elsewhere only `pid`)."""
+    kids: dict[int, list[int]] = {}
+    for d in Path("/proc").glob("[0-9]*"):
+        try:
+            kids.setdefault(int((d / "stat").read_text().rsplit(")", 1)[1].split()[1]),
+                            []).append(int(d.name))
+        except (OSError, IndexError, ValueError):
+            continue
+    todo, tree = [pid], []
+    while todo:
+        tree.append(todo.pop())
+        todo += kids.get(tree[-1], [])
+    for q in tree:
+        try:
+            os.kill(q, signal.SIGKILL)
+        except OSError:
+            pass
+
+
 def _run_one(cmd: Any, repo: Path, env: dict, say: Callable[[str], None]) -> int:
     """Run one push check: 0 when it passes, CHECKS_FAILED when it fails, BUSY when its check host
     could not run it (an environment fault, recorded as runner_wait records a missing runner)."""
     if remote_host(cmd):
         say(f"running {cmd}{where(cmd)}")
-    rc = scriptwatch.rerun(
-        lambda: subprocess.run(check_argv(cmd, repo, env), cwd=repo, env=env, pass_fds=checkdirs.inherited()).returncode,
-        bool, None if remote_host(cmd) else str(cmd), repo, env, say, on_pass=True)
+    def once() -> int:
+        with subprocess.Popen(check_argv(cmd, repo, env), cwd=repo, env=env, pass_fds=checkdirs.inherited()) as proc:
+            try:
+                return proc.wait(timeout=check_limit_s)
+            except subprocess.TimeoutExpired:
+                _kill_tree(proc.pid)
+                proc.wait()
+                say(f"check timed out after {check_limit_s:.0f} s and was ended: {cmd}{where(cmd)} "
+                    "(delivery.push_checks_timeout_s; unset: 4x the last measured check run, at least 4 h)")
+                return 124
+            except BaseException:   # stopped (run_detached's SIGTERM): the check ends with it, as run() did
+                proc.kill()
+                raise
+    rc = scriptwatch.rerun(once, bool, None if remote_host(cmd) else str(cmd), repo, env, say, on_pass=True)
     if rc == 0:
         return 0
     if fault := remote_fault(cmd, rc, repo):
@@ -3571,14 +3623,16 @@ def _run(p: Project, repo: Path, own: bool = False, recorded: dict | None = None
         rounds = rounds_of(d.get("push_rounds"))
         explicit = d.get("push_wait_s")
         wait_s = default_wait(last_check_s(p)) if explicit in (None, "") else wait_of(explicit)
+        limit_s = check_limit_of(d.get("push_checks_timeout_s"), last_check_s(p))
         version_bump = bump_of(d.get("version_bump"))
         if not own and (why := scalar_problem(d.get("push_exclude_paths"))):   # never push unguarded
             raise ValueError(f"delivery.push_exclude_paths: {why}")
     except ValueError as e:
         print(f"ttp push: {e}", file=sys.stderr)
         return REFUSED
-    global last_ff, last_reach, last_after, pending_after
+    global last_ff, last_reach, last_after, pending_after, check_limit_s
     last_ff, last_reach, last_after, pending_after = [], None, None, None
+    check_limit_s = limit_s
     if own:   # delivery.push_exclude_paths guards the push branch only
         say_target(repo, remote, branch)
         # The docs-only test, if_changed scopes and the project's own checks may all compare with the
@@ -3640,6 +3694,7 @@ def run_after(p: Project, repo: Path) -> dict | None:
     return out
 
 
+check_limit_s: float | None = None   # the time limit of each check of the current run() (check_limit_of)
 last_ff: list[str] = []   # the fast_forward outcome of the last run(): `ff`/`not ff` and `mirror`/`not mirrored` lines
 last_after: dict | None = None   # the after_push outcome of the last run() (batch.after_ordinary_push)
 pending_after: tuple[str, str, str] | None = None   # (sha, target, tip) whose after_push run() left to run

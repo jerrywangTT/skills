@@ -681,6 +681,8 @@ project with `ttp config <name> jev.enabled false`. Without a key, screening is 
   reboot frees. One that waits longer than `delivery.push_wait_s` exits 75 and prints a
   `retry_when` for its hand-off: `ttp push --free`, which exits 0 once the turn is free. Unset,
   the wait is twice the last measured check run plus 60 s, at least 900 s and at most 2 h.
+  Each check runs at most `delivery.push_checks_timeout_s` (unset: four times the last measured
+  check run, at least 4 h; 0 for no limit): one past it is ended and the push fails, saying so.
 - A check is a command, which runs on every head. One that only makes sense once a file exists
   (a test file a later change adds) can opt in to being skipped where it does not apply:
   `{"run": "pytest tests/test_new.py", "if_exists": "tests/test_new.py"}`. `if_exists` is a

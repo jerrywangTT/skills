@@ -12042,3 +12042,42 @@ def test_a_cancelled_tasks_detached_push_is_stopped_and_its_queued_push_never_st
         except OSError:
             pass
         reap_tmp_processes(env["tmp"])
+
+
+def _safe_read(path):
+    try:
+        return path.read_bytes()
+    except OSError:
+        return b""
+
+
+def test_a_push_check_past_its_time_limit_is_ended_and_fails_the_push_loudly(env, monkeypatch, capsys):
+    """A push check that never ends (a hung test, or one waiting on a slot that never frees) must not hold
+    the push, its host check slot and the task waiting on it forever."""
+    from ttp import push
+    started = env["tmp"] / "started"
+    p, repo, origin, other = _push_setup(env, monkeypatch, [f"touch {started}; sleep 61.7; true"])
+    before = _git_out(origin, "rev-parse", "proj")
+    _commit(repo, "mine.txt", "mine\n")
+    p.set_config("delivery.push_checks_timeout_s", 1)
+    t0 = time.time()
+    assert _ttp("push") == push.CHECKS_FAILED
+    err = capsys.readouterr().err
+    assert time.time() - t0 < 30 and started.exists()
+
+    def sleeping():
+        return [d for d in pathlib.Path("/proc").glob("[0-9]*")
+                if (d / "cmdline").exists() and _safe_read(d / "cmdline") == b"sleep\x0061.7\x00"]
+    assert _wait_for(lambda: not sleeping(), 5), "the timed-out check's children outlived it"
+    assert "check timed out after 1 s and was ended" in err and "push_checks_timeout_s" in err, err
+    assert _git_out(origin, "rev-parse", "proj") == before
+    # Unset: four times the last measured check run, never under 4 h; 0 is no limit; nonsense is refused.
+    assert push.check_limit_of(None, None) == push.check_limit_of("", 60.0) == 4 * 3600
+    assert push.check_limit_of(None, 7200.0) == 4 * 7200
+    assert push.check_limit_of(0, 7200.0) is None and push.check_limit_of("0", None) is None
+    assert push.check_limit_of("90", None) == 90.0
+    for bad in ("soon", -1, True, [1], "nan"):
+        with pytest.raises(ValueError):
+            push.check_limit_of(bad, None)
+    p.set_config("delivery.push_checks_timeout_s", "soon")
+    assert _ttp("push") == push.REFUSED and "push_checks_timeout_s" in capsys.readouterr().err
