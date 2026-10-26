@@ -10,10 +10,11 @@ ttp progress report result  --key nightly-filler "batch 12 of 40 done"
 
 - Kinds: `result` (a counted result: it ends a streak), `refusal`, `stall` and `failure` (they count toward one).
 - `--key` names what the report is about, the same on every loop. Inside a `ttp detach` job it defaults to `<task>/<job name>`.
+- A refusal on a busy lock adds `--resource <name>`: its holders now (task and run, or an external label, with pid and live or stale) are recorded from the lock state `ttp lock --probe --json` reads, or `unknown` when it cannot be read. `--holder "<who>"` records what the driver knows instead. The stall observation and `ttp status` name the holder, so nobody needs a run to find it.
 - The project comes from `TTP_PROJECT` or the folder it runs in, as for other `ttp` commands.
 - It exits 0 with the daemon down, and also when the line cannot be written (it says so on stderr), so a driver under `set -e` keeps going. It exits 2 only with no project or no key.
 
-Each report is one JSON line appended under a lock to `state/progress.jsonl`: `{"ts", "key", "kind", "reason", "source"}`, plus the driver's `pid` (the caller's parent), `boot`, and inside a `ttp detach` job its `job` (.rc path), `task` and `run`. Each line is synced as it is written, and the file rotates to `progress.1.jsonl` past 256 KiB.
+Each report is one JSON line appended under a lock to `state/progress.jsonl`: `{"ts", "key", "kind", "reason", "source"}`, plus the driver's `pid` (the caller's parent), `boot`, inside a `ttp detach` job its `job` (.rc path), `task` and `run`, and a refusal's `resource` and `holder` when given or found. Each line is synced as it is written, and the file rotates to `progress.1.jsonl` past 256 KiB.
 
 Readers (runtime `progress.py`):
 

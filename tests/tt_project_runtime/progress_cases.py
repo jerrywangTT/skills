@@ -143,6 +143,99 @@ def test_the_daemon_raises_one_keyed_observation_per_stalled_streak(env):
     assert len(ev) == 2 and "5 failures in a row" in ev[1]["text"], ev
 
 
+def _observations(p):
+    return [e["text"] for e in p.db.q("SELECT text FROM events WHERE source='daemon:progress' ORDER BY id")]
+
+
+def test_a_refusal_s_explicit_holder_is_recorded_and_named_by_describe_and_the_stall_observation(env, monkeypatch):
+    p = make(env)
+    from ttp import progress
+    from ttp.daemon import Daemon
+    monkeypatch.setenv("TTP_PROJECT", str(p.base))
+    for _ in range(5):
+        assert _report("refusal", "--key", "filler", "--resource", "bench", "--holder", "external ci-runner (live)",
+                       "device wanted (75)") == 0
+    last = _lines(p)[-1]
+    assert (last["resource"], last["holder"]) == ("bench", "external ci-runner (live)"), last
+    line = progress.describe(progress.streaks(progress.entries(p.state))["filler"])
+    assert line == "5 refusals in a row, no result: device wanted (75) (bench held by external ci-runner (live))"
+    # The flags may also come before the kind.
+    assert _report("--holder", "task #4 (run 9)", "--resource", "bench", "refusal", "--key", "filler", "busy") == 0
+    assert _lines(p)[-1]["holder"] == "task #4 (run 9)"
+    d = Daemon(p.base)
+    d.watch_progress(every_s=0)
+    ev = _observations(p)
+    assert len(ev) == 1 and "busy (bench held by task #4 (run 9))" in ev[0], ev
+
+
+def test_a_refusal_naming_a_held_resource_records_its_holder_live_or_stale_by_default(env, monkeypatch):
+    p = make(env)
+    from ttp import locks
+    from ttp.daemon import Daemon
+    monkeypatch.setenv("TTP_PROJECT", str(p.base))
+    d = Daemon(p.base)
+    held = _held_slot(d, "bench")
+    try:
+        assert _report("refusal", "--key", "filler", "--resource", "bench", "device wanted (75)") == 0
+    finally:
+        held.close()
+    assert _lines(p)[-1]["holder"] == f"task #99 (run 7), pid {os.getpid()} (live)", _lines(p)[-1]
+    gone = _exited_holder_pid()
+    held = _held_slot(d, "bench", pid=gone)
+    try:
+        assert _report("refusal", "--key", "filler", "--resource", "bench", "device wanted (75)") == 0
+    finally:
+        held.close()
+    assert _lines(p)[-1]["holder"] == f"task #99 (run 7), pid {gone} (stale)", _lines(p)[-1]
+    # A hold taken outside any task is an external label.
+    held = locks.try_take(d._slot_paths("bench"), "nightly-ci", "exclusive")
+    try:
+        assert _report("refusal", "--key", "filler", "--resource", "bench", "busy") == 0
+    finally:
+        held.close()
+    assert _lines(p)[-1]["holder"] == f"external nightly-ci, pid {os.getpid()} (live)", _lines(p)[-1]
+    # Free now: said so; a result or a refusal with no resource records no holder.
+    assert _report("refusal", "--key", "filler", "--resource", "bench", "busy") == 0
+    assert _lines(p)[-1]["holder"] == "nobody (free)"
+    assert _report("refusal", "--key", "filler", "busy") == 0
+    assert _report("result", "--key", "filler", "--resource", "bench", "done") == 0
+    assert all("holder" not in x for x in _lines(p)[-2:]), _lines(p)[-2:]
+
+
+def test_a_refusal_whose_lock_state_cannot_be_read_is_still_recorded_with_holder_unknown(env, monkeypatch):
+    p = make(env)
+    from ttp import lockprobe
+    monkeypatch.setenv("TTP_PROJECT", str(p.base))
+
+    def broken(*a, **k):
+        raise OSError(13, "Permission denied")
+    monkeypatch.setattr(lockprobe, "answer", broken)
+    assert _report("refusal", "--key", "filler", "--resource", "bench", "device wanted (75)") == 0
+    last = _lines(p)[-1]
+    assert (last["kind"], last["resource"], last["holder"]) == ("refusal", "bench", "unknown"), last
+    monkeypatch.setattr(lockprobe, "answer", lambda *a, **k: (75, "not a dict"))
+    assert _report("refusal", "--key", "filler", "--resource", "bench", "busy") == 0
+    assert _lines(p)[-1]["holder"] == "unknown"
+
+
+def test_old_reports_without_a_holder_load_and_describe_beside_new_ones(env):
+    p = make(env)
+    from ttp import progress
+    from ttp.daemon import Daemon
+    _driver_reports(p, 99999, ["refusal"] * 5, key="recheck")   # written before holders existed
+    k = progress.streaks(progress.entries(p.state))["recheck"]
+    assert progress.describe(k) == "5 refusals in a row, no result: lock busy (exit 75) #4"
+    # The streak's last report decides: a new one with a holder names it, an old one after it does not.
+    progress.append(p.state, {**k["last"], "ts": time.time() - 5, "holder": "task #3 (run 8), pid 42 (stale)",
+                              "resource": "bench", "reason": "busy"})
+    k = progress.streaks(progress.entries(p.state))["recheck"]
+    assert progress.describe(k).endswith("busy (bench held by task #3 (run 8), pid 42 (stale))")
+    d = Daemon(p.base)
+    d.watch_progress(every_s=0)
+    assert "(bench held by task #3 (run 8), pid 42 (stale))" in _observations(p)[0]
+    _driver_reports(p, 99999, ["refusal"], key="recheck", t0=time.time() - 1)
+    assert "held by" not in progress.describe(progress.streaks(progress.entries(p.state))["recheck"])
+
 # ---- the progress and stall check (progress.check, Daemon.check_progress) ----
 
 def _prog_events(p, kind=None):

@@ -4229,14 +4229,18 @@ def cmd_ack_wait(a) -> None:
 
 
 def cmd_progress(a) -> None:
-    """`ttp progress report <kind> --key <key> "<reason>"`: one JSON line in the project's
-    state/progress.jsonl (progress.py). No daemon needed; exit 0 once given a project and a key, even
-    when the line cannot be written, so a driver under `set -e` keeps going."""
+    """`ttp progress report <kind> --key <key> [--resource <name>] [--holder <text>] "<reason>"`: one JSON
+    line in the project's state/progress.jsonl (progress.py). A refusal naming --resource with no --holder
+    records the lock's holders now (progress.holder_text, "unknown" when unreadable). No daemon needed;
+    exit 0 once given a project and a key, even when the line cannot be written, so a driver under
+    `set -e` keeps going."""
     from . import progress
     ap = argparse.ArgumentParser(prog="ttp progress report")
     ap.add_argument("kind", choices=progress.KINDS)
     ap.add_argument("reason", nargs="?", default="")
     ap.add_argument("--key", default=a.key)
+    ap.add_argument("--resource", default=getattr(a, "resource", None) or "")
+    ap.add_argument("--holder", default=getattr(a, "holder", None) or "")
     a = ap.parse_intermixed_args(a.words or [])
     p = here()
     if not p:
@@ -4246,7 +4250,10 @@ def cmd_progress(a) -> None:
         key = f"{os.environ.get('TTP_TASK') or 'job'}/{Path(job).stem}"
     if not (key or "").strip():
         die("ttp progress report: --key is required outside a `ttp detach` job", 2)
-    rec = progress.record(a.kind, key, a.reason)
+    holder = a.holder
+    if not holder.strip() and a.kind == "refusal" and a.resource.strip():
+        holder = progress.holder_text(p, a.resource.strip())
+    rec = progress.record(a.kind, key, a.reason, resource=a.resource, holder=holder)
     try:
         progress.append(p.state, rec)
     except OSError as e:
@@ -7724,6 +7731,10 @@ def main(argv: list[str] | None = None) -> None:
                                      "cannot be written (a warning on stderr), so a driver never stops on it")
     m.add_argument("--key", help="what the report is about, the same each loop (default inside a `ttp detach` "
                                  "job: its task and name)")
+    m.add_argument("--resource", help="a refusal's busy resource (lock name); with no --holder, its holders now "
+                                      "are recorded from the lock state (`ttp lock --probe --json`), else unknown")
+    m.add_argument("--holder", help="who holds the resource (a task, run, pid or external label), as the driver "
+                                    "knows it; shown in the stall observation")
     m.add_argument("words", nargs=argparse.REMAINDER, metavar="KIND [REASON]",
                    help="KIND: result (a counted result; ends a stall), refusal, stall or failure (count toward "
                         "one); REASON: why, one line (an exit code, the refusal's text); --key may come anywhere")

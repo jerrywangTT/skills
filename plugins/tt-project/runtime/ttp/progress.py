@@ -5,7 +5,8 @@
 A filler, recheck loop or guard that a worker or schedule started reports each counted result,
 refusal, stall and failure here, one line from bash. Each report is one JSON line in the project's
 state/progress.jsonl: {"ts", "key", "kind", "reason", "source"} plus the reporting driver's pid
-(the caller's parent), boot id and, inside a `ttp detach` job, the job's .rc path, task and run.
+(the caller's parent), boot id and, inside a `ttp detach` job, the job's .rc path, task and run. A refusal
+may name its busy `resource` and `holder` (--holder, else holder_text from the lock state); describe names it.
 
 The file is append-only under a lock (progress.lock) and synced per line, so concurrent reports
 never interleave. It needs no daemon: a report made while the daemon is down is read once it is
@@ -105,8 +106,10 @@ def _one_line(text: str, cap: int) -> str:
     return re.sub(r"\s+", " ", str(text or "")).strip()[:cap]
 
 
-def record(kind: str, key: str, reason: str, env: dict | None = None, now: float | None = None) -> dict:
-    """The line a report writes, from the caller's environment."""
+def record(kind: str, key: str, reason: str, env: dict | None = None, now: float | None = None,
+           resource: str = "", holder: str = "") -> dict:
+    """The line a report writes, from the caller's environment; a refusal's resource and its holder
+    (holder_text) only when given."""
     from .runner import boot_id
     env = os.environ if env is None else env
     job = env.get(JOB_ENV) or None
@@ -116,7 +119,30 @@ def record(kind: str, key: str, reason: str, env: dict | None = None, now: float
            f"job {Path(job).stem}" if job else "", f"pid {pid}"]
     return {"ts": round(time.time() if now is None else now, 3), "key": _one_line(key, 200), "kind": kind,
             "reason": _one_line(reason, REASON_MAX), "source": " ".join(w for w in who if w),
-            "pid": pid, "boot": boot_id(), "job": job, "task": task, "run": run}
+            "pid": pid, "boot": boot_id(), "job": job, "task": task, "run": run,
+            **({"resource": _one_line(resource, 200)} if (resource or "").strip() else {}),
+            **({"holder": _one_line(holder, REASON_MAX)} if (holder or "").strip() else {})}
+
+
+def holder_text(p, resource: str) -> str:
+    """Who holds `resource` now, as `ttp lock --probe --json` reads it (lockprobe.answer): each holder's
+    label (a task's "task #N (run R)", else "external <label>"), pid and live or stale; "nobody (free)"
+    or "nobody (paused: <why>)"; "unknown" when the lock state cannot be read. Never raises."""
+    from . import hold, lockprobe
+    try:
+        _, said = lockprobe.answer(p, p.config(), resource, as_json=True)
+        if said.get("paused"):
+            return f"nobody (paused: {said.get('reason') or '?'})"
+        out = []
+        for h in said.get("holders") or []:
+            lbl = str(h.get("holder") or "?")
+            state = ("stale" if h.get("stale") or h.get("alive") is False else
+                     "live" if h.get("alive") else "liveness unknown")
+            pid = f", pid {h['pid']}" if h.get("pid") else ""
+            out.append(f"{lbl if hold.parse(lbl) else f'external {lbl}'}{pid} ({state})")
+        return "; ".join(out) or ("nobody (free)" if said.get("free") else "unknown")
+    except Exception:
+        return "unknown"
 
 
 def append(state: Path, rec: dict, max_bytes: int = MAX_BYTES) -> None:
@@ -207,7 +233,8 @@ def _alive(r: dict) -> bool:
 def describe(s: dict) -> str:
     """'4 refusals, 1 failure, no result since <first report>: <last reason>' without the time."""
     kinds = ", ".join(f"{n} {k}{'s' if n != 1 else ''}" for k, n in sorted(s["kinds"].items(), key=lambda kv: (-kv[1], kv[0])))
-    return f"{kinds} in a row, no result: {s['last'].get('reason') or '(no reason given)'}"
+    held = f" ({s['last'].get('resource') or 'resource'} held by {h})" if (h := s["last"].get("holder")) else ""
+    return f"{kinds} in a row, no result: {s['last'].get('reason') or '(no reason given)'}{held}"
 
 
 def stalled(state: Path, cfg: dict | None, now: float | None = None) -> list[dict]:
