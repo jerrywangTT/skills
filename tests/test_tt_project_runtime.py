@@ -26560,6 +26560,7 @@ DURABLE_EXEMPT = {
     ("globalcap.py", 'global-spend.lock", "a")'): "a flock guard file, never written",
     ("localspend.py", 'session-spend.lock", "a")'): "a flock guard file, never written",
     ("hook.py", "OFFSET_FILE).write_text"): "a lost offset re-delivers messages, never drops one",
+    ("hook.py", "mark.write_text(why"): "a once-per-run marker for the no-sandbox notice: a lost one only repeats the notice",
     ("devq.py", 'open(tmp, "w")'): "inside devq._write, durable_write's standard-library twin for the device host",
     ("devq.py", "os.replace(tmp, path)"): "inside devq._write, durable_write's standard-library twin for the device host",
     ("devq.py", 'open(path, "a")'): "inside devq._append, which syncs each line",
