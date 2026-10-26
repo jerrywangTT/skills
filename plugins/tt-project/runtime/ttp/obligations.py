@@ -609,7 +609,7 @@ _DELIVER = (r"(?:report|deliver|share|confirm|follow up|come back|get back|circl
             r"post (?:it|them|an update|updates|the results?|back|here)|have (?:it|them|the|a|an|your|that|this)\b"
             r"[^.;!?]{0,80}?\bready)\b")
 # "I'll post each result here", "we'll open a PR": a send verb, a few words, then the object it delivers
-_SEND = (r"(?:post|send|open|share)\s+(?:[\w'’/-]+\s+){0,6}?"
+_SEND = (r"(?:post|send|open|share)\s+(?:[\w'’/#()-]+\s+){0,6}?"
          r"(?:here|results?|table|PR|pull request|numbers|link)\b")
 # "... and it goes up as the draft PR": a delivery the sender owns, told in the third person (not "if it goes up")
 _GOES_UP = (r"(?<!\bif\s)(?<!\bwhen\s)(?<!\bwhether\s)(?<!\bunless\s)"

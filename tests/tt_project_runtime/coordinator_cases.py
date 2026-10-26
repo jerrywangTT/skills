@@ -16089,3 +16089,14 @@ def test_the_audit_json_has_a_repeated_instructions_row_matching_the_text_clause
         {"msg": b, "ts": now - 60, "why": f"repeats #{first}", "fix": "", "shown": False}])
     assert audit.report(p.db, now)["repeated_instructions"] == {
         "count": 2, "top_sentence": "run the full suite before pushing", "top_count": 2, "first_id": first}
+
+
+def test_promise_filler_accepts_hash_and_parenthesised_numbers():
+    """'#812' and '(812)' are filler tokens like '812'; a sentence end still stops the match."""
+    from ttp import obligations as ob
+    for text in ("I'll post the #812 table here.", "I'll post the #812 results here.",
+                 "I'll post the (812) table here.", "I'll post the (812) results here."):
+        assert ob.commitments(text) == [text], text
+    for text in ("I posted the #812 table here.", "If you want, I'll post the (812) table here.",
+                 "I'll post it later. The #812 table is here."):
+        assert ob.commitments(text) == [], text
