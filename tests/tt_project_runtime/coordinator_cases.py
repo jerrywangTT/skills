@@ -3713,7 +3713,8 @@ def test_task_add_rejects_a_near_duplicate_naming_the_task(env):
     assert "fix flaky upload test in CI" in problem and "force: true" in problem
     assert p.db.q("SELECT COUNT(*) n FROM tasks")[0]["n"] == 1
     # The exact-title rejection keeps its own message.
-    assert coord.apply(p, [{**near, "title": "fix flaky upload test in CI"}]) == [f"task_add: duplicate of open task #{old}"]
+    assert coord.apply(p, [{**near, "title": "fix flaky upload test in CI"}]) == [
+        f"task_add: duplicate of open task #{old} {coord.INFO_MARK}"]
     # Different numbers are different work, however alike the rest reads.
     p.db.add_task("benchmark candidate 3", "Run the benchmark suite on the candidate build and report.", origin="user")
     assert coord.apply(p, [{"type": "task_add", "title": "benchmark candidate 4",
@@ -5356,7 +5357,9 @@ def test_a_rejection_goes_back_to_the_coordinator_not_into_the_users_reply(env, 
     [x] = p.db.kv(coord.REJECTED_KEY)
     assert "is running" in x and "continues" in x, x
     text = coord.digest(p, {}, [], [])
-    assert "action was rejected; fix or drop it" in text and "Your reply already went out" in text, text
+    # Refusing a running task's branch change is information only: it rides along, no fix asked.
+    assert "action was refused, information only: nothing to fix" in text, text
+    assert "Your reply already went out" in text and coord.INFO_MARK not in text, text
     assert "rejected again" not in text
     d._finish_coordinator({"dir": "x"}, bad, "ok", {})
     text = coord.digest(p, {}, [], [])
@@ -16236,3 +16239,111 @@ def test_promise_filler_accepts_hash_and_parenthesised_numbers():
     for text in ("I posted the #812 table here.", "If you want, I'll post the (812) table here.",
                  "I'll check it. The #812 table is here."):
         assert ob.commitments(text) == [], text
+
+
+def test_mute_slots_show_near_the_cap_and_only_mutes_in_force_hold_one(env):
+    """A turn that cannot see how many mute slots are left sends a mute the cap refuses: near the cap
+    the digest counts them and names the mute that ends first. A mute past its end no longer holds a
+    slot, so the cap refuses only what the digest shows as full."""
+    from ttp import coordinator as coord, screen as scr
+    p = make(env)
+    db, now = p.db, time.time()
+    for i in range(scr.MUTE_MAX - scr.MUTE_SLOTS_NEAR - 1):
+        scr.mute(db, f"watcher:w{i}", f"condition number {i}", 2 + i, why="known noise", now=now)
+    assert "mute slots" not in coord.digest(p, {}, [], []), "far from the cap: no count"
+    scr.mute(db, "watcher:w99", "condition number 99", 1, why="known noise", now=now)
+    shown = coord.digest(p, {}, [], [])
+    line = next(x for x in shown.splitlines() if x.startswith("## Muted observations"))
+    assert f"; {scr.MUTE_MAX - scr.MUTE_SLOTS_NEAR} of {scr.MUTE_MAX} mute slots used, first to end: watcher:w99 " \
+           f"'condition number 99' in 1.0 h)" in line, line
+    seen = coord.digest_parts(p, {}, [], [], {}, {})[1]
+    again = dict(coord.digest_parts(p, {}, [], [], seen, {})[0])["muted"]
+    assert "(as last turn; never wake you; 15 of 20 mute slots used" in again, again
+    for i in range(scr.MUTE_MAX - scr.MUTE_SLOTS_NEAR, scr.MUTE_MAX):
+        scr.mute(db, f"watcher:x{i}", f"condition number {i}", 3, why="known noise", now=now)
+    with pytest.raises(ValueError, match=f"observation_mute rejected: {scr.MUTE_MAX} mutes are already active; "
+                                         f"let one end first$"):
+        scr.mute(db, "watcher:new", "another condition", 2, now=now)   # the cap itself still holds
+    later = now + 3601   # watcher:w99 ended, not yet swept from the list
+    assert len(db.kv(scr.MUTES_KEY)) == scr.MUTE_MAX and len(scr.mutes(db, later)) == scr.MUTE_MAX - 1
+    assert scr.mute(db, "watcher:new", "another condition", 2, now=later)["source"] == "watcher:new"
+
+
+def test_obligation_actions_on_a_delivered_obligation_are_noted_not_rejected(env, monkeypatch):
+    """Attaching the task that delivered it, adding a milestone, dropping it or recording its receipt
+    again, once an obligation has its receipt, changes nothing owed: a note, not a rejection."""
+    from ttp import coordinator as coord
+    from ttp import obligations as ob
+    p, d, now, tid, check = _ob_setup(env, monkeypatch)
+    oid = ob.add(p, "the urgent report", [tid], now=now)
+    ob.record(p, oid, "receipt", "docs/report.md", None, now=now)
+    p.db.update_task(tid, status="done")
+    before = ob.get(p.db, oid)
+    for a in ({"owners": [tid]}, {"milestones": [{"key": "m1", "due": "2030-01-01T00:00:00+00:00",
+                                                  "evidence_required": "a file"}]},
+              {"why": "delivered"}, {"evidence": "docs/report.md again"}):
+        assert coord.apply(p, [{"type": "obligation", "key": oid, **a}]) == [], a
+        assert "receipt" in " ".join(p.db.kv(coord.NOTES_KEY) or []), a
+    assert ob.get(p.db, oid) == before, "nothing changed"
+    assert coord.effort_triggers(p.db, p.config(), [], None)[0] == []
+    # Still refused: an obligation that is owed cannot take a finished task as its producer.
+    owed = ob.add(p, "another report", now=now)
+    out = coord.apply(p, [{"type": "obligation", "key": owed, "owners": [tid]}])
+    assert len(out) == 1 and "attach the task that will produce it" in out[0]
+    assert not coord.informational_rejection(out[0])
+
+
+def test_information_only_refusals_ride_along_and_real_rules_still_raise_a_turn(env):
+    """A refusal that only reports open or landed work, or a field a running task keeps, reaches the
+    next digest without raising a turn by itself; one that needs a decision still raises it."""
+    from ttp import coordinator as coord
+    p = make(env)
+    db, cfg = p.db, p.config()
+    trig = lambda: coord.effort_triggers(db, cfg, [], None)[0]
+    run = db.add_task("running work", "spec", kind="code", origin="user")
+    db.update_task(run, status="running")
+    open_ = db.add_task("open work", "spec", origin="user")
+    landed = db.add_task("compact the cache to 4 MB", "Compact the cache to 4 MB.", kind="code", origin="user")
+    db.update_task(landed, status="done", attempts=1,
+                   result=json.dumps({"status": "done", "summary": "Kept: the cache is 4 MB."}))
+    db.x("INSERT INTO task_landings(marker, task, sha, target) VALUES('m1', ?, 'abc1234', 'work')", (landed,))
+    shelved = db.add_task("fuse the norm (bound 1.8x)", "Fuse the norm; bound 1.8x.", kind="code", origin="user")
+    db.update_task(shelved, status="done", attempts=1,
+                   result=json.dumps({"status": "done", "summary": "Shelved: 1.05x of the 1.8x bound."}))
+    info = [{"type": "task_update", "id": run, "resources": ["m1"]},
+            {"type": "task_update", "id": run, "pr_branch": "feature/x"},
+            {"type": "task_update", "id": run, "model": "other"},
+            {"type": "task_update", "id": run, "status": "queued"},
+            {"type": "task_update", "id": run, "start_after": "+1h"},
+            {"type": "task_add", "title": "open work", "spec": "spec"},
+            {"type": "task_add", "title": "Compact the cache to 4 MB", "kind": "code", "spec": "Compact it to 4 MB."}]
+    for a in info:
+        out = coord.apply(p, [a])
+        assert len(out) == 1 and coord.informational_rejection(out[0]), (a, out)
+        db.set_kv(coord.REJECTED_KEY, out)
+        assert trig() == [], (a, out)
+        shown = coord.digest(p, {}, [], [])
+        assert "refused, information only: nothing to fix" in shown and coord.INFO_MARK not in shown
+    assert f"ledger entry #{landed}: task done, closed, landed" in out[0], out[0]
+    assert db.task(run)["status"] == "running" and json.loads(db.task(run)["labels"] or "[]") == []
+    assert db.one("SELECT COUNT(*) n FROM tasks")["n"] == 4, "refused exactly as before: nothing added"
+    # Refusals for a rule or a decision still raise the next turn, worded as before.
+    decide = [{"type": "task_add", "title": "Fuse the norm, bound 1.8x", "kind": "code", "spec": "Fuse it; 1.8x."},
+              {"type": "pr_approve", "id": 999999, "text": "https://github.com/acme/widgets/pull/7", "quote": "yes"},
+              {"type": "task_update", "id": 999999, "priority": 1}]
+    for a in decide:
+        out = coord.apply(p, [a])
+        assert len(out) == 1 and not coord.informational_rejection(out[0]), (a, out)
+        db.set_kv(coord.REJECTED_KEY, out)
+        assert trig() == ["rejected action"], (a, out)
+        assert "your previous turn's action was rejected; fix or drop it" in coord.digest(p, {}, [], [])
+    assert "was shelved" in coord.apply(p, [decide[0]])[0] and \
+        f"ledger entry #{shelved}: task done, closed, not landed" in coord.apply(p, [decide[0]])[0]
+
+
+def test_a_clipped_information_only_refusal_keeps_its_mark():
+    from ttp import coordinator as coord
+    long = "task_add: already tried: " + "x" * 900 + f" {coord.INFO_MARK}"
+    cut = coord.clip_rejection(long)
+    assert coord.informational_rejection(cut) and len(cut) <= 500 + len(coord.INFO_MARK) + 1
+    assert coord.clip_rejection("task_update: no task " + "y" * 900) == ("task_update: no task " + "y" * 900)[:500]

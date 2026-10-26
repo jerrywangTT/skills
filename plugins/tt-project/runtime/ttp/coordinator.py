@@ -306,6 +306,7 @@ SETTLED_REJECTIONS = ("duplicate of ", "near duplicate of ", "already tried: ", 
 MISSING_FIELDS = "task_add needs a"   # start of a rejection the next turn can fix (fixable_rejection)
 UNKNOWN_KIND = "task_add kind"   # start of an unknown-kind rejection, also one the next turn can fix
 TASK_KINDS = ("question", "code", "review", "plan", "harness", "work")   # coordinator.md's `kind` list
+INFO_MARK = "(information only: nothing was lost; no turn needed)"   # ends an InfoRejection's text
 NOTES_KEY = "action_notes"   # kv: the last turn's notes on actions applied with a change; information only
 RECENT_OUT = 5                       # outbound messages the digest repeats, so turns do not resend them
 # Digest row lengths. Background rows are cut; new events, asks and open-task notes carry decisions.
@@ -934,13 +935,14 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
             "## Recurring (as last turn): " + ", ".join(f"{s['name']} {'on' if s['enabled'] else 'off'}"
                                                         for s in recurring))
     muted = scr.mutes(db, now)
+    slots = scr.slots_line(muted, now)
     lines = ["## Muted observations (recorded and counted, never wake you; one high event if a condition "
-             "persists past its ask time; one summary event when each ends)"] if muted else []
+             f"persists past its ask time; one summary event when each ends{slots})"] if muted else []
     for m in muted:
         lines.append(f"- {clip(scr.mute_line(m, now, p), MUTE_CHARS)}")
     section("muted", lines, json.dumps([[m["source"], m["match"], m["below"], m["until"], m.get("why"),
                                          m.get("end_when"), m.get("probe_broken")] for m in muted]),
-            "## Muted observations (as last turn; never wake you): "
+            f"## Muted observations (as last turn; never wake you{slots}): "
             + "; ".join(f"{m['source']} {m['match']!r}: {int(m['count'])} muted, "
                         + (f"persisting {', '.join(scr.mute_ages(m, now))}, " if scr.mute_ages(m, now) else "")
                         + f"ends in {max(0.0, (float(m['until']) - now) / 3600):.1f} h" + scr.mute_probe(m)
@@ -1017,8 +1019,10 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
         if rejected and db.kv(REJECTED_REPLY_KEY, False) else ""
     for x in rejected:
         tag = "rejected again, as on the turn before: do not send it as is" if rejection_key(x) in again \
-            else "your previous turn's action was rejected; fix or drop it"
-        lines.append(f"- [{tag}] {x[:_rejection_cap(x)]}{told}")
+            else "your previous turn's action was refused, information only: nothing to fix" \
+            if informational_rejection(x) else "your previous turn's action was rejected; fix or drop it"
+        reason = str(x).replace(f" {INFO_MARK}", "")
+        lines.append(f"- [{tag}] {reason[:_rejection_cap(reason)]}{told}")
     for x in db.kv(NOTES_KEY, []) or []:
         lines.append(f"- [note on your previous turn's action: applied, nothing to fix] {x[:500]}")
     for x in chaincap.notices(db):
@@ -1195,6 +1199,27 @@ _GIT_LOG = re.compile(rf"\bgit(?:\s+-[^\s|;&]+(?:\s+[^\s|;&-][^\s|;&]*)??)*\s+lo
 
 class MissingTaskRef(ValueError):
     """A start_when, retry_when, hold probe or depends_on that names a task this project does not have."""
+
+
+class InfoRejection(ValueError):
+    """A refusal that is information only: the action matched open or landed work, or a field a running
+    task keeps until it ends, so nothing was lost and nothing waits on a decision. It still reaches the
+    next digest but raises no turn by itself (effort_triggers): it rides along with the next wake."""
+
+    def __init__(self, text: str):
+        super().__init__(f"{text} {INFO_MARK}")
+
+
+def informational_rejection(problem: str) -> bool:
+    """Whether a rejection is information only (InfoRejection)."""
+    return INFO_MARK in str(problem)
+
+
+def clip_rejection(problem: str, n: int = 500) -> str:
+    """A rejection cut to n chars for storage; an information-only one keeps its mark."""
+    if not informational_rejection(problem):
+        return str(problem)[:n]
+    return str(problem).replace(f" {INFO_MARK}", "")[:n] + f" {INFO_MARK}"
 
 
 class DraftGateRejection(ValueError):
@@ -1622,7 +1647,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 dup = db.one("SELECT id FROM tasks WHERE title=? AND status NOT IN ('done','failed','cancelled')",
                              (title,))
                 if dup and str(dup["id"]) != str(a.get("continues")):
-                    raise ValueError(f"duplicate of open task #{dup['id']}")
+                    raise InfoRejection(f"duplicate of open task #{dup['id']}")
                 # Work this project already tried, shelved or landed (tried.py): a reworded title with
                 # the same parameters still matches; force passes only with the difference stated.
                 # A hop of a continue chain repeats its earlier hops' titles, not their work.
@@ -1634,13 +1659,14 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 skip.add(str(a.get("continues")))
                 hit = tried.match(db, title, a.get("spec") or "", p, skip=skip)
                 if hit and not (a.get("force") and tried.differs(a.get("spec") or "", hit)):
-                    raise ValueError(tried.rejection(hit, p))
+                    raise (InfoRejection if hit["outcome"] in tried.REACHED else ValueError)(tried.rejection(hit, p))
                 if hit:
                     notes.append(f"task_add {title[:80]!r}: forced past {tried.describe(hit, p)}")
                 if not a.get("force"):
                     same = similar_task(db, title, a.get("spec") or "", skip=skip)
                     if same:
-                        raise ValueError(f"near duplicate of task #{same['id']} ({same['status']}) "
+                        raise (ValueError if same["status"] in TERMINAL_TASK_STATES else InfoRejection)(
+                            f"near duplicate of task #{same['id']} ({same['status']}) "
                                          f"'{same['title'][:120]}': update or continue it; if this is new work, say "
                                          f"how it differs in the title and spec, or add force: true")
                 review = a.get("kind") == "review"
@@ -1877,7 +1903,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 upd: dict[str, Any] = {}
                 if a.get("status") in ("queued", "blocked", "cancelled", "done", "waiting"):
                     if task["status"] == "running" and a["status"] != "cancelled":
-                        raise ValueError(f"task #{task['id']} is running: send `spec` alone to steer it mid-run, "
+                        raise InfoRejection(f"task #{task['id']} is running: send `spec` alone to steer it mid-run, "
                                          f"or set status cancelled")
                     upd["status"] = a["status"]
                     if a["status"] == "queued":
@@ -1902,7 +1928,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 if a.get("resources") is not None:
                     # Moves the task to other resources (a healthy machine instead of a failing one).
                     if task["status"] == "running":
-                        raise ValueError(f"task #{task['id']} is running: its resources change only while it is "
+                        raise InfoRejection(f"task #{task['id']} is running: its resources change only while it is "
                                          f"not; cancel it and re-add it with `continues` to move it now")
                     kind_label = "exclusive" if a.get("exclusive") else "resource"
                     keep = [lb for lb in json.loads(task["labels"] or "[]")
@@ -1942,7 +1968,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     # line too, so a later update's `pr_branch:` line or field wins (worktree.recorded_pr_branch).
                     want = str(a["pr_branch"]).strip()
                     if task["status"] in ("running", *TERMINAL_TASK_STATES):
-                        raise ValueError(f"task #{task['id']} is {task['status']}: its branch changes only before "
+                        raise InfoRejection(f"task #{task['id']} is {task['status']}: its branch changes only before "
                                          f"it starts; add a new one with continues and pr_branch \"\"")
                     if want and not worktree.valid_branch(want):
                         raise ValueError(f"task #{task['id']} rejected: pr_branch {want!r} is not one valid branch name")
@@ -1951,7 +1977,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 if a.get("start_after") is not None or a.get("start_when") is not None \
                         or (a.get("why") is not None and deferral(task).get("when")):
                     if task["status"] in ("running", *TERMINAL_TASK_STATES):
-                        raise ValueError(f"task #{task['id']} is {task['status']}: only a task that has not "
+                        raise InfoRejection(f"task #{task['id']} is {task['status']}: only a task that has not "
                                          f"started can be deferred; add a new one with start_after/start_when")
                     cur = deferral(task)
                     try:
@@ -1991,7 +2017,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     upd["priority"] = int(a["priority"])
                 if any(a.get(k) is not None for k in ("provider", "model", "effort", "pin_verify")):
                     if task["status"] == "running":
-                        raise ValueError(f"task #{task['id']} is running: its provider, model, effort and pin verification change only "
+                        raise InfoRejection(f"task #{task['id']} is running: its provider, model, effort and pin verification change only "
                                          f"while it is not; cancel it and re-add it with `continues` to change them now")
                     pin = _task_pin(cfg, a, {k: task.get(k) for k in ("provider", "model", "effort", "pin_verify")})
                     upd.update({k: v for k, v in pin.items() if v != task.get(k)})
@@ -2417,6 +2443,10 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                                                      milestone=a.get("milestone")))
                 elif str(a.get("why") or "").strip():
                     notes.append(obligations.drop(p, oid, str(a["why"]), by="coordinator"))
+                elif (owners or a.get("milestones")) and (obligations.get(db, oid) or {}).get("receipt"):
+                    # Delivered already: an owner or milestone more changes nothing owed (no rejection).
+                    notes.append(f"obligation {oid} already has its receipt: owners and milestones not added, "
+                                 f"nothing is owed")
                 elif owners or a.get("milestones"):
                     with db.tx():
                         if a.get("milestones"):
@@ -2968,7 +2998,8 @@ def effort_triggers(db, cfg: dict, event_ids: list[int], wake_due: str | None,
         texts = db.q(f"SELECT text FROM messages WHERE id IN ({','.join('?' * len(msg_ids))})", list(msg_ids))
         if any(CONFLICT_RE.search(m["text"] or "") for m in texts):
             add("change of plan")
-    rejected = [str(x) for x in db.kv(REJECTED_KEY, []) or []]
+    # Information-only refusals ride along with the next wake: they raise no turn (InfoRejection).
+    rejected = [str(x) for x in db.kv(REJECTED_KEY, []) or [] if not informational_rejection(str(x))]
     if any(x.startswith("ask_user:") for x in rejected):
         add("retry after a rejected ask_user")
     elif rejected:

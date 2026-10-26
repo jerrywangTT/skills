@@ -547,6 +547,7 @@ def settle_receipts(db: DB, source: str, since: float, subjects: Any, now: float
 # extended, no mute outlasts MUTE_CAP_S from when it began: its end then makes the coordinator look again.
 MUTES_KEY = "observation_mutes"   # kv: list of active mutes, oldest first
 MUTE_MIN_MATCH, MUTE_MAX_H, MUTE_MAX = 3, 72, 20
+MUTE_SLOTS_NEAR = 5   # the digest counts mute slots once this few or fewer are free (slots_line)
 MUTE_BELOW = ("normal", "high", "critical")
 MUTE_ESCALATE_H = 2.0   # default escalate_after_h; 0 never escalates (needs a `why` naming who handles it)
 MUTE_ESCALATE_MIN_H = 0.5
@@ -621,7 +622,8 @@ def mute(db: DB, source: Any, match: Any, hours: Any, below: Any = None, why: An
     with db.tx():
         active = db.kv(MUTES_KEY, []) or []
         old = next((m for m in active if _same_mute(m, source, match)), None)
-        if old is None and len(active) >= MUTE_MAX:
+        # Only mutes still in force hold a slot: an ended one waits for its summary, not for a slot.
+        if old is None and sum(float(m["until"]) > now for m in active) >= MUTE_MAX:
             raise ValueError(f"observation_mute rejected: {MUTE_MAX} mutes are already active; let one end first")
         if esc is None:
             esc = float(old.get("escalate_after_h", MUTE_ESCALATE_H)) if old else MUTE_ESCALATE_H
@@ -698,6 +700,21 @@ def mutes(db: DB, now: float | None = None) -> list[dict]:
     """The mutes still in force."""
     now = time.time() if now is None else now
     return [m for m in db.kv(MUTES_KEY, []) or [] if float(m["until"]) > now]
+
+
+def slots_line(muted: list[dict], now: float | None = None) -> str:
+    """'; 18 of 20 mute slots used, first to end: <source> <match> in 1.5 h', once the mutes in force
+    are within MUTE_SLOTS_NEAR of MUTE_MAX ('' before), so a turn does not send a mute the cap refuses."""
+    if len(muted) < MUTE_MAX - MUTE_SLOTS_NEAR:
+        return ""
+    now = time.time() if now is None else now
+    first = min(muted, key=lambda m: float(m["until"]))
+    return (f"; {len(muted)} of {MUTE_MAX} mute slots used, first to end: {first['source']} "
+            f"{clip_match(first['match'])!r} in {max(0.0, (float(first['until']) - now) / 3600):.1f} h")
+
+
+def clip_match(match: str, n: int = 40) -> str:
+    return match if len(match) <= n else match[: n - 1] + "…"
 
 
 def count_muted(db: DB, source: str, text: str, severity: str, now: float | None = None,

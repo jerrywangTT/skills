@@ -241,8 +241,8 @@ def drop(p, oid: str, why: str, by: str = "user", now: float | None = None) -> s
     with p.db.tx():
         st = _load(p.db)
         o = _need(st, oid)
-        if o["receipt"]:
-            raise ValueError(f"obligation {oid} already has a receipt")
+        if o["receipt"]:   # delivered: it is no longer owed either way
+            return f"{oid} already has its receipt; nothing to drop"
         if o.get("dropped"):
             return f"{oid} was already dropped"
         o["dropped"] = {"at": now, "by": by, "why": why}

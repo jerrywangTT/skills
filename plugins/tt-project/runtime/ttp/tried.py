@@ -36,6 +36,7 @@ LEDGER_ROWS = 400          # finished tasks read at most (newest first)
 DIGEST_ROWS = 6            # ledger lines a digest shows
 OUTCOMES = ("landed", "kept", "shelved", "rejected", "failed", "cancelled", "done")
 SETTLED = ("landed", "kept", "shelved", "rejected")   # a result was reached: repeating it the same day is waste
+REACHED = ("landed", "kept")   # the work exists: a task_add repeating it is refused as information only
 RESULT_CHARS = 100
 COMMON_SHARE = 0.15        # a title word or parameter in this share of the ledger (and at least
 COMMON_MIN = 4             # COMMON_MIN entries) is the project's own vocabulary: it says nothing alike
@@ -264,7 +265,7 @@ def entries(db, where=None, now: float | None = None, days: float = LEDGER_DAYS)
             continue   # never ran: nothing was tried
         res = load_result(t["result"])
         ts = float(t["ts"])
-        base = {"id": t["id"], "ts": ts, "date": timefmt.long(ts, where)}
+        base = {"id": t["id"], "status": t["status"], "ts": ts, "date": timefmt.long(ts, where)}
         items = [i for i in (res.get("tried") or []) if isinstance(i, dict) and str(i.get("title") or "").strip()] \
             if isinstance(res.get("tried"), list) else []
         for i in items:
@@ -319,7 +320,9 @@ def describe(entry: dict, where=None, now: float | None = None) -> str:
 
 
 def rejection(entry: dict, where=None, now: float | None = None) -> str:
-    return (f"already tried: {describe(entry, where, now)}. Do not queue it again; if this is really new work, "
+    state = (f"; ledger entry #{entry['id']}: task {entry['status']}, closed, "
+             + ("landed" if entry["outcome"] == "landed" else "not landed")) if entry.get("status") else ""
+    return (f"already tried: {describe(entry, where, now)}{state}. Do not queue it again; if this is really new work, "
             f"add 'differs from #{entry['id']}: <how>' to the spec and resend with force: true")
 
 

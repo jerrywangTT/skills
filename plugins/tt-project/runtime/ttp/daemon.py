@@ -3170,7 +3170,7 @@ class Daemon:
             except Exception:   # bookkeeping: the turn is settled either way
                 log(self.p, "coordinator turn gate record failed: "
                     + traceback.format_exc().replace("\n", " | ")[:1000])
-        self._record_rejections([x[:500] for x in problems])
+        self._record_rejections([coord.clip_rejection(x) for x in problems])
         db.set_kv("last_coordinator_summary", {"ts": time.time(), "summary": (out or {}).get("summary", "")})
         try:
             quietgate.left(db, self._quiet_fp({k: g.as_dict() for k, g in self.gates.items()}), r.get("id"),
