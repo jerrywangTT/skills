@@ -341,3 +341,62 @@ def test_standby_snapshots_only_while_this_host_holds_the_lease(env, tmp_path, m
     replica._save_state(p, st)
     call(d)
     assert seen and seen[-1][0] == replica.OBS_SOURCE, "a holder that stays stale is alerted"
+
+
+def test_lease_on_a_remote_whose_push_url_is_not_its_fetch_url(env, tmp_path, monkeypatch):
+    """A named failover.lease_remote whose pushurl differs from its url keeps the lease where
+    `git push <name>` writes, and reads it there: the compare-and-swap's expected value comes from the
+    push side, so a second holder is refused and sees the first. A one-URL remote resolves as before;
+    one with several push URLs is refused (one CAS point)."""
+    from ttp import lease
+    p = make(env)
+    fetch, push, extra = (tmp_path / f"{n}.git" for n in ("fetch", "push", "extra"))
+    for repo in (fetch, push, extra):
+        subprocess.run(["git", "init", "-q", "--bare", str(repo)], check=True)
+    git = ["git", "-C", str(p.root)]
+    subprocess.run([*git, "remote", "add", "leases", str(fetch)], check=True)
+    subprocess.run([*git, "remote", "set-url", "--push", "leases", str(push)], check=True)
+    subprocess.run([*git, "remote", "add", "plain", str(extra)], check=True)
+    assert lease.resolve_remote(p, {"failover": {"lease_remote": "plain", "allow_delivery_remote": True}}) == str(extra)
+    url = lease.resolve_remote(p, {"failover": {"lease_remote": "leases", "allow_delivery_remote": True}})
+    assert url == str(push)
+    t = [0.0]
+    mk = _leases(tmp_path, url, lambda: t[0])
+    a, b = mk("host-a"), mk("host-b")
+    assert a.step() == "acquired" and a.epoch == 1
+    assert b.step() == "watching" and not b.held() and b.snapshot()["holder_host"] == "host-a"
+    t[0] += 25
+    assert a.step() == "renewed" and a.held()
+    ref = lease.REF_PREFIX + "demo"
+    assert subprocess.run(["git", "ls-remote", str(push), ref], capture_output=True, text=True).stdout
+    assert not subprocess.run(["git", "ls-remote", str(fetch), ref], capture_output=True, text=True).stdout
+    # Several push URLs: refused, not split across repositories.
+    subprocess.run([*git, "remote", "set-url", "--add", "--push", "leases", str(extra)], check=True)
+    with pytest.raises(lease.Refused, match="2 push URLs"):
+        lease.resolve_remote(p, {"failover": {"lease_remote": "leases", "allow_delivery_remote": True}})
+
+
+def test_lease_store_reads_where_a_push_insteadof_rule_sends_its_writes(env, tmp_path, monkeypatch):
+    """A lease_remote URL that a pushInsteadOf rule rewrites for pushes only: GitStore reads (and
+    fetches) the rewritten URL its writes go to, so the holder renews, a second holder is refused and
+    sees it, and the URL as written never gets the ref."""
+    from ttp import lease
+    fetch, push = (tmp_path / f"{n}.git" for n in ("fetch", "push"))
+    for repo in (fetch, push):
+        subprocess.run(["git", "init", "-q", "--bare", str(repo)], check=True)
+    gitconfig = tmp_path / "gitconfig"
+    subprocess.run(["git", "config", "--file", str(gitconfig), f"url.{push}.pushInsteadOf", str(fetch)], check=True)
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(gitconfig))
+    store = lease.GitStore(str(fetch), "demo", tmp_path / "probe.git")
+    assert store.url() == str(push)
+    t = [0.0]
+    mk = _leases(tmp_path, fetch, lambda: t[0])
+    a, b = mk("host-a"), mk("host-b")
+    assert a.step() == "acquired"
+    assert b.step() == "watching" and b.snapshot()["holder_host"] == "host-a"
+    t[0] += 25
+    assert a.step() == "renewed" and a.held() and a.epoch == 1
+    rec, ver = store.read()
+    assert rec["holder_host"] == "host-a" and ver
+    assert store.cas("", {"epoch": 9, "holder_host": "host-c"}) is False, "expected value read from the push side"
+    assert not subprocess.run(["git", "ls-remote", str(fetch)], capture_output=True, text=True).stdout

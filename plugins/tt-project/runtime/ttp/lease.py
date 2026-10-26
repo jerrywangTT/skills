@@ -211,7 +211,19 @@ def resolve_remote(p, cfg: dict) -> str:
                 raise Refused(f"failover.lease_remote {raw} is the project's delivery remote ({name}): refs "
                               f"under {REF_PREFIX} may break its branch rules; configure a separate remote, or "
                               f"set failover.allow_delivery_remote if its charter allows such refs")
-    return url
+    if raw not in remotes:
+        return url
+    # A named remote's lease lives where `git push <name>` writes: its push URL (remote.<name>.pushurl
+    # or a pushInsteadOf rewrite), not the fetch URL `git remote -v` lists first. push_sides gives the
+    # name back for a one-URL remote. Several push URLs are refused rather than read from the first as
+    # push_side does: a compare-and-swap is atomic on one repository only, and a write that one URL
+    # took and another refused would leave the copies apart for good.
+    from .push import push_sides
+    sides = push_sides(Path(p.root), raw)
+    if len(sides) > 1:
+        raise Refused(f"failover.lease_remote {raw} has {len(sides)} push URLs: a lease needs one "
+                      f"compare-and-swap point; configure a remote with a single push URL")
+    return remotes.get(sides[0], sides[0])
 
 
 # Store -------------------------------------------------------------------------------------------
@@ -224,6 +236,7 @@ class GitStore:
 
     def __init__(self, remote: str, ident: str, gitdir: Path):
         self.remote, self.ref, self.gitdir = remote, REF_PREFIX + ident, Path(gitdir)
+        self._url: str | None = None
 
     def _repo(self) -> Path:
         if not (self.gitdir / "HEAD").exists():
@@ -241,15 +254,23 @@ class GitStore:
         except OSError as e:
             raise Unreachable(f"git {args[0]}: {e}") from e
 
+    def url(self) -> str:
+        """Where a write goes: `remote` after the pushInsteadOf rewriting `git push` applies to it in
+        this repo. Reads and the fetch ask this URL too, so the compare-and-swap's expected value comes
+        from the repository it writes to (`git ls-remote <remote>` would ask the insteadOf form)."""
+        if self._url is None:
+            self._url = push_url(self.remote, self._repo())
+        return self._url
+
     def read(self) -> tuple[dict | None, str]:
-        r = self._call(["ls-remote", self.remote, self.ref])
+        r = self._call(["ls-remote", self.url(), self.ref])
         if r.returncode:
             raise Unreachable(f"git ls-remote {self.remote}: {(r.stderr or r.stdout).strip()[-300:]}")
         oid = next((ln.split()[0] for ln in r.stdout.splitlines() if ln.endswith("\t" + self.ref)), "")
         if not oid:
             return None, ""
         if self._call(["cat-file", "-e", oid + "^{commit}"]).returncode:
-            f = self._call(["fetch", "-q", "--no-tags", self.remote, f"+{self.ref}:refs/ttp/seen"])
+            f = self._call(["fetch", "-q", "--no-tags", self.url(), f"+{self.ref}:refs/ttp/seen"])
             if f.returncode:
                 raise Unreachable(f"git fetch {self.remote}: {f.stderr.strip()[-300:]}")
         blob = self._call(["cat-file", "blob", f"{oid}:lease.json"])
@@ -269,7 +290,7 @@ class GitStore:
                              f"lease epoch {rec.get('epoch')} {rec.get('holder_host') or 'released'}"], env=ident)
         if blob.returncode or tree.returncode or commit.returncode:
             raise Unreachable("cannot build the lease commit: " + (commit.stderr or tree.stderr or blob.stderr).strip()[:200])
-        r = self._call(["push", "--porcelain", f"--force-with-lease={self.ref}:{version}", self.remote,
+        r = self._call(["push", "--porcelain", f"--force-with-lease={self.ref}:{version}", self.url(),
                         f"{commit.stdout.strip()}:{self.ref}"])
         if r.returncode == 0:
             return True
