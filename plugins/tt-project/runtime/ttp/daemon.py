@@ -1686,6 +1686,15 @@ class Daemon:
             detach.tend(self.p)
         except Exception:
             log(self.p, "starting queued detached jobs failed\n" + traceback.format_exc())
+        try:   # the jobs of tasks that ended without success, and `ttp detach --stop` requests (jobstop)
+            from . import jobstop
+            due = time.monotonic() >= getattr(self, "_jobstop_due", 0.0)
+            if due:
+                self._jobstop_due = time.monotonic() + jobstop.SWEEP_EVERY_S
+            for r in jobstop.sweep(self.p) if due else jobstop.serve_requests(self.p):
+                log(self.p, r["text"])
+        except Exception:
+            log(self.p, "stopping the detached jobs of ended tasks failed\n" + traceback.format_exc())
         try:
             pushq.tend_receipts(self.p, self.alert)
         except Exception:

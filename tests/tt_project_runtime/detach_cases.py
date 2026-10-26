@@ -574,3 +574,260 @@ def test_detach_lock_job_closed_as_died_leaves_no_lock_held_or_shown_held(env, t
     for r in takes:   # the lock's pid reused by a live process never shows the lock as held
         r["pid"] = os.getpid()
     assert [s["state"] for s in activity.spans(recs, "testhost") if s["kind"] == "lock"] == ["unknown", "unknown"]
+
+
+# Stopping the detached jobs of a task that ended without success (jobstop), and `ttp detach --stop`.
+# The broker is a stub on PATH; every process signalled is one this test started.
+
+def _stub_broker(tmp_path, status=None, fail=False):
+    """A `tt-device-mcp` stub: `run` records its pid and sleeps (a client), `status -j` prints the
+    jobs given (or exits 1), `kill <id>` records the id and the client's process state."""
+    d = tmp_path / "brokerbin"
+    d.mkdir(exist_ok=True)
+    (d / "status.json").write_text(json.dumps({"jobs": status or []}))
+    stub = d / "tt-device-mcp"
+    stub.write_text(f'''#!/bin/sh
+d={shlex.quote(str(d))}
+case "$1" in
+  run) echo $$ >"$d/client.pid"; sleep 60; exit 0 ;;
+  status) {"exit 1" if fail else 'cat "$d/status.json"'} ;;
+  kill) echo "$2 $(cut -d' ' -f3 /proc/$(cat "$d/client.pid")/stat)" >>"$d/kills" ;;
+esac
+''')
+    stub.chmod(0o755)
+    return d
+
+
+def _broker_jobs(me):
+    return [{"job_id": 11, "owner": me, "command": "sleep 60", "status": "running"},
+            {"job_id": 12, "owner": "another-user", "command": "sleep 60", "status": "running"},
+            {"job_id": 13, "owner": me, "command": "sleep 61", "status": "running"},
+            {"job_id": 14, "owner": me, "command": "sleep 60", "status": "done", "finished_at": 1}]
+
+
+def _locked_job(p, tid, broker, name="loop", status="running"):
+    """Task tid's run started `ttp detach --lock builddir <name>`, whose loop runs a broker client;
+    returns (rc, pgid) once the client runs."""
+    run_dir = p.runs / f"stop-{tid}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    p.db.x("INSERT INTO runs(task,role,provider,started,status,dir) VALUES(?,?,?,?,?,?)",
+           (tid, "worker", "fake", time.time() - 60, "ok", str(run_dir)))
+    (broker / "client.pid").unlink(missing_ok=True)
+    loop = f"while :; do {shlex.quote(str(broker / 'tt-device-mcp'))} run -- sleep 60; done"
+    r = _ttp_run(p, "detach", "--lock", "builddir", name, "--", "sh", "-c", loop, env={"TTP_RUN_DIR": str(run_dir)})
+    assert r.returncode == 0, r.stderr
+    rc = (run_dir / f"{name}.rc").resolve()
+    assert _wait_for_path(broker / "client.pid")
+    pgid = int(rc.with_suffix(".started").read_text().split()[0])
+    p.db.update_task(tid, status=status)
+    return rc, pgid
+
+
+def _end_group(pgid):
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except OSError:
+        pass
+
+
+def _stopped_events(p):
+    return p.db.q("SELECT * FROM events WHERE kind='detached_job_stopped'")
+
+
+def test_a_cancelled_tasks_job_is_frozen_its_matching_broker_job_ended_and_its_locks_freed(env, tmp_path, monkeypatch):
+    import pwd
+    from ttp import jobstop, locks as lk
+    from ttp.daemon import Daemon
+    p = make(env)
+    me = pwd.getpwuid(os.getuid()).pw_name
+    broker = _stub_broker(tmp_path, _broker_jobs(me))
+    monkeypatch.setenv("PATH", f"{broker}:{os.environ['PATH']}")
+    tid = p.db.add_task("soak", "s", kind="work", tier="light", origin="user")
+    rc, pgid = _locked_job(p, tid, broker, status="cancelled")
+    try:
+        slot = p.state / "locks" / "builddir.0.lock"
+        assert not lk.any_free([slot]) and json.loads(slot.read_text())["job_rc"] == str(rc)
+        Daemon(p.base).tend_pushes()   # the daemon's tick runs the sweep
+        # Only the job whose owner and full command match the client: ended once, while the group was stopped.
+        assert (broker / "kills").read_text().split("\n")[0] == "11 T", (broker / "kills").read_text()
+        assert len((broker / "kills").read_text().splitlines()) == 1
+        assert f"task #{tid} is cancelled" in rc.with_suffix(".lost").read_text()
+        assert lk.any_free([slot]) and lk.any_free([lk.job_lock(rc)])
+        assert not jobstop.members(pgid)
+        (ev,) = _stopped_events(p)
+        assert ev["task"] == tid and "loop" in ev["text"] and "11" in ev["text"] and "builddir.0.lock" in ev["text"]
+        assert str(pgid) in ev["text"]
+        # Idempotent: a second pass does nothing and logs nothing.
+        assert jobstop.sweep(p) == [] and len(_stopped_events(p)) == 1
+        assert len((broker / "kills").read_text().splitlines()) == 1
+    finally:
+        _end_group(pgid)
+
+
+def test_a_failing_or_missing_broker_cli_never_blocks_the_stop(env, tmp_path, monkeypatch):
+    import pwd
+    from ttp import jobstop, locks as lk
+    p = make(env)
+    me = pwd.getpwuid(os.getuid()).pw_name
+    broker = _stub_broker(tmp_path, _broker_jobs(me), fail=True)
+    monkeypatch.setenv("PATH", f"{broker}:{os.environ['PATH']}")
+    failed = p.db.add_task("failed", "s", kind="work", tier="light", origin="user")
+    rc, pgid = _locked_job(p, failed, broker, status="failed")
+    try:
+        (r,) = jobstop.sweep(p)
+        assert "status -j` failed" in r["note"] and not (broker / "kills").exists()
+        assert lk.any_free([lk.job_lock(rc)]) and not jobstop.members(pgid)
+    finally:
+        _end_group(pgid)
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")   # no broker CLI at all
+    gone = p.db.add_task("gone", "s", kind="work", tier="light", origin="user")
+    rc2, pgid2 = _locked_job(p, gone, broker, name="loop2", status="failed")
+    try:
+        (r,) = jobstop.sweep(p)
+        assert "not on PATH" in r["note"] and not (broker / "kills").exists()
+        assert lk.any_free([lk.job_lock(rc2)]) and "is failed" in rc2.with_suffix(".lost").read_text()
+    finally:
+        _end_group(pgid2)
+
+
+def test_a_broker_job_is_ended_only_on_an_exact_owner_and_command_match(env, tmp_path):
+    from ttp import jobstop
+    me = "builder"
+    d = _stub_broker(tmp_path, [{"job_id": 1, "owner": me, "command": "sleep 60"},
+                                {"job_id": 2, "owner": "other", "command": "sleep 60"},
+                                {"job_id": 3, "owner": me, "command": "sleep 600"},
+                                {"job_id": 4, "owner": me, "command": "sleep"}])
+    proc = subprocess.Popen([str(d / "tt-device-mcp"), "run", "--owner", me, "--", "sleep", "60"], start_new_session=True)
+    try:
+        assert _wait_for_path(d / "client.pid")
+        os.environ["PATH"], old = f"{d}:{os.environ['PATH']}", os.environ["PATH"]
+        try:
+            ids, note = jobstop.end_broker_jobs(jobstop.members(proc.pid))
+        finally:
+            os.environ["PATH"] = old
+        assert ids == ["1"] and not note
+        assert jobstop.end_broker_jobs([os.getpid()]) == ([], "")   # no client among them: nothing asked
+    finally:
+        _end_group(proc.pid)
+        proc.wait()
+
+
+def test_a_job_an_open_task_still_waits_on_is_not_stopped(env, tmp_path):
+    from ttp import jobstop, locks as lk
+    p = make(env)
+    broker = _stub_broker(tmp_path)
+    tid = p.db.add_task("cancelled", "s", kind="work", tier="light", origin="user")
+    rc, pgid = _locked_job(p, tid, broker, status="cancelled")
+    try:
+        other = p.db.add_task("waiter", "s", kind="work", tier="light", origin="user")
+        p.db.update_task(other, status="queued", result=json.dumps(
+            {"status": "waiting", "retry_when": f"ttp detach --check {rc}"}))
+        assert jobstop.sweep(p) == [] and not lk.any_free([lk.job_lock(rc)])
+        assert not rc.with_suffix(".lost").exists() and not _stopped_events(p)
+        p.db.update_task(other, result=json.dumps({"status": "waiting", "retry_when": "true",
+                                                   "on_pass": {"status": "done", "summary": f"see {rc}"}}))
+        assert jobstop.sweep(p) == []
+        p.db.update_task(other, status="done")
+        assert len(jobstop.sweep(p)) == 1 and lk.any_free([lk.job_lock(rc)])
+    finally:
+        _end_group(pgid)
+
+
+def test_a_restart_mid_stop_finishes_it_on_the_next_pass(env, tmp_path):
+    from ttp import jobstop, locks as lk
+    p = make(env)
+    broker = _stub_broker(tmp_path)
+    tid = p.db.add_task("cancelled", "s", kind="work", tier="light", origin="user")
+    rc, pgid = _locked_job(p, tid, broker, status="cancelled")
+    try:
+        os.killpg(pgid, signal.SIGSTOP)   # a daemon that froze the group and wrote why, then died
+        rc.with_suffix(".lost").write_text(f"task #{tid} is cancelled\n")
+        (r,) = jobstop.sweep(p)
+        assert lk.any_free([lk.job_lock(rc)]) and not jobstop.members(pgid) and r["pgid"] == pgid
+        assert jobstop.sweep(p) == [] and len(_stopped_events(p)) == 1
+    finally:
+        _end_group(pgid)
+
+
+def test_detach_stop_is_allowed_for_ended_tasks_and_priority_one_resource_holders_only(env, tmp_path):
+    from ttp import locks as lk
+    p = make(env)
+    broker = _stub_broker(tmp_path)
+    tid = p.db.add_task("open", "s", kind="work", tier="light", origin="user")
+    rc, pgid = _locked_job(p, tid, broker, status="waiting")
+    try:
+        r = _ttp_run(p, "detach", "--stop", str(rc))
+        assert r.returncode == 3 and r.stderr.count("\n") == 1 and "refused" in r.stderr, r.stderr
+        low = p.db.add_task("low", "s", kind="work", tier="light", origin="user", labels=["resource:builddir"])
+        r = _ttp_run(p, "detach", "--stop", str(rc), env={"TTP_TASK": str(low)})
+        assert r.returncode == 3, r.stderr   # priority 3, not 1
+        urgent = p.db.add_task("recover", "s", kind="work", tier="light", origin="user", priority=1,
+                               labels=["resource:another"])
+        r = _ttp_run(p, "detach", "--stop", str(rc), env={"TTP_TASK": str(urgent)})
+        assert r.returncode == 3, r.stderr   # none of its resources is held by the job
+        assert not lk.any_free([lk.job_lock(rc)])
+        p.db.update_task(urgent, labels=json.dumps(["exclusive:builddir"]))
+        r = _ttp_run(p, "detach", "--stop", str(rc), env={"TTP_TASK": str(urgent)})
+        assert r.returncode == 0 and "stopped detached job loop" in r.stdout, r.stderr
+        assert lk.any_free([lk.job_lock(rc)]) and f"priority-1 task #{urgent}" in rc.with_suffix(".lost").read_text()
+        r = _ttp_run(p, "detach", "--stop", str(rc), env={"TTP_TASK": str(urgent)})
+        assert r.returncode == 0 and "not running" in r.stdout and len(_stopped_events(p)) == 1
+    finally:
+        _end_group(pgid)
+    done = p.db.add_task("done", "s", kind="work", tier="light", origin="user")
+    rc2, pgid2 = _locked_job(p, done, broker, name="after", status="done")
+    try:
+        r = _ttp_run(p, "detach", "--stop", str(rc2))
+        assert r.returncode == 0 and lk.any_free([lk.job_lock(rc2)]), r.stderr
+    finally:
+        _end_group(pgid2)
+
+
+def test_the_daemon_reaps_the_wrappers_relaunch_started(env, tmp_path):
+    from ttp import detach
+    p = make(env)
+    run_dir = p.runs / "reap"
+    run_dir.mkdir(parents=True)
+    rc = run_dir / "quick.rc"
+    detach.save_resume(rc, run_dir / "quick.log", ["true"], str(tmp_path), {}, "boot-a")
+    why, pid = detach.relaunch(rc, "boot-b")
+    assert not why and pid > 1
+    assert _wait_for_path(rc)
+    stat = pathlib.Path(f"/proc/{pid}/stat")
+    deadline = time.time() + 10
+    while time.time() < deadline and stat.exists() and stat.read_text().rsplit(")", 1)[1].split()[0] != "Z":
+        time.sleep(0.05)
+    assert stat.exists(), "the wrapper was reaped before the daemon's tick"
+    detach.tend(p)
+    assert not stat.exists(), "the relaunched wrapper stayed a zombie of the daemon"
+
+
+def test_a_cancelled_tasks_detached_checks_from_an_earlier_run_are_stopped(env, tmp_path, monkeypatch, capsys,
+                                                                         reap_tmp_processes):
+    """An earlier run of a task started `ttp checks --detach`; once the task is cancelled the daemon's pass
+    ends their group, they write checks.rc 143, one event says so, and a second pass does nothing."""
+    from ttp import jobstop
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    tid = p.db.add_task("soak", "s", kind="code", tier="light", origin="user")
+    later = p.runs / "later"
+    later.mkdir(parents=True)
+    for d in (run, later):
+        p.db.x("INSERT INTO runs(task,role,provider,started,status,dir) VALUES(?,?,?,?,?,?)",
+               (tid, "worker", "fake", time.time() - 60, "ok", str(d)))
+    started = tmp_path / "started"
+    pid = _detached_checks(run, capsys, "sh", "-c", f"touch {started}; sleep 60")
+    try:
+        assert _wait_for(started.exists)
+        assert jobstop.sweep(p) == [], "the checks of an open task were stopped"
+        p.db.x("UPDATE tasks SET status='cancelled' WHERE id=?", (tid,))
+        stopped = jobstop.sweep(p)
+        assert [r["job"] for r in stopped] == ["checks"] and _wait_for(lambda: _gone_pid(pid), 10)
+        assert (run / "checks.rc").read_text().strip() == "143"
+        assert len(_stopped_events(p)) == 1 and f"task #{tid}" in _stopped_events(p)[0]["text"]
+        assert jobstop.sweep(p) == [] and len(_stopped_events(p)) == 1
+    finally:
+        try:
+            os.killpg(pid, signal.SIGKILL)
+        except OSError:
+            pass
+        reap_tmp_processes(tmp_path)

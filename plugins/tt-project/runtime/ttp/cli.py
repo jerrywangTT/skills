@@ -4259,6 +4259,8 @@ def cmd_detach(a) -> None:
             sys.exit(_detach_check_remote(a.host, a.check, rows, after or 0, mirror))
     if getattr(a, "reap", None):
         sys.exit(_detach_reap(a.reap))
+    if getattr(a, "stop", None):
+        sys.exit(_detach_stop(a.stop))
     if a.check is None:
         _start_options(a)
     if a.check is None and (getattr(a, "rows", None) is not None or getattr(a, "after", None) is not None):
@@ -4388,6 +4390,39 @@ def _detach_reap(what: str) -> int:
     ex = "?" if e.get("exit") is None else e["exit"]
     print(f"{rc.stem}: {e['status']} rc={ex} at {time.strftime('%Y-%m-%d %H:%M:%S %Z', time.localtime(e['ended']))}"
           + (f" ({e['why']})" if e.get("why") else ""))
+    return 0
+
+
+def _detach_stop(what: str) -> int:
+    """`ttp detach --stop <rc>`: stop a running job as the daemon stops those of ended tasks (jobstop.end):
+    0 once stopped or when it no longer runs, 2 when no record names it, 3 when refused (jobstop.may_stop).
+    A sandboxed caller, which cannot signal it, queues the stop for the daemon."""
+    from . import detach, jobstop
+    from .push import _boxed
+    rc = Path(what).expanduser().resolve()
+    if not detach._entry(rc):
+        print(f"ttp detach --stop: no detached job is recorded at {rc}", file=sys.stderr)
+        return 2
+    base = rc.parent.parent.parent.parent if rc.parent.parent.name == "runs" else None
+    if base is None or not (base / "state").is_dir():
+        print(f"ttp detach --stop: {rc} is not a job of a tt-project run", file=sys.stderr)
+        return 2
+    p = Project(base)
+    if not jobstop.running(rc):
+        print(f"{rc.stem}: not running; nothing to stop")
+        return 0
+    caller = os.environ.get("TTP_TASK") or ""
+    ok, why = jobstop.may_stop(p, rc, caller)
+    if not ok:
+        print(f"ttp detach --stop: {why}", file=sys.stderr)
+        return 3
+    if _boxed():
+        jobstop.request(p, rc, caller)
+        print(f"{rc.stem}: queued; the daemon stops it within seconds ({why})")
+        return 0
+    t = jobstop.task_of(p, rc)
+    r = jobstop.end(p, rc, f"stopped by `ttp detach --stop` ({why})", t["id"] if t else None)
+    print(r["text"] if r else f"{rc.stem}: not running; nothing to stop")
     return 0
 
 
@@ -8001,6 +8036,10 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--reap", metavar="NAME|RC",
                    help="close the record of a job that is over now, as the daemon does each minute: ended "
                    "with its exit code, or died when gone without one; refuses (exit 1) while it runs; idempotent")
+    s.add_argument("--stop", metavar="RC",
+                   help="stop a running job (its group, its matching broker jobs, its lock slots), logged; allowed "
+                   "when its task has ended, or for an open priority-1 task whose resources its locks hold; "
+                   "refused (exit 3) otherwise; idempotent")
     s.add_argument("--resumable", action="store_true",
                    help="the job is safe to rerun from the start: after a host reboot cuts it short, the daemon "
                    "starts it again while the task still waits on it, with no model run (up to "

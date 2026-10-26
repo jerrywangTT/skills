@@ -154,7 +154,21 @@ def start(rc: Path, log: Path, cmd: list, cwd: str, env: dict, lock) -> int:
                             cwd=cwd, env=env, stdin=subprocess.DEVNULL,
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
                             pass_fds=(lock.fileno(),))
+    _children.append(proc)
     return proc.pid
+
+
+# Wrappers this process started (start): a long-lived one, the daemon (tend, relaunch), reaps each that
+# ended on its next tick (reap_children), so none stays a zombie with the daemon as its parent.
+_children: list = []
+
+
+def reap_children() -> int:
+    """Reap the started wrappers that ended (non-blocking); how many."""
+    left = [c for c in _children if c.poll() is None]
+    n = len(_children) - len(left)
+    _children[:] = left
+    return n
 
 
 def enqueue(state: Path, rc: Path, log: Path, cmd: list, cwd: str, env: dict, *, checks: dict | None = None) -> Path:
@@ -518,6 +532,7 @@ def tend(p: Project) -> None:
     # Completion normally removes scratch; SIGKILL, a launcher crash or a reboot cannot.
     # The inherited lifetime lock protects live checks across daemon restarts and pid namespaces.
     from . import checkdirs, checkreap
+    reap_children()
     checkreap.sweep(p.state)   # first, so the scratch whose lock a leftover held can go below
     checkdirs.recover(p.state, p.runs)
     sweep(p.state)
