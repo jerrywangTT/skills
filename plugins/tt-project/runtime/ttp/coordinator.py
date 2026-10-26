@@ -1307,14 +1307,14 @@ def marker_only_probe(probe: str | None, root: Path | str | None = None) -> str 
     end = probe_flag(probe)
     if end:
         return f"start_when {clip(probe, 120)!r} {end}"
-    missing = missing_file_probe(probe, root)
-    if missing:
-        return missing
     from .landed import literal_sha
     sha = literal_sha(probe)
     if sha:
         return (f"start_when {clip(probe, 120)!r} greps a literal sha ({sha}), likely stale after a rebase or "
                 f"redeploy: wait with `landed:#<id>`, or for a commit with `ttp landed <sha>`")
+    missing = missing_file_probe(probe, root)
+    if missing:
+        return missing
     if not probe or not _MARKER_ONLY.fullmatch(probe) or not re.search(r"ready", probe, re.I):
         return None
     return (f"start_when {clip(probe, 120)!r} only checks a readiness marker file, which can outlive the "

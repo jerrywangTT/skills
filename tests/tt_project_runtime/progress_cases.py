@@ -1005,3 +1005,124 @@ def test_a_reply_wait_stays_quiet_while_its_peer_recovers_and_re_arms_once_it_is
     state["peer-a"] = (True, "")
     stale, why = verdict()
     assert len(stale) == 1 and "recovering" not in why, why
+
+
+# ---- probe stalls the blocker sweep settles model-free (sweep.dispose_probe_stalls) ----
+
+def _stalled(p, d, probe, deps=(), now=None, ago=7200):
+    """A deferred task whose start_when said not yet 21 times, with its probe stall raised `ago` s back."""
+    from ttp import progress
+    now = time.time() if now is None else now
+    tid = _deferred(p, probe, now - ago - 4000)
+    if deps:
+        p.db.update_task(tid, depends_on=json.dumps(list(deps)))
+    for i in range(21):
+        d._start_verdict(p.db.task(tid), 1, now - ago - 3800 + i * 180)
+    progress.check(p.db, p.config(), p.state, now - ago)
+    assert f"stall:probe:#{tid}" in progress.load(p.db)["raised"]
+    return tid
+
+
+def _done_task(p):
+    tid = p.db.add_task("finished work", "s")
+    p.db.update_task(tid, status="done")
+    return tid
+
+
+def _dispose(p, d, now, rcs=None, cfg=None):
+    from ttp import sweep
+    from ttp.daemon import _current_probe
+    ran = []
+
+    def run(probe):
+        ran.append(probe)
+        return (rcs or {}).get(probe, 1)
+    got = sweep.dispose_probe_stalls(p.db, cfg or p.config(), now, _current_probe, run, d._probe_stall_act)
+    return {r["task"]: r["disposition"] for r in got}, ran
+
+
+def test_a_probe_stall_on_a_done_dependency_releases_the_task_once_with_a_note(env):
+    """A deferred task whose start_when has said not yet for hours while the task it depends on is done:
+    the blocker sweep re-runs the probe model-free; still not yet, so the task is released to start
+    once at its own tier with a note to check its probe. The same probe text never releases it again."""
+    from ttp import progress, sweep
+    from ttp.daemon import Daemon
+    from ttp.db import deferral
+    p = make(env)
+    d, now = Daemon(p.base), time.time()
+    dep = _done_task(p)
+    tid = _stalled(p, d, _LIVE_START, deps=[dep], now=now)
+    d.blocker_sweep()                     # runs the real probe in the project root: still not yet
+    t = p.db.task(tid)
+    assert not deferral(t).get("when") and t["not_before"] is None and t["tier"] == "light"
+    assert "your probe has said not yet for" in t["spec"] and "check it still tests what you wait for" in t["spec"]
+    rec = p.db.kv(sweep.PROBE_STALL_KEY)[str(tid)]
+    assert rec["disposition"] == "released-stale"
+    assert str(tid) not in progress.load(p.db)["probes"]
+    assert any(f"probe stall #{tid}" in line and "released-stale" in line for line in sweep.probe_stall_lines(p.db, now))
+    # Deferred again on the same probe and stalled again: never released a second time.
+    p.db.update_task(tid, labels=[f"start_when:{_LIVE_START}", f"deferred_since:{now:.0f}"])
+    for i in range(21):
+        d._start_verdict(p.db.task(tid), 1, now - 7000 + i * 180)
+    progress.check(p.db, p.config(), p.state, now - 3700)
+    got, ran = _dispose(p, d, now + 60)
+    assert got == {} and ran == [] and deferral(p.db.task(tid)).get("when") == _LIVE_START
+    assert p.db.task(tid)["spec"].count("your probe has said not yet") == 1
+
+
+def test_a_probe_stall_whose_probe_passes_on_the_recheck_lifts_its_hold(env):
+    from ttp.daemon import Daemon
+    from ttp.db import deferral
+    p = make(env)
+    d, now = Daemon(p.base), time.time()
+    tid = _stalled(p, d, _LIVE_START, deps=[_done_task(p)], now=now)
+    got, ran = _dispose(p, d, now, rcs={_LIVE_START: 0})
+    t = p.db.task(tid)
+    assert got == {tid: "rechecked-passed"} and ran == [_LIVE_START]
+    assert not deferral(t).get("when") and "your probe has said" not in t["spec"]
+
+
+def test_a_probe_stall_on_a_literal_sha_is_flagged_and_every_old_stall_gets_a_disposition(env):
+    """A probe that greps a literal commit sha is flagged without running anything; a stall naming no
+    finished task is listed; none is judged before coordinator.probe_stall_dispose_h, and 0 turns the
+    pass off."""
+    from ttp import sweep
+    from ttp.daemon import Daemon
+    from ttp.db import deferral
+    p = make(env)
+    d, now = Daemon(p.base), time.time()
+    sha_probe = "grep -q 3f9a1c27b04e state/deployed.txt || exit 1"
+    flagged = _stalled(p, d, sha_probe, now=now)
+    plain = _stalled(p, d, "test -e state/other-ready || exit 1", deps=[p.db.add_task("still going", "s")], now=now)
+    for h in (0, 3):     # off, and a threshold past the stalls' 2 h
+        cfg = {**p.config(), "coordinator": {**p.config()["coordinator"], "probe_stall_dispose_h": h}}
+        assert _dispose(p, d, now, cfg=cfg) == ({}, [])
+    got, ran = _dispose(p, d, now)
+    assert got == {flagged: "literal-sha-flagged", plain: "listed"} and ran == []
+    why = p.db.kv(sweep.PROBE_STALL_KEY)[str(flagged)]["why"]
+    assert "probe greps a literal sha; likely stale after a rebase or redeploy" in why
+    assert "landed:#<id>" in why and "ttp landed <sha>" in why
+    assert deferral(p.db.task(flagged)).get("when") == sha_probe
+    lines = sweep.probe_stall_lines(p.db, now)
+    assert any(f"#{flagged}" in x and "literal-sha-flagged" in x for x in lines)
+
+
+def test_user_gated_probe_stalls_are_left_without_a_recheck_release_or_wake(env):
+    """A probe that tests a user marker or a saved secret, or a task an open ask holds, is never
+    re-run, released or woken, even when the task it depends on is done."""
+    from ttp.daemon import Daemon
+    from ttp.db import deferral
+    p = make(env)
+    d, now = Daemon(p.base), time.time()
+    dep = _done_task(p)
+    marker = _stalled(p, d, "test -e state/user-go && test -e state/out-ready || exit 1", deps=[dep], now=now)
+    secret = _stalled(p, d, "ttp secret get api-token >/dev/null || exit 1", deps=[dep], now=now)
+    asked = _stalled(p, d, _LIVE_START, deps=[dep], now=now)
+    p.db.x("INSERT INTO messages(ts,direction,kind,text,handled) VALUES(?,'out','ask',?,0)",
+           (now, f"May #{asked} go ahead?"))
+    got, ran = _dispose(p, d, now, rcs={_LIVE_START: 0})
+    assert got == {marker: "user-gated-left", secret: "user-gated-left", asked: "user-gated-left"} and ran == []
+    for tid in (marker, secret, asked):
+        t = p.db.task(tid)
+        assert deferral(t).get("when") and "your probe has said" not in t["spec"]
+        assert "woke" not in json.loads(t["result"] or "{}")

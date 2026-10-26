@@ -8571,7 +8571,7 @@ def test_a_new_start_when_is_never_run_at_defer_time(env, monkeypatch):
     with p.db.tx():
         assert coord.apply(p, [{"type": "task_add", "title": "slow", "spec": "s", "start_when": slow},
                                {"type": "task_update", "id": tid, "start_when": "now-ish"}]) == []
-    assert cli.set_when(p.db, tid, broken, p) == f"task #{tid} start_when set: {broken}"
+    assert cli.set_when(p.db, tid, broken, p).startswith(f"task #{tid} start_when set: {broken}")   # + the literal-sha flag
     ran = [c for c in spawned if list(c[:2]) != ["/bin/sh", "-n"]]
     assert time.time() - t0 < 5 and not ran, spawned
     assert f"start_when:{slow}" in _labels(p, _added(p, "slow")) and f"start_when:{broken}" in _labels(p, tid)
@@ -8690,6 +8690,30 @@ def test_a_start_when_with_a_live_check_or_no_ready_marker_is_not_flagged(env, p
     assert coord.apply(p, [{"type": "task_add", "title": "ok", "spec": "s", "start_when": probe}]) == []
     assert p.db.kv(coord.NOTES_KEY) == [] and coord.marker_only_probe(probe) is None
 
+
+
+@pytest.mark.parametrize("probe,flagged", [
+    ("grep -q 3f9a1c27b04e state/deployed.txt || exit 1", True),
+    ("ssh box 'cat /opt/app/VERSION' | grep -q 9e8d7c6b5a49f3e2d1c0b9a8f7e6d5c4b3a2f1e0 || exit 1", True),
+    ("landed:#42", False),
+    ("ttp landed 3f9a1c27b04e", False),
+    ("git merge-base --is-ancestor 3f9a1c27b04e origin/main", False),   # the daemon runs it as `ttp landed`
+    ("ttp ack-wait probe --from peer-a --hash 0123abcd", False),
+    ('test "$(date +%s)" -ge 1792990518', False),
+    ("test -e state/deadbeef-cafe-4a1b-9c2d-0123456789ab", False),        # a UUID, not a sha
+])
+def test_a_start_when_that_greps_a_literal_sha_is_flagged_with_the_landed_forms(env, probe, flagged):
+    """task_add and task_update flag (never refuse) a start_when testing a literal commit sha: it goes
+    stale after a rebase or redeploy; `landed:#<id>` or `ttp landed <sha>` follow the change."""
+    p = make(env)
+    from ttp import coordinator as coord
+    hint = coord.marker_only_probe(probe)
+    if flagged:
+        assert coord.apply(p, [{"type": "task_add", "title": "w", "spec": "s", "start_when": probe}]) == []
+        assert "greps a literal sha" in hint and "landed:#<id>" in hint and "ttp landed <sha>" in hint
+        assert any("greps a literal sha" in n for n in map(str, p.db.kv(coord.NOTES_KEY)))
+    else:
+        assert hint is None or "literal sha" not in hint, hint
 
 
 def test_parse_start_after_now_any_case_or_empty_clears(env):

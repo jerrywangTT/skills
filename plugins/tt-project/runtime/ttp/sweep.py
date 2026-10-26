@@ -1016,7 +1016,7 @@ def dispose_probe_stalls(db: DB, cfg: dict, now: float, current_probe: Callable[
         except ValueError:
             continue
         t = db.task(tid)
-        probe = current_probe(t) if t and t["status"] == "queued" else None
+        probe = current_probe(t) if t and t["status"] in ("queued", "waiting") else None
         if not probe:
             continue
         sha, prev = _probe_sha(probe), done.get(str(tid)) or {}
@@ -1034,9 +1034,10 @@ def dispose_probe_stalls(db: DB, cfg: dict, now: float, current_probe: Callable[
             rec.update(disposition="user-gated-left", why=f"{why}: left for the user, no wake")
         else:
             refs = [int(n) for n in landed.task_refs(probe) if int(n) != tid]
-            named = sorted(set(refs) | {n for n in dependency_ids(t) if n != tid})
+            deps = dependency_ids(t)
+            named = sorted(set(refs) | {n for n in deps if n is not None and n != tid})
             rows = [db.task(n) for n in named]
-            finished = bool(named) and all(x and x["status"] == "done" for x in rows)
+            finished = bool(named) and None not in deps and all(x and x["status"] == "done" for x in rows)
             unrun = False
             for n in refs if finished else ():
                 got = run_probe(f"landed:#{n}")
