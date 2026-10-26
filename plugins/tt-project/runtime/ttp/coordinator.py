@@ -1825,7 +1825,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 if clash:
                     notes.append(f"task_add: #{new_id} added; {file_overlap.warning(clash, landing)}")
                 if tie:
-                    how = f"start_when {when}" if landing else f"depends_on [{tie[0]}]: no push branch or landed probe to wait on its landing"
+                    how = (f"start_when {when}" if landing else
+                           f"depends_on [{tie[0]}]: no push branch or landed probe to wait on its landing")
                     notes.append(f"task_add: #{new_id} chained after #{tie[0]} ({how}): {tie[1]}; "
                                  f"a `parallel: <why>` spec line runs it beside instead")
                 elif beside:
