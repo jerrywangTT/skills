@@ -518,7 +518,9 @@ project with `ttp config <name> jev.enabled false`. Without a key, screening is 
   adds or changes, the task is still added, but its task_add result and its line in the coordinator's
   open tasks say `overlaps #<id> (<paths>, new files flagged)` for the three most recent such tasks
   (then `+N more tasks`) with the fix: `depends_on` an open task, `start_when landed:#<id>` a done
-  one. A done task counts only while it finished within `branch_days`, has a branch head, is not
+  one. An open task that holds or waits for a device or machine lock, or that waits itself (blocked,
+  deferred or on unfinished tasks), is named but never waited on: no fix, no automatic chain, and a
+  continue hop drops the depends_on its predecessor's overlap warning named onto it. A done task counts only while it finished within `branch_days`, has a branch head, is not
   landed (itself or through a review, fix or continuation that carried it), merged or on the push
   branch by patch, and was not shelved, rejected, superseded or cancelled, so a landed wait it names
   can pass. Its worker's prompt lists the eight most recent such branches and says to reuse their

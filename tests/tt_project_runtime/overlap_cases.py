@@ -285,7 +285,8 @@ def test_task_add_chains_a_new_task_on_a_hot_or_settled_file_after_the_newest_op
     t = add("own probe", f"Extend {hot}.", start_when="test -e /tmp/x || false")
     assert deferral(t)["when"] == f"ttp landed --task {prev} && (test -e /tmp/x || false)"
     # An ancestor probe keeps landed.probe_command's rewrite, so a sha the push queue rebased still counts.
-    prev, sha = t["id"], "abcdef1234567"
+    # "own probe" waits on a probe of its own (overlap.exempt): it is passed over for the one before it.
+    sha = "abcdef1234567"
     t = add("rebased sha check", f"Extend {hot} for the queue.", start_when=f"git merge-base --is-ancestor {sha} origin/tt/push")
     assert deferral(t)["when"] == f"ttp landed --task {prev} && ttp landed {sha} --onto origin/tt/push"
     # A combined probe over the start_when limit chains nothing: the caller's own wait stays.
@@ -315,7 +316,7 @@ def test_task_add_chains_a_new_task_on_a_hot_or_settled_file_after_the_newest_op
     p.db.update_task(newest, status="queued")
     settled.add(p, [calm], "one rule", commit=False)
     p.db.update_task(first, spec=f"Change {calm}.")
-    later = p.db.add_task("later", f"Change {calm}.", kind="code", status="blocked")
+    later = p.db.add_task("later", f"Change {calm}.", kind="code", status="queued")
     t = add("settled", f"Extend {calm}.")
     assert deferral(t)["when"] == f"landed:#{later}"
     assert f"{calm} is a settled area" in deferral(t)["why"]
@@ -351,9 +352,9 @@ def test_overlap_chain_never_waits_on_a_task_that_waits_on_the_new_tasks_own_lin
     d = p.db.add_task("D", f"Change {hot}.", kind="code", status="queued")
     fix = add("Fix A third", f"Fix {hot}.", continues=a)
     assert deferral(fix)["when"] == f"landed:#{d}"
-    # A task outside A's lineage still chains after the newest (C waits on A, not on it).
+    # A task outside A's lineage never chains after C or B either: each waits itself (overlap.exempt).
     p.db.x("UPDATE tasks SET status='cancelled' WHERE id IN (?, ?)", (d, fix["id"]))
-    assert deferral(add("other", f"Extend {hot}."))["when"] == f"landed:#{c}"
+    assert not deferral(add("other", f"Extend {hot}."))
 
 
 def test_an_automatic_chain_uses_depends_on_where_no_landing_can_be_checked(env, monkeypatch):
@@ -396,3 +397,85 @@ def test_an_automatic_chain_uses_depends_on_where_no_landing_can_be_checked(env,
     p.set_config("delivery.push_branch", "tt/push")
     t = add("with a push branch", f"Extend {calm}.")
     assert deferral(t)["when"] == f"landed:#{t['id'] - 1}" and dependency_ids(t) == []
+
+
+def test_overlap_never_chains_or_suggests_depends_on_onto_device_or_waiting_tasks(env, monkeypatch):
+    """A delivery sat behind a long device A/B run and a fix that itself waited on another task,
+    because an overlap became depends_on. A new task sharing a hot file with an open task that holds
+    or waits for a device or machine lock, or that is blocked, deferred or waits on unfinished
+    depends_on, gets no depends_on or chain on it: the overlap stays a label and the warning says
+    why. An ordinary open code task is still chained after, as before."""
+    from ttp import coordinator as coord, overlap, reviewcap
+    from ttp.db import deferral, dependency_ids
+    p = make(env)
+    p.set_config("device.locks", ["board0"])
+    hot = "runtime/ttp/progress.py"
+    monkeypatch.setattr(reviewcap, "main_file", lambda p, r: hot)
+
+    def add(title, spec, **kw):
+        assert coord.apply(p, [{"type": "task_add", "title": title, "kind": "code", "spec": spec, **kw}]) == []
+        return p.db.one("SELECT * FROM tasks WHERE title=?", (title,))
+
+    _failed_review(p, p.db.add_task("older", f"Change {hot}.", kind="code", status="done"))
+    ordinary = p.db.add_task("ordinary", f"Change {hot}.", kind="code", status="queued")
+    other = p.db.add_task("unrelated", "Write the notes.", kind="work", status="queued")
+    cases = [("device run", "running", {"labels": ["exclusive:box-device"]}, "holds or waits for box-device"),
+             ("board job", "queued", {"labels": ["resource:board0"]}, "holds or waits for board0"),
+             ("blocked", "blocked", {}, "is blocked"),
+             ("deferred", "queued", {"labels": ["start_when:test -e /tmp/never"]}, "is deferred"),
+             ("waits", "queued", {"depends_on": [other]}, f"waits on #{other}")]
+    for i, (name, status, kw, why) in enumerate(cases):
+        h = p.db.add_task(name, f"Change {hot}.", kind="code", status=status, **kw)
+        t = add(f"new {i}", f"Extend {hot}.")
+        # No landing to check here: an automatic chain would be depends_on.
+        assert dependency_ids(t) == [ordinary] and not deferral(t), (i, t["depends_on"], deferral(t))
+        assert overlap.exempt(p, p.db.task(h)) == why
+        lb = [x for x in json.loads(t["labels"]) if x.startswith("overlap:")]
+        assert lb and f"#{h} (" in lb[0] and lb[0].startswith(f"overlap:{ordinary}:"), lb
+        note = next(n for n in p.db.kv(coord.NOTES_KEY) if n.startswith(f"task_add: #{t['id']} added; overlaps"))
+        assert f"no depends_on on #{h} {why}" in note and f"depends_on [{h}" not in note, note
+        p.db.update_task(t["id"], status="cancelled")
+        p.db.update_task(h, status="cancelled")
+    held = p.db.one("SELECT id FROM tasks WHERE title='device run'")["id"]
+    # With a landing to wait on, the chain is landed:#<ordinary>, never a device task's landing.
+    p.set_config("delivery.landed_probe", "test -e landed/{id}")
+    p.db.update_task(held, status="running")
+    t = add("with a landed probe", f"Extend {hot}.")
+    assert deferral(t)["when"] == f"landed:#{ordinary}" and dependency_ids(t) == []
+
+
+def test_a_continue_hop_drops_overlap_depends_on_onto_device_or_waiting_tasks(env):
+    """A continue hop was queued with depends_on [A, B] copied from its predecessor's overlap
+    warning: A a long device run, B a fix itself waiting on another task. The hop drops edges its
+    predecessor's overlap label names onto such tasks and says so; an overlap-named edge onto an
+    ordinary task and an edge the coordinator set on purpose (not in the label) are carried."""
+    from ttp import coordinator as coord
+    from ttp.db import dependency_ids
+    p = make(env)
+    f = "runtime/ttp/progress.py"
+    later = p.db.add_task("later", "Land the next batch.", kind="work", status="queued")
+    a = p.db.add_task("A/B device run", f"Change {f}.", kind="code", status="running",
+                      labels=["exclusive:box-device"])
+    b = p.db.add_task("tests-only fix", f"Change {f}.", kind="code", status="queued", depends_on=[later])
+    plain = p.db.add_task("plain", f"Change {f}.", kind="code", status="queued")
+    mine = p.db.add_task("explicit", "Prepare the data.", kind="work", status="queued",
+                         labels=["exclusive:box-device"])
+    text = f"overlaps #{plain} ({f}); #{b} ({f}); #{a} ({f}): build on them, not beside them"
+    for status in ("failed", "done"):
+        old = p.db.add_task(f"delivery {status}", "Deliver it.", kind="code", status=status,
+                            depends_on=[a, b, plain, mine], labels=[f"overlap:{plain},{b},{a}:{text}"])
+        title = f"continue: delivery {status}"
+        assert coord.apply(p, [{"type": "task_add", "title": title, "kind": "code", "continues": old,
+                                "spec": "Finish the delivery.", "depends_on": [a, b, plain, mine]}]) == []
+        t = p.db.one("SELECT * FROM tasks WHERE title=?", (title,))
+        assert dependency_ids(t) == [plain, mine], t["depends_on"]
+        note = next(n for n in p.db.kv(coord.NOTES_KEY) if n.startswith(f"task_add: #{t['id']} continues #{old}"))
+        assert f"#{a} (holds or waits for box-device)" in note and f"#{b} (waits on #{later})" in note, note
+        p.db.update_task(t["id"], status="cancelled")
+    # The coordinator's prompt states the exemption.
+    rule = " ".join((RUNTIME.parent / "template" / "prompts" / "coordinator.md").read_text().split())
+    assert "Never make an overlap a depends_on onto a device or machine task or one that waits itself" in rule
+    # A plain task_add (no hop) keeps the depends_on the coordinator gave, device task or not.
+    assert coord.apply(p, [{"type": "task_add", "title": "on purpose", "kind": "code",
+                            "spec": "Finish the delivery.", "depends_on": [a, b]}]) == []
+    assert dependency_ids(p.db.one("SELECT * FROM tasks WHERE title='on purpose'")) == [a, b]

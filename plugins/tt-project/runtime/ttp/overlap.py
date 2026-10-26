@@ -21,7 +21,9 @@ commands (`delivery.push_checks`) name, which specs cite as the required suite. 
 paths. A shared file in a hot area, one a review failed on within reviewcap.AREA_WINDOW_S (its main
 file) with that change not landed, or a settled area's file, is more than a warning: task_add
 chains the new task after the newest open, unlanded task sharing it (chain), unless its spec has a
-`parallel: <why>` line. No network, no model.
+`parallel: <why>` line. An open task that holds or waits for a device or machine (it may run for
+hours) or that waits itself (blocked, deferred, or on unfinished tasks) is exempt (exempt): it stays
+in the warning and label, but no fix or chain waits on it. No network, no model.
 """
 from __future__ import annotations
 
@@ -288,7 +290,71 @@ def find(p, spec: str, skip=()) -> list[dict]:
                 h["paths"][m] = h["paths"].get(m, False) or new
             h.update(branch=b["branch"], head=b["head"])
     _save_seen(p, seen, size)
+    for h in hits.values():
+        if h["open"] and (why := exempt(p, p.db.task(h["id"]))):
+            h["exempt"] = why
     return [{**h, "paths": list(h["paths"].items())} for _, h in sorted(hits.items(), reverse=True)]
+
+
+def exempt(p, task: dict | None, now: float | None = None, _seen: frozenset = frozenset()) -> str:
+    """Why an open task a new one overlaps is never waited on (no depends_on, no chain), '' when it
+    may be: it holds or waits for a device or machine (a `resources` lock the project's device locks,
+    the shared resources or `ttp machines` name, a `-device` lock, or needs_device), so it may run for
+    hours, or it waits itself (blocked, a future start_after, a start_when or unfinished depends_on).
+    A wait that is only its own overlap chain (on tasks its overlap label names, label_ids) counts
+    only when a task it waits on is exempt, so a hot area's tasks still chain in line. A fault
+    reading it is no exemption."""
+    if not task or task["id"] in _seen or len(_seen) > 20:
+        return ""
+    from . import locks, machines, shared
+    from .coordinator import task_resources
+    from .db import deferral
+    from .landed import task_refs
+    try:
+        cfg = p.config()
+        boxes = locks.device_locks(cfg) | shared.names(cfg) | set(machines.load())
+        held = sorted(r for r in task_resources(task) if r in boxes or r.endswith("-device"))
+        if held or "needs_device" in json.loads(task.get("labels") or "[]"):
+            return f"holds or waits for {', '.join(held) or 'a device'}"
+        if task.get("status") == "blocked":
+            return "is blocked"
+        chained, seen = label_ids(task), _seen | {task["id"]}
+
+        def through(ids) -> str:
+            for i in ids:
+                if why := exempt(p, p.db.task(i), now, seen):
+                    return f"waits on #{i}, which {why}"
+            return ""
+        d = deferral(task)
+        if (d.get("after") or 0) > (time.time() if now is None else now):
+            return "is deferred"
+        when = d.get("when") or ""
+        refs = {int(x) for x in task_refs(when) if x.isdigit()}
+        if when and not (refs and refs <= chained and not re.sub(r"(?:ttp landed --task|landed:#)\s*\d+|[\s&()]",
+                                                                 "", when)):
+            return "is deferred"
+        unmet = [i for i in p.db.unmet_dependencies([task])[task["id"]] if i is not None]
+        if own := [i for i in unmet if i not in chained]:
+            return f"waits on {', '.join(f'#{i}' for i in own[:3])}"
+        return through(sorted(refs | set(unmet), reverse=True))
+    except Exception:
+        return ""
+
+
+def label_ids(task: dict | None) -> set[int]:
+    """The task ids a task's overlap label names (the ids its fix named and every #<id> its warning
+    lists): the depends_on its own task_add warning may have suggested."""
+    try:
+        labels = json.loads((task or {}).get("labels") or "[]")
+    except (ValueError, TypeError):
+        return set()
+    out: set[int] = set()
+    for lb in labels if isinstance(labels, list) else []:
+        if isinstance(lb, str) and lb.startswith(LABEL):
+            ids_s, _, text = lb[len(LABEL):].partition(":")
+            out |= {int(x) for x in ids_s.split(",") if x.isdigit()}
+            out |= {int(x) for x in re.findall(r"#(\d+) \(", text)}
+    return out
 
 
 def advice(hits: list[dict], landing: bool = True) -> tuple[list[int], str]:
@@ -296,7 +362,7 @@ def advice(hits: list[dict], landing: bool = True) -> tuple[list[int], str]:
     `start_when landed:#<id>` the most recent done one with a head (its landed probe can pass), only
     with `landing` (landed.can_check: a project with no way to check a landing gets no such wait)."""
     shown = hits[:MAX_TASKS]
-    deps = [h["id"] for h in shown if h.get("open")]
+    deps = [h["id"] for h in shown if h.get("open") and not h.get("exempt")]
     land = next((h["id"] for h in shown if not h.get("open") and h.get("head")), None) if landing else None
     fix = ([f"depends_on [{', '.join(map(str, deps))}]"] if deps else []) + \
         ([f"start_when landed:#{land}"] if land is not None else [])
@@ -315,8 +381,11 @@ def warning(hits: list[dict], landing: bool = True) -> str:
     more = len(hits) - MAX_TASKS
     it = "it" if len(hits) == 1 else "them"
     fix = advice(hits, landing)[1]
+    free = [f"#{h['id']} {h['exempt']}" for h in hits[:MAX_TASKS] if h.get("open") and h.get("exempt")]
+    free_s = f"; no depends_on on {', '.join(free)}: a device or machine task or one that waits " \
+             f"itself stays a label only" if free else ""
     return (f"overlaps {'; '.join(parts)}{f'; +{more} more tasks' if more > 0 else ''}: build on {it}, not "
-            f"beside {it}{f': {fix}' if fix else ''}")
+            f"beside {it}{f': {fix}' if fix else ''}{free_s}")
 
 
 def label(hits: list[dict], chained: int | None = None, landing: bool = True) -> str:
@@ -382,9 +451,9 @@ def chain(p, hits: list[dict], now: float | None = None, lineage: set[int] | Non
     """(id, why) of the newest open, unlanded task in `hits` (find) sharing a settled area's file or a
     hot review area's (hot_files): a new task waits for it to land. None for plain overlaps. A task
     in the new one's `lineage`, or waiting on it (waits_on), is passed over: its work lands only with
-    the new task's, so waiting on it would never end."""
+    the new task's, so waiting on it would never end. An exempt one (exempt) is passed over too."""
     landed = _landed_ids(p.db)
-    shown = [h for h in hits if h.get("open") and h["id"] not in landed
+    shown = [h for h in hits if h.get("open") and h["id"] not in landed and not h.get("exempt")
              and not (lineage and waits_on(p.db, h["id"], lineage, landed))]
     zones = {settled._base(f) for r in settled.live(p, now) for f in r.get("files") or []} if shown else set()
     hot = None

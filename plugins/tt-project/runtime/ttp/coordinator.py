@@ -1464,6 +1464,19 @@ def _overlap_chain(p: Project, clash: list[dict], roots: set[int] = frozenset())
         return None
 
 
+def _exempt_overlap_deps(p: Project, prev: dict | None, deps: list[int]) -> dict[int, str]:
+    """{id: why} of the depends_on a continue hop of `prev` would copy from prev's overlap warning
+    (overlap.label_ids) onto a task no overlap waits on (overlap.exempt): the hop recomputes them, never
+    copies them. An edge prev's overlap label does not name was set on purpose and stays."""
+    if not prev or not deps:
+        return {}
+    try:
+        named = file_overlap.label_ids(prev)
+        return {d: why for d in deps if d in named and (why := file_overlap.exempt(p, p.db.task(d)))}
+    except Exception:
+        return {}
+
+
 def _lineage_tie(p: Project, kind: str, labels: list[str], skip: set) -> tuple[int, str] | None:
     """(id, what it shares) of the newest queued, running or waiting task a new task of `kind` with
     `labels` shares a branch or worktree with (worktree.claims: the branch it carries or rebases, the task it
@@ -1803,6 +1816,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 pin = _task_pin(cfg, a, pin_of(old or followup))
                 labels += _pin_mark(db, a.get("pin_required"), pin, old or followup)
                 clash = _file_overlaps(p, kind, a.get("spec") or "", {old["id"]} if old else set())
+                if dropped := _exempt_overlap_deps(p, old or followup, deps):
+                    deps = [d for d in deps if d not in dropped]
                 why_after = start_why(a, {}, when)
                 roots = {int(a["continues"])} if a.get("continues") is not None else set()
                 roots |= {t["id"] for t in (old, followup, carried and carried[0]) if t}
@@ -1879,6 +1894,10 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     notes.append(f"task_add: #{new_id} added; {as_deps}")
                 if stale:
                     notes.append(f"task_add: #{new_id} added; flagged: {stale}")
+                if dropped:
+                    notes.append(f"task_add: #{new_id} continues #{(old or followup)['id']} without its overlap "
+                                 f"warning's depends_on on " + ", ".join(f"#{d} ({w})" for d, w in dropped.items())
+                                 + ": an overlap never waits on a device or machine task or one that waits itself")
                 if clash:
                     notes.append(f"task_add: #{new_id} added; {file_overlap.warning(clash, landing)}")
                 if tie:
