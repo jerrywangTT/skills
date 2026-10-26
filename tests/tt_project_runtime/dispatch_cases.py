@@ -678,3 +678,122 @@ def test_code_prompt_tells_a_task_in_a_root_that_is_no_git_repo_to_make_its_own_
     assert f"make your own, t{tid} on branch ttp/t{tid}-<topic>" in prompt
     assert f"from #{old}'s branch; never edit in its worktree" in prompt
     assert "No worktree was made" not in worker_task(p, p.db.task(tid), str(p.worktrees / f"t{tid}"), "ttp/x")
+
+
+def _sched_lines(p):
+    from ttp import schedlog
+    f = schedlog.path(p)
+    return [json.loads(x) for x in f.read_text().splitlines()] if f.exists() else []
+
+
+def _sched_held(p, title, **cols):
+    tid = p.db.add_task(title, "s", kind="work", tier="light", origin="user", priority=2)
+    if cols:
+        p.db.x(f"UPDATE tasks SET {', '.join(f'{k}=?' for k in cols)} WHERE id=?", (*cols.values(), tid))
+    return tid
+
+
+def test_a_slot_fill_logs_runnable_tasks_in_rank_order_held_counts_by_reason_and_the_pick(
+        env, monkeypatch, tmp_path, reap_tmp_processes):
+    """One free slot; runnable p1 and p3, one task held by start_when, one by a `ttp lock` on its resource
+    (ranked between the two, so it is reached only after the slot filled): one line, the p1 task picked."""
+    p, d, drain, settle = _slot_setup(env, monkeypatch, tmp_path, slots=1)
+    _board_slots(p, d, 1)
+    flag, marks = tmp_path / "unlock", tmp_path / "marks"
+    holder = None
+    try:
+        holder = _lock(_lock_env(env, p, TTP_TASK="900"), "board", cmd=_mark(marks, "H", flag))
+        assert _until_true(lambda: marks.exists() and "start H" in marks.read_text())
+        p3 = p.db.add_task("routine", "s", kind="work", tier="light", origin="user", priority=3)
+        p1 = p.db.add_task("urgent", "s", kind="work", tier="light", origin="user", priority=1)
+        _sched_held(p, "deferred", labels=json.dumps(["start_when:false"]))
+        locked = _board_add(p, "needs the board", 2)
+        d.dispatch()
+        assert _slot_tasks(p) == [p1]
+        lines = _sched_lines(p)
+        assert len(lines) == 1, lines
+        line = lines[0]
+        assert line["free_slots"] == 1 and line["picked"] == [p1] and line["ts"].endswith("Z")
+        assert line["runnable"] == [{"id": p1, "priority": 1, "owns_obligation": False},
+                                    {"id": p3, "priority": 3, "owns_obligation": False}], (line, locked)
+        assert line["runnable_total"] == 2
+        assert {k: v for k, v in line["held"].items() if v} == {"start_when": 1, "lock": 1}, line
+    finally:
+        flag.touch()
+        if holder:
+            _ended([holder])
+        drain(d)
+        assert reap_tmp_processes(tmp_path) == [], "a stand-in run outlived the test"
+
+
+def test_a_slot_fill_flags_an_obligation_owner_and_lists_it_where_dispatch_ranks_it(
+        env, monkeypatch, tmp_path, reap_tmp_processes):
+    p, d, drain, settle = _slot_setup(env, monkeypatch, tmp_path, slots=1)
+    try:
+        plain = p.db.add_task("urgent", "s", kind="work", tier="light", origin="user", priority=1)
+        owner = p.db.add_task("owes a deliverable", "s", kind="work", tier="light", origin="user", priority=3)
+        _owe(p, owner, time.time() + 3600)
+        d.dispatch()
+        assert _slot_tasks(p) == [owner]
+        line, = _sched_lines(p)
+        assert line["runnable"] == [{"id": owner, "priority": 3, "owns_obligation": True},
+                                    {"id": plain, "priority": 1, "owns_obligation": False}], line
+        assert line["picked"] == [owner]
+    finally:
+        drain(d)
+        assert reap_tmp_processes(tmp_path) == [], "a stand-in run outlived the test"
+
+
+def test_idle_slot_fills_with_nothing_changed_add_no_scheduler_line_even_after_a_restart(env, monkeypatch, tmp_path):
+    from ttp.daemon import Daemon
+    p, d, drain, settle = _slot_setup(env, monkeypatch, tmp_path, slots=1)
+    _sched_held(p, "deferred", labels=json.dumps(["start_when:false"]))
+    _sched_held(p, "later", not_before=time.time() + 3600)
+    for _ in range(3):
+        d.dispatch()
+    assert len(_sched_lines(p)) == 1
+    d2 = Daemon(p.base)   # a restart reads the last line back
+    d2.cfg = d.cfg
+    d2.update_gates()
+    d2.dispatch()
+    assert len(_sched_lines(p)) == 1
+    _sched_held(p, "after it", depends_on=json.dumps([99999]))
+    d2.dispatch()
+    lines = _sched_lines(p)
+    assert len(lines) == 2 and lines[0]["picked"] == lines[1]["picked"] == [] and lines[1]["runnable"] == []
+    assert {k: v for k, v in lines[1]["held"].items() if v} == {"start_when": 1, "start_after": 1, "depends_on": 1}
+
+
+def test_the_scheduler_log_rotates_under_its_cap_and_keeps_one_old_copy(tmp_path, monkeypatch):
+    from ttp import schedlog
+    monkeypatch.setattr(schedlog, "MAX_BYTES", 2000)
+    f, cache, warned = tmp_path / "state" / schedlog.FILE, {}, []
+    for i in range(200):
+        assert schedlog.record(f, schedlog.entry(1, [{"id": i, "priority": 3, "owns_obligation": False}], {}, []),
+                               cache, warned.append)
+        assert f.stat().st_size <= 2000
+    old = f.with_name(schedlog.OLD)
+    assert old.exists() and old.stat().st_size <= 2000 and not warned
+    assert sorted(x.name for x in f.parent.iterdir()) == [schedlog.OLD, schedlog.FILE]
+    assert json.loads(f.read_text().splitlines()[-1])["runnable"][0]["id"] == 199
+
+
+def test_an_unwritable_scheduler_log_never_stops_dispatch_and_is_reported_once(
+        env, monkeypatch, tmp_path, reap_tmp_processes):
+    from ttp import schedlog
+    p, d, drain, settle = _slot_setup(env, monkeypatch, tmp_path, slots=2)
+    blocker = tmp_path / "a-file"
+    blocker.write_text("")
+    monkeypatch.setattr(schedlog, "path", lambda _p: blocker / schedlog.FILE)   # its parent is a file
+    try:
+        a = p.db.add_task("first", "s", kind="work", tier="light", origin="user", priority=1)
+        d.dispatch()
+        assert _slot_tasks(p) == [a]
+        b = p.db.add_task("second", "s", kind="work", tier="light", origin="user", priority=1)
+        d.dispatch()
+        assert _slot_tasks(p) == [a, b]
+        text = (p.logs / "daemon.log").read_text()
+        assert text.count("scheduler log: write to") == 1 and "scheduler log failed" not in text
+    finally:
+        drain(d)
+        assert reap_tmp_processes(tmp_path) == [], "a stand-in run outlived the test"

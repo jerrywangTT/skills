@@ -24,6 +24,10 @@ For people (and agents) changing tt-project itself. Users start with the plugin 
 State is one SQLite file per project (`state/project.db`). Everything a run produces is on disk
 in `state/runs/<id>/`, so a daemon restart never loses a result.
 
+`state/scheduler.jsonl` audits dispatch's picks: each slot fill whose candidates, held counts or pick
+changed adds one line (runnable queued tasks in rank order with priority and obligation flag, held
+counts by reason, the ids started); it rotates to `scheduler.1.jsonl` past 2 MB (`runtime/ttp/schedlog.py`).
+
 Detached checks keep durable reports in `state/check-reports/<id>/` and managed scratch in
 `state/check-runs/<id>/checks-tmp`. Only check subprocesses holding the lifetime guard receive
 that scratch environment; push and batch supervisors, Git commands and `after_push` keep

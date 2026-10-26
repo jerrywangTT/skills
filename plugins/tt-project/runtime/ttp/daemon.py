@@ -38,6 +38,7 @@ from . import anchors
 from . import askrethink
 from . import audit
 from . import replica
+from . import schedlog
 from . import replymsg
 from . import msgparts
 from . import awake
@@ -6027,11 +6028,15 @@ class Daemon:
         live = self._live_claims() if ready else {}
         ctx = {"now": now, "paused": paused, "logged_out": logged_out, "busy": busy, "committed": None, "live": live}
         holds = settinghold.active(db, self.cfg, self.p.root) if ready else {}
+        gate0 = self.gates.get(core)
+        free = max(gate0.max_parallel - busy.get(core, 0), 0) if gate0 and gate0.allow_new_work else 0
+        fate: dict[int, str] = {}   # task id -> a schedlog reason, "full" or "picked" (_log_slot_fill)
         for task in ready:
             if not self.lease_held():   # lapsed during this tick (a slow start or store): start nothing more
                 break
             # Before _start_hold, which may reserve the task's resource.
             if holds and self._setting_hold(task, holds, now):
+                fate[task["id"]] = "hold"
                 continue
             # No run starts without a dollar cap: an unbudgeted run would get no --max-budget-usd and
             # commit nothing toward the dollar caps, so one tick could start several past them. The
@@ -6042,9 +6047,11 @@ class Daemon:
                 db.update_task(task["id"], budget_usd=task["budget_usd"])
             # Before _start_hold: a review whose pre-review checks failed needs no reviewer, nor its gates.
             if task["kind"] == "review" and self._precheck_failed(task):
+                fate[task["id"]] = "other"
                 continue
             provider = task["provider"] or core
             why = self._start_hold(task, provider, ctx, reserve=True)
+            fate[task["id"]] = "full" if why == "gate" and task["id"] in ctx["full"] else SLOT_HELD_BY.get(why, "other")
             if why == "held":
                 if task["id"] in ctx["branch"]:
                     self._note_branch_hold(task, ctx["branch"][task["id"]])
@@ -6094,6 +6101,7 @@ class Daemon:
                 continue
             skipped, gated = self._wake_gate(task)
             if skipped:
+                fate[task["id"]] = "start_after"   # it re-deferred the wake
                 continue
             review_pick = None
             if task["kind"] == "review" and self._reuse_review(task):
@@ -6149,6 +6157,7 @@ class Daemon:
                 self._unreserve(task)
                 continue
             self._start_failures = 0
+            fate[task["id"]] = "picked"
             live[task["id"]] = worktree.claims(self.p, dict(task, branch=branch))   # held from others this tick
             if logged_out[provider]:
                 db.set_kv(f"auth_probe:{provider}", now)   # the one check of the login until the next
@@ -6160,6 +6169,42 @@ class Daemon:
         for task in ready:
             if task["id"] not in reached:
                 self._unreserve(task)
+        if free:
+            try:
+                self._log_slot_fill(free, ready, fate, ctx, core)
+            except Exception:   # the audit log never stops dispatch
+                log(self.p, "scheduler log failed\n" + traceback.format_exc())
+
+    def _log_slot_fill(self, free: int, ready: list[dict], fate: dict[int, str], ctx: dict, core: str) -> None:
+        """One schedlog line for this slot fill: the ready tasks dispatch walked, in its order, that started or
+        were held only by the worker slots this pass filled (re-checked with no slot taken, nothing reserved),
+        held counts by reason for the rest of the queue, and the ids started. A task whose start this pass
+        failed counts as other."""
+        db = self.p.db
+        try:
+            due = obligations.owner_due(db) if ready else {}
+        except Exception:   # unreadable obligations only lose the flag, as in db.ready_tasks
+            due = {}
+        runnable, picked, held = [], [], dict.fromkeys(schedlog.REASONS, 0)
+        for t in ready:
+            why = fate.get(t["id"], "other")
+            if why == "full":
+                why = self._start_hold(t, t["provider"] or core, dict(ctx, busy={}, holds={}, full={}, branch={}))
+                why = "runnable" if why is None else SLOT_HELD_BY.get(why, "other")
+            if why in ("picked", "runnable"):
+                runnable.append({"id": t["id"], "priority": t["priority"], "owns_obligation": t["id"] in due})
+                if why == "picked":
+                    picked.append(t["id"])
+            else:
+                held[why] += 1
+        seen = {t["id"] for t in ready}
+        rest = [r for r in db.q("SELECT * FROM tasks WHERE status='queued'") if r["id"] not in seen]
+        unmet = db.unmet_dependencies(rest) if rest else {}
+        for r in rest:
+            held["start_after" if (r["not_before"] or 0) > ctx["now"] else "start_when" if "when" in deferral(r)
+                 else "depends_on" if unmet.get(r["id"]) else "other"] += 1
+        schedlog.record(schedlog.path(self.p), schedlog.entry(free, runnable, held, picked, ctx["now"]),
+                        self.__dict__.setdefault("_schedlog", {}), lambda msg: log(self.p, msg))
 
     def _live_claims(self) -> dict[int, tuple[set[str], set[str]]]:
         """worktree.claims of each running task, by id."""
@@ -11244,6 +11289,9 @@ RESOURCE_BUSY_NOTE = "its resource stayed busy"   # an exclusive run that lost t
 LOGGED_OUT_NOTE = "held: logged out"
 NET_HELD_NOTE = "held: network,"
 BRANCH_HELD_NOTE = "held: waits for #"   # Daemon._branch_clash: another live task uses its branch or worktree
+# _start_hold's reasons as schedlog reasons (Daemon._log_slot_fill); budget, caps and optional are other.
+SLOT_HELD_BY = {"held": "hold", "paused": "hold", "logged_out": "provider_gate", "net": "provider_gate",
+                "gate": "provider_gate", "device": "lock", "resource": "lock"}
 LOGIN_CHECK_PASSED = "its login check passed"
 ACCOUNT_SWITCH_EVENT = "login_account_changed"   # recorded when a login comes back as another account
 
