@@ -682,7 +682,7 @@ def _shared_branches(p: Project) -> set[str]:
 def claims(p: Project, task: dict) -> tuple[set[str], set[str]]:
     """(branches, worktree paths) a task outside NEVER_OWN_KINDS works on: its recorded branch, the one
     it carries (pr_branch:) or rebases, the branch of the task it continues, and its own and that task's
-    worktree paths (worktrees/t<id>: in a project root that is no git repo the worker makes its worktree
+    worktree paths (once that one ran: a task cancelled before it started has neither) (worktrees/t<id>: in a project root that is no git repo the worker makes its worktree
     itself, and may pick the continued task's). Shared branches (_shared_branches) never count. Empty for
     a review or harness task. No git command: dispatch runs it for every ready task each tick."""
     t = dict(task)
@@ -692,7 +692,7 @@ def claims(p: Project, task: dict) -> tuple[set[str], set[str]]:
     paths = {str(p.worktrees / f"t{t['id']}")}
     from .db import continues_id
     old = p.db.task(cid) if (cid := continues_id(t)) else None
-    if old and old["kind"] not in NEVER_OWN_KINDS:
+    if old and old["kind"] not in NEVER_OWN_KINDS and (old["branch"] or old["attempts"]):   # it ran
         branches.add(old["branch"] or "")
         paths.add(str(p.worktrees / f"t{old['id']}"))
     return branches - _shared_branches(p) - {""}, paths

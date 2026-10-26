@@ -6335,8 +6335,9 @@ def test_a_rebase_task_builds_on_its_own_branch_and_its_review_publishes_back_on
     # A title without "rebase" keeps pr_branch.
     assert coord.apply(p, [{"type": "task_add", "title": "Fix feature/x CI", "kind": "code",
                             "spec": "pr_branch: `feature/x`\nFix it."}]) == []
+    # It shares feature/x with the open rebase: chained to start once that one ends.
     assert json.loads(p.db.one("SELECT labels FROM tasks WHERE title='Fix feature/x CI'")["labels"]) \
-        == ["pr_branch:feature/x"]
+        == ["pr_branch:feature/x", f"waits_end:{t['id']}"]
     # Its review: published back onto feature/x with --own under a lease, review only for the queue.
     code, _, _, (rev,) = _finish_code(env, p, "rebase it", {"r.py": 3}, labels=["rebases:feature/x"])
     own = p.db.task(code)["branch"]
