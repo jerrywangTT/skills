@@ -1033,11 +1033,15 @@ def dispose_probe_stalls(db: DB, cfg: dict, now: float, current_probe: Callable[
         if why := _user_gated(db, t, probe, cfg, asks):
             rec.update(disposition="user-gated-left", why=f"{why}: left for the user, no wake")
         else:
-            refs = [int(n) for n in landed.task_refs(probe) if int(n) != tid]
+            # A ref as written that is no task id ('$T', '0') names a task that is never done.
+            raw = landed.task_refs(probe)
+            good = [int(n) for n in raw if re.fullmatch(r"[0-9]+", n) and int(n) > 0]
+            refs = [n for n in good if n != tid]
             deps = dependency_ids(t)
             named = sorted(set(refs) | {n for n in deps if n is not None and n != tid})
             rows = [db.task(n) for n in named]
-            finished = bool(named) and None not in deps and all(x and x["status"] == "done" for x in rows)
+            finished = (bool(named) and len(good) == len(raw) and None not in deps
+                        and all(x and x["status"] == "done" for x in rows))
             unrun = False
             for n in refs if finished else ():
                 got = run_probe(f"landed:#{n}")

@@ -1126,3 +1126,95 @@ def test_user_gated_probe_stalls_are_left_without_a_recheck_release_or_wake(env)
         t = p.db.task(tid)
         assert deferral(t).get("when") and "your probe has said" not in t["spec"]
         assert "woke" not in json.loads(t["result"] or "{}")
+
+
+def _repointed(p, d, probe, deps=(), now=None):
+    """A stalled deferred task whose start_when was re-pointed to `probe` since its stall was raised:
+    progress.py raises none on a `ttp landed` wait itself (OWN_WAIT_RE), so the sweep meets one so."""
+    from ttp.db import deferral
+    tid = _stalled(p, d, _LIVE_START, deps=deps, now=now)
+    since = deferral(p.db.task(tid)).get("since") or now
+    p.db.update_task(tid, labels=[f"start_when:{probe}", f"deferred_since:{since:.0f}"])
+    return tid
+
+
+def test_a_probe_stall_with_a_task_ref_that_is_no_id_gets_a_disposition_and_the_pass_goes_on(env):
+    """A `ttp landed --task` ref as written that is no task id ('$T', 'abc', '0') names a task that is
+    never done: no re-run, no release, and the stalls sorted after it are still judged."""
+    from ttp.daemon import Daemon
+    from ttp.db import deferral
+    p = make(env)
+    d, now = Daemon(p.base), time.time()
+    dep = _done_task(p)
+    bad = [_repointed(p, d, f"ttp landed --task {ref} && test -e state/out-ready || exit 1", deps=[dep], now=now)
+           for ref in ('"$T"', "abc", "0")]
+    flagged = _stalled(p, d, "grep -q 3f9a1c27b04e state/deployed.txt || exit 1", now=now)
+    got, ran = _dispose(p, d, now, rcs={_LIVE_START: 0})
+    assert got == {**{tid: "listed" for tid in bad}, flagged: "literal-sha-flagged"} and ran == []
+    assert all(deferral(p.db.task(tid)).get("when") for tid in bad)
+
+
+def test_a_probe_stall_on_a_landed_task_ref_rechecks_the_landing_before_releasing(env):
+    """Criterion 1's landed path: the probe waits on `ttp landed --task N` for a done task N. While
+    `landed:#N` says not yet the probe is not re-run and the task stays held; once N landed and the
+    probe still says not yet, the task is released once with the note."""
+    from ttp import sweep
+    from ttp.daemon import Daemon
+    from ttp.db import deferral
+    p = make(env)
+    d, now = Daemon(p.base), time.time()
+    dep = _done_task(p)
+    probe = f"ttp landed --task {dep} && test -e state/out-ready || exit 1"
+    tid = _repointed(p, d, probe, now=now)
+    got, ran = _dispose(p, d, now, rcs={f"landed:#{dep}": 1})
+    assert got == {tid: "listed"} and ran == [f"landed:#{dep}"]
+    assert deferral(p.db.task(tid)).get("when") == probe and "your probe has said" not in p.db.task(tid)["spec"]
+    later = now + sweep.PROBE_STALL_RECHECK_S + 1
+    got, ran = _dispose(p, d, later, rcs={f"landed:#{dep}": 0})
+    t = p.db.task(tid)
+    assert got == {tid: "released-stale"} and ran == [f"landed:#{dep}", probe]
+    assert not deferral(t).get("when") and t["spec"].count("your probe has said not yet") == 1
+    assert f"#{dep} done" in p.db.kv(sweep.PROBE_STALL_KEY)[str(tid)]["why"]
+    assert _dispose(p, d, later + sweep.PROBE_STALL_RECHECK_S + 1, rcs={f"landed:#{dep}": 0}) == ({}, [])
+
+
+def _stalled_waiting(p, d, tmp_path, probe, deps, now, ago=7200):
+    """A task that handed off waiting on `probe` through the daemon's hand-off path (status queued,
+    last result waiting), with its probe stall raised `ago` s back."""
+    from ttp import progress
+    from ttp.daemon import _current_probe
+    from ttp.providers.base import RunUsage
+    tid = p.db.add_task("waits on a file", "s", kind="work", tier="light", origin="user")
+    p.db.update_task(tid, depends_on=json.dumps(list(deps)), status="running")
+    run_dir = tmp_path / f"run-{tid}"
+    run_dir.mkdir()
+    (run_dir / "result.json").write_text(json.dumps({"status": "waiting", "summary": "waits on its output",
+                                                     "retry_after_s": 1800, "retry_when": probe}))
+    d._finish_worker({"task": tid, "note": "{}"}, RunUsage(cost_usd=0.1), "ok", run_dir)
+    t = p.db.task(tid)
+    assert t["status"] == "queued" and json.loads(t["result"])["status"] == "waiting" and t["not_before"] > now
+    for i in range(21):
+        progress.note_probe(p.db, tid, probe, 1, "no such file", now - ago - 3800 + i * 180)
+    progress.check(p.db, p.config(), p.state, now - ago, current_probe=_current_probe)
+    assert f"stall:probe:#{tid}" in progress.load(p.db)["raised"]
+    return tid
+
+
+def test_a_waiting_tasks_probe_stall_lifts_through_probe_passed_or_wakes_once_with_the_note(env, tmp_path):
+    """A waiting hand-off whose retry_when stalled while the task it depends on is done: a pass on the
+    re-run wakes it as a passed probe does (_probe_passed); a not yet wakes it once (_wake_waiting)
+    with the spec note."""
+    from ttp.daemon import Daemon
+    p = make(env)
+    d, now = Daemon(p.base), time.time()
+    dep = _done_task(p)
+    passes = _stalled_waiting(p, d, tmp_path, "test -e state/a-ready || exit 1", [dep], now)
+    stale = _stalled_waiting(p, d, tmp_path, "test -e state/b-ready || exit 1", [dep], now)
+    got, ran = _dispose(p, d, now, rcs={"test -e state/a-ready || exit 1": 0})
+    assert got == {passes: "rechecked-passed", stale: "released-stale"}
+    a, b = p.db.task(passes), p.db.task(stale)
+    assert json.loads(a["result"])["woke"].startswith("probe passed on a probe-stall re-check")
+    assert a["not_before"] <= time.time() and "your probe has said" not in a["spec"]
+    assert json.loads(b["result"])["woke"] == "probe stale: released once by the blocker sweep"
+    assert b["not_before"] <= time.time() and b["spec"].count("your probe has said not yet") == 1
+    assert _dispose(p, d, now + 60) == ({}, [])
