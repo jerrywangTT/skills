@@ -20482,6 +20482,99 @@ def test_passed_checks_record_the_on_pass_hand_off_without_a_model_run(env, monk
     assert len(p.db.q("SELECT id FROM runs WHERE task=?", (tid,))) == 1
 
 
+def _on_pass_reviews(p):
+    return [r["title"] for r in p.db.q("SELECT title FROM tasks WHERE kind='review' ORDER BY id")]
+
+
+def _later_sweeps(p, d, tid):
+    """The review sweeps a done task meets afterwards: its run and record aged past their waits."""
+    old = time.time() - 7200
+    p.db.x("UPDATE runs SET ended=? WHERE task=?", (old, tid))
+    p.db.x("UPDATE tasks SET updated=? WHERE id=?", (old, tid))
+    d._review_swept = d._unreviewed_swept = 0.0
+    d.sweep_reviews()
+    d.sweep_unreviewed(force=True)
+    d.tick()
+
+
+def test_a_code_task_done_through_on_pass_gets_exactly_one_review(env, monkeypatch, tmp_path):
+    """A code task its passed checks record done model-free (on_pass) gets its review from the same
+    step a worker's done hand-off does (_finish_worker -> _auto_review): one 'Review #<id>: <title>',
+    and the later sweeps (in review, unreviewed) and ticks add none."""
+    p = make(env)
+    from ttp import daemon as dmod
+    monkeypatch.setattr(dmod, "PROBE_EVERY_S", 0)
+    d = dmod.Daemon(p.base)
+    tid, _ = _checks_wait_task(p, tmp_path, DONE_ON_PASS)
+    _settle_probe(d, tid)
+    assert p.db.task(tid)["status"] == "done"
+    assert _on_pass_reviews(p) == [f"Review #{tid}: fix the parser"]
+    ev = p.db.one("SELECT text FROM events WHERE kind='task_done' AND task=?", (tid,))
+    assert "queued by the daemon" in ev["text"]
+    _later_sweeps(p, d, tid)
+    assert _on_pass_reviews(p) == [f"Review #{tid}: fix the parser"]
+
+
+def test_an_on_pass_done_code_task_with_a_review_already_open_gets_no_second_one(env, monkeypatch, tmp_path):
+    """A review queued ahead for the task (by the coordinator) is its review: the on_pass finish and
+    the later sweeps queue none beside it."""
+    p = make(env)
+    from ttp import daemon as dmod
+    monkeypatch.setattr(dmod, "PROBE_EVERY_S", 0)
+    d = dmod.Daemon(p.base)
+    tid, _ = _checks_wait_task(p, tmp_path, DONE_ON_PASS)
+    ahead = p.db.add_task(f"Review #{tid}: fix the parser", "spec", kind="review", origin="coordinator",
+                          depends_on=[tid], labels=[f"auto_review:{tid}"])
+    _settle_probe(d, tid)
+    assert p.db.task(tid)["status"] == "done"
+    assert [r["id"] for r in p.db.q("SELECT id FROM tasks WHERE kind='review'")] == [ahead]
+    assert "was already queued" in p.db.one("SELECT text FROM events WHERE kind='task_done' AND task=?",
+                                            (tid,))["text"]
+    _later_sweeps(p, d, tid)
+    assert [r["id"] for r in p.db.q("SELECT id FROM tasks WHERE kind='review'")] == [ahead]
+
+
+def test_an_on_pass_done_code_task_the_direct_review_missed_gets_one_from_the_backstop(env, monkeypatch, tmp_path):
+    """The task is done, never in 'review', so the in-review sweep does not see it; the unreviewed
+    sweep (sweep_unreviewed) does: one review, and none more on its next passes."""
+    p = make(env)
+    from ttp import daemon as dmod
+    monkeypatch.setattr(dmod, "PROBE_EVERY_S", 0)
+    d = dmod.Daemon(p.base)
+    real = dmod.Daemon._auto_review
+    monkeypatch.setattr(dmod.Daemon, "_auto_review", lambda self, *a, **k: None)   # e.g. the review cap
+    tid, _ = _checks_wait_task(p, tmp_path, DONE_ON_PASS)
+    _settle_probe(d, tid)
+    assert p.db.task(tid)["status"] == "done" and _on_pass_reviews(p) == []
+    monkeypatch.setattr(dmod.Daemon, "_auto_review", real)
+    _later_sweeps(p, d, tid)
+    assert _on_pass_reviews(p) == [f"Review #{tid}: fix the parser"]
+    _later_sweeps(p, d, tid)
+    assert _on_pass_reviews(p) == [f"Review #{tid}: fix the parser"]
+
+
+@pytest.mark.parametrize("case", ["not_code", "no_review_step"])
+def test_an_on_pass_done_task_gets_no_review_where_a_hand_off_gets_none(env, monkeypatch, tmp_path, case):
+    """As after a worker's hand-off: a task that is not code, or a project whose delivery has no
+    review step (no review_before_pr, no push branch), gets no review from on_pass or the sweeps."""
+    p = make(env)
+    from ttp import daemon as dmod
+    monkeypatch.setattr(dmod, "PROBE_EVERY_S", 0)
+    if case == "no_review_step":
+        p.set_config("delivery.review_before_pr", False)
+        p.set_config("delivery.push_branch", "")
+    d = dmod.Daemon(p.base)
+    tid, _ = _checks_wait_task(p, tmp_path, DONE_ON_PASS)
+    if case == "not_code":
+        p.db.x("UPDATE tasks SET kind='work' WHERE id=?", (tid,))
+    _settle_probe(d, tid)
+    task = p.db.task(tid)
+    assert task["status"] == "done", (task["status"], task["result"])
+    assert "recorded its on_pass (done) model-free" in (p.logs / "daemon.log").read_text()
+    _later_sweeps(p, d, tid)
+    assert _on_pass_reviews(p) == []
+
+
 @pytest.mark.parametrize("exit_code, writes, status, summary", [
     (1, False, "queued", None),
     (0, False, "done", "parser fixed; checks pass"),
