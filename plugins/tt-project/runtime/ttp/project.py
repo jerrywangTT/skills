@@ -898,6 +898,13 @@ PINNED_MEMORY_KINDS = ("restriction", "preference", "resource")
 # Memory each prompt carries, in characters of whole entries (see Project.memory_select). A worker's
 # charter digest and memory share theirs (see prompts.worker_context); its Restrictions come on top.
 COORDINATOR_MEMORY_CHARS, WORKER_MEMORY_CHARS = 12000, 8000
+# Room the coordinator's newest decisions and facts keep whatever pinned entries take: once pinned
+# entries leave less, it goes on top of the budget (the memory grows by at most this), so neither side
+# is cut for the other (Project.memory_select).
+COORDINATOR_RECENT_MIN_CHARS = 3000
+# `ttp memory` warns, naming the largest pinned entries, once pinned entries take more than this share
+# of COORDINATOR_MEMORY_CHARS (coordinator.coordinator_pinned_total).
+COORDINATOR_PINNED_WARN_SHARE = 2 / 3
 # Memory pinned for workers gets what the charter digest leaves of WORKER_MEMORY_CHARS, never less
 # than this: a long charter neither crowds it out nor is crowded out by it.
 WORKER_PINNED_MIN_CHARS = WORKER_MEMORY_CHARS // 2
@@ -1364,27 +1371,35 @@ class Project:
             used += len(e["line"]) + 1
         return out[::-1]
 
-    def memory_select(self, limit_chars: int = COORDINATOR_MEMORY_CHARS) -> tuple[list[dict], dict]:
+    def memory_select(self, limit_chars: int = COORDINATOR_MEMORY_CHARS,
+                      recent_min: int = COORDINATOR_RECENT_MIN_CHARS) -> tuple[list[dict], dict]:
         """The entries a prompt of `limit_chars` gets, whole: every pinned entry (restrictions,
-        preferences, resources, standing entries, user_corrections) first, then the newest decisions and facts that
-        still fit. Pinned entries are kept even past the budget. Also returns the usage numbers for
-        the digest."""
+        preferences, resources, standing entries, user_corrections) first, then the newest decisions and
+        facts that fit the room pinned entries leave, never less than `recent_min` (capped at
+        `limit_chars`): past the budget that reserve goes on top. One too big for the room left is
+        skipped and older, smaller ones still considered. Pinned entries are kept even past the budget.
+        Also returns the usage numbers for the digest: `recent_left` decisions and facts left out,
+        `crowded` when pinned entries took all but the reserve so that some were."""
         entries = self._memory_entries()
         corrected = {e["name"] for e in self.user_corrections()}
         pin = lambda e: e["kind"] in PINNED_MEMORY_KINDS or e["standing"] or e["name"] in corrected
         pinned = [e for e in entries if pin(e)]
-        used = sum(len(e["line"]) + 1 for e in pinned)
-        rest = []
-        for e in reversed([e for e in entries if not pin(e)]):
-            if used + len(e["line"]) + 1 > limit_chars:
-                break   # whole entries only, and no older one slips in past a gap
-            rest.append(e)
-            used += len(e["line"]) + 1
-        chosen = pinned + rest[::-1]
         pinned_chars = sum(len(e["line"]) + 1 for e in pinned)
+        reserve = max(0, min(recent_min, limit_chars))
+        room = max(limit_chars - pinned_chars, reserve)
+        unpinned = [e for e in entries if not pin(e)]
+        rest, used = [], 0
+        for e in reversed(unpinned):
+            if used + len(e["line"]) + 1 <= room:   # whole entries only; a too-big one is skipped
+                rest.append(e)
+                used += len(e["line"]) + 1
+        chosen = pinned + rest[::-1]
+        left = len(unpinned) - len(rest)
         return chosen, {"entries": len(entries), "shown": len(chosen), "pinned": len(pinned),
                         "chars": sum(len(e["line"]) + 1 for e in entries), "pinned_chars": pinned_chars,
-                        "limit": limit_chars, "pinned_over": pinned_chars > limit_chars}
+                        "limit": limit_chars, "pinned_over": pinned_chars > limit_chars,
+                        "recent_shown": len(rest), "recent_left": left, "recent_room": room, "reserve": reserve,
+                        "crowded": bool(left) and pinned_chars + reserve > limit_chars}
 
     def worker_memory_select(self, limit_chars: int, task: dict | None = None, pinned_limit: int | None = None,
                              restated=None) -> tuple[list[dict], dict]:

@@ -34,7 +34,8 @@ from .db import (PAUSED_RESOURCES_KEY, SEVERITY_RANK, SHARED_SEEN_KEY, TERMINAL_
                  reviewed_ids,
                  task_outcome, without_deferral)
 from .project import rebase_problems, rebase_replace, rebase_replace_mode
-from .project import (CORRECTIONS_HEADER, COORDINATOR_MEMORY_CHARS, PINNED_MEMORY_KINDS, Project, code_tasks_may_push,
+from .project import (CORRECTIONS_HEADER, COORDINATOR_MEMORY_CHARS, COORDINATOR_PINNED_WARN_SHARE,
+                      PINNED_MEMORY_KINDS, Project, code_tasks_may_push,
                       durable_append, own_push, own_push_mode,
                       durable_write, pin_verify_mode, push_queue_number, push_queue_on)
 from .runner import stop_runs
@@ -3500,9 +3501,15 @@ def memory_budget_line(p: Project) -> str:
     work = worker_context(p)[2]
     if work["shown"] >= work["entries"] and coord["shown"] >= coord["entries"]:
         return ""
+    left = coord["recent_left"]
+    why = (f"crowded out by pinned entries ({coord['pinned_chars']} of {coord['limit']} chars; the newest keep "
+           f"{coord['reserve']} chars reserved), merge pinned ones (`memory_add` with `supersedes`)"
+           if coord["crowded"] else "older or too big for the room left")
+    out = (f"; {left} decision/fact entr{'y' if left == 1 else 'ies'} left out of your prompt, {why}; "
+           f"still in memory/ (`ttp memory {p.name} --search <words>`)" if left else "")
     return (f"## Memory over budget: {coord['entries']} entries, {coord['chars']} chars; you see "
             f"{coord['shown']}, workers see {work['shown']} of the {work['entries']} meant for them "
-            f"(pinned restrictions/preferences/resources {coord['pinned_chars']} chars, always shown). Retire "
+            f"(pinned restrictions/preferences/resources {coord['pinned_chars']} chars, always shown){out}. Retire "
             f"stale entries with `memory_forget`, or `supersedes` when a new one replaces them; a (standing) "
             f"entry is only shortened (a standing `memory_add` that supersedes it), never retired for space")
 
@@ -3530,6 +3537,24 @@ def worker_pinned_total(p: Project) -> tuple[str, str]:
     total = (f"pinned worker memory: {use['pinned_chars']} of {use['memory_limit']} chars "
              f"({use['pinned']} entr{'y' if use['pinned'] == 1 else 'ies'})")
     return total, worker_pinned_line(p, use)
+
+
+def coordinator_pinned_total(p: Project, largest: int = 3) -> tuple[str, str]:
+    """For every `ttp memory` write: (the memory pinned for the coordinator against its budget and how
+    many decisions and facts its prompt shows, a warning naming the `largest` pinned entries once they
+    take over COORDINATOR_PINNED_WARN_SHARE of it, else "")."""
+    shown, use = p.memory_select(COORDINATOR_MEMORY_CHARS)
+    total = (f"pinned coordinator memory: {use['pinned_chars']} of {use['limit']} chars "
+             f"({use['recent_shown']} decisions/facts shown"
+             + (f", {use['recent_left']} left out, in memory/" if use["recent_left"] else "") + ")")
+    if use["pinned_chars"] <= use["limit"] * COORDINATOR_PINNED_WARN_SHARE:
+        return total, ""
+    big = sorted(shown[:use["pinned"]], key=lambda e: -len(e["line"]))[:largest]
+    return total, (f"pinned coordinator memory takes {use['pinned_chars']} of {use['limit']} chars (over "
+                   f"{COORDINATOR_PINNED_WARN_SHARE:.0%}), crowding decisions and facts toward their "
+                   f"{use['reserve']}-char reserve; largest pinned: "
+                   + ", ".join(f"{e['name']} ({len(e['line']) + 1} chars)" for e in big)
+                   + "; merge or shorten them (`--supersedes`, same kind, standing kept standing)")
 
 
 MEMORY_PINNED_HALF_KEY = "memory_pinned_half"   # kv: set once pinned memory alone takes over half the coordinator's

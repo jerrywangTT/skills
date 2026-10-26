@@ -977,9 +977,10 @@ def test_a_routine_digest_collapses_unchanged_background_and_keeps_what_decides_
     from ttp import screen as scr
     db = p.db
     scr.mute(db, "watcher:hw", "tray dropped", 24, why="known; handled by the hardware team " + "x" * 300)
-    # Past the coordinator's memory budget, so the memory_budget section is shown.
+    # Past the coordinator's memory budget, so the memory_budget section is shown (a fact too big for
+    # the decisions' reserve is left out).
     _memories(p, [("restriction" if i % 2 else "preference", f"RULE-{i} " + "y" * 1300) for i in range(10)]
-              + [("fact", "OLD-FACT")])
+              + [("fact", "OLD-FACT " + "f" * 3500)])
     coord.pause_resource(p, "box-b", True, reason="firmware", by="user")
     from ttp import settled
     settled.add(p, ["landwait.py"], "narrowed; no more edge-case fixes")
@@ -14755,6 +14756,9 @@ def test_archive_never_retires_worker_memory_cut_from_worker_prompts(env):
     plain = p.add_memory("Routine: the nightly build moved to the large runner.", kind="decision")
     for f in (restated, *pinned, plain):
         f.write_text(re.sub(r"^created: \S+", "created: 2026-01-01", f.read_text(), flags=re.M))
+    # Small notes, older than the large ones, take what room the large ones leave, so the older
+    # entries above stay out of the coordinator's prompt (it skips an entry too big and goes on).
+    small = [p.add_memory(f"S{i:02}", kind="decision") for i in range(60)]
     filler = [p.add_memory(f"Newer note {i}: " + "n" * 900, kind="decision") for i in range(14)]
     p.note_memory_shown([], now=t0 - 30 * day)
     _, mem, use = worker_context(p)
@@ -14762,7 +14766,7 @@ def test_archive_never_retires_worker_memory_cut_from_worker_prompts(env):
     assert use["pinned_dropped"] and use["duplicates"] == 1 and restated.stem in cut and len(cut) > 1, use
     p.note_memory_shown([e["name"] for e in mem], now=t0)
     coordinator = {e["name"] for e in p.memory_select()[0]}
-    assert not cut & coordinator and plain.stem not in coordinator
+    assert not cut & coordinator and plain.stem not in coordinator and small[-1].stem in coordinator
     p.note_memory_shown(list(coordinator), now=t0)
     hidden = p.hidden_memory(7)
     assert not cut & set(hidden) and plain.stem in hidden, hidden
@@ -14849,6 +14853,93 @@ def test_memory_cli_add_prints_the_pinned_worker_total_and_warns_once_it_outgrow
     cli.main(["memory", "demo", "--forget", old[2].stem])
     out = capsys.readouterr()
     assert "pinned worker memory" not in out.out + out.err
+
+
+def test_coordinator_memory_keeps_a_reserve_for_decisions_and_facts_past_pinned_entries(env):
+    """Pinned entries past the coordinator's budget no longer leave it no decisions or facts: the newest
+    get COORDINATOR_RECENT_MIN_CHARS on top, and every pinned entry stays whole."""
+    p = make(env)
+    from ttp import project as proj
+    assert 2500 <= proj.COORDINATOR_RECENT_MIN_CHARS <= 3500 and 0.5 < proj.COORDINATOR_PINNED_WARN_SHARE < 0.8
+    rules = [("restriction", f"RULE-{i:02} " + "r" * 1300) for i in range(10)]
+    _memories(p, rules + [("decision", f"DECISION-{i:02} " + "d" * 400) for i in range(20)])
+    chosen, use = p.memory_select()
+    assert use["pinned_chars"] > proj.COORDINATOR_MEMORY_CHARS and use["pinned"] == 10
+    text = "\n".join(e["line"] for e in chosen)
+    for i in range(10):
+        assert f"RULE-{i:02} " + "r" * 1300 in text, f"pinned RULE-{i:02} was cut"
+    shown = [e["name"] for e in chosen[use["pinned"]:]]
+    assert use["recent_shown"] == len(shown) >= 5 and "DECISION-19 " in text, "no decisions for the coordinator"
+    recent = sum(len(e["line"]) + 1 for e in chosen[use["pinned"]:])
+    assert recent <= proj.COORDINATOR_RECENT_MIN_CHARS and len(text) + 1 <= use["pinned_chars"] + use["reserve"]
+    assert use["recent_left"] == 20 - len(shown) and use["crowded"]
+
+
+def test_coordinator_memory_skips_a_decision_too_big_for_the_room_and_keeps_older_smaller_ones(env):
+    """A decision or fact too big for the room left is skipped, not the end: older, smaller ones still
+    come in, newest first, and the digest says how many were left out and where they are."""
+    p = make(env)
+    from ttp import coordinator as coord
+    _memories(p, [("restriction", "Never push to main.")]
+              + [("fact", f"SMALL-{i:02} " + "s" * 200) for i in range(5)]
+              + [("decision", "HUGE " + "h" * 13000)]
+              + [("decision", f"NEWER-{i:02} " + "n" * 200) for i in range(3)])
+    chosen, use = p.memory_select()
+    text = "\n".join(e["line"] for e in chosen)
+    assert "HUGE " not in text
+    for i in range(5):
+        assert f"SMALL-{i:02} " in text, f"SMALL-{i:02} dropped past the gap"
+    assert use["recent_left"] == 1 and not use["crowded"]
+    names = [e["name"] for e in chosen[use["pinned"]:]]
+    assert names == sorted(names, key=lambda n: [e["name"] for e in p._memory_entries()].index(n))
+    line = coord.memory_budget_line(p)
+    assert "1 decision/fact entry left out of your prompt, older or too big for the room left" in line, line
+    assert "still in memory/" in line and "crowded out" not in line
+
+
+def test_memory_budget_line_says_when_pinned_entries_crowd_out_decisions_and_facts(env):
+    """The digest's memory-over-budget line names the decisions and facts pinned entries crowded out
+    of the coordinator's prompt, and how to make room."""
+    p = make(env)
+    from ttp import coordinator as coord
+    _memories(p, [("restriction", f"RULE-{i:02} " + "r" * 1300) for i in range(10)]
+              + [("fact", f"FACT-{i:02} " + "f" * 400) for i in range(20)])
+    use = p.memory_select()[1]
+    n = use["recent_left"]
+    line = coord.memory_budget_line(p)
+    assert n > 0 and (f"{n} decision/fact entries left out of your prompt, crowded out by pinned entries "
+                      f"({use['pinned_chars']} of {use['limit']} chars; the newest keep {use['reserve']} chars "
+                      f"reserved)") in line, line
+    assert "still in memory/" in line
+    assert "crowded out by pinned entries" in coord.digest(p, {}, [], [])
+
+
+def test_memory_cli_writes_print_the_pinned_coordinator_total_and_warn_naming_the_largest(env, capsys):
+    """Every `ttp memory` write (add, supersede, forget) prints the memory pinned for the coordinator
+    against its budget and how many decisions and facts it shows; past COORDINATOR_PINNED_WARN_SHARE
+    of the budget a warning names the largest pinned entries."""
+    p = make(env)
+    from ttp import cli
+    from ttp.project import COORDINATOR_MEMORY_CHARS
+    cli.main(["memory", "demo", "A plain decision.", "--kind", "decision"])
+    out = capsys.readouterr()
+    use = p.memory_select()[1]
+    assert f"pinned coordinator memory: {use['pinned_chars']} of {COORDINATOR_MEMORY_CHARS} chars (1 decisions/facts shown)" in out.out
+    assert "warning" not in out.err
+    rules = _memories(p, [("restriction", f"RULE-{i:02} " + "r" * (700 + 100 * i)) for i in range(10)])
+    cli.main(["memory", "demo", "RULE-00 and RULE-01 merged. " + "m" * 600, "--kind", "restriction",
+              "--supersedes", rules[0].stem, rules[1].stem])
+    out = capsys.readouterr()
+    use = p.memory_select()[1]
+    assert use["pinned_chars"] > COORDINATOR_MEMORY_CHARS * 2 / 3
+    assert f"pinned coordinator memory: {use['pinned_chars']} of {COORDINATOR_MEMORY_CHARS} chars (" in out.out
+    warn = [x for x in out.err.splitlines() if x.startswith("warning: pinned coordinator memory takes")]
+    assert len(warn) == 1 and f"largest pinned: {rules[9].stem} (" in warn[0], out.err
+    assert rules[8].stem in warn[0] and rules[2].stem not in warn[0]
+    cli.main(["memory", "demo", "--forget", rules[9].stem])
+    out = capsys.readouterr()
+    assert "pinned coordinator memory: " in out.out and "pinned worker memory" not in out.out + out.err
+    assert rules[9].stem not in out.err
 
 
 def test_worker_policies_keep_their_own_room_beside_long_goals_and_large_pinned_memory(env):
