@@ -9204,7 +9204,8 @@ def test_the_coordinator_role_prompt_carries_only_the_rules_of_features_that_are
     # +300: the delivery.rebase_replace / never_force config_set rule and the rebase rule per mode
     # +90: a user pause's end_when or until only signals; it is said to lift only with the user's word
     # +110: the reply/notify length limit (6000 per message, parts, rejected over 24000)
-    assert len(role) <= 33_150, len(role)
+    # +50: memory_add's supersedes keeps the replaced entries' earliest end unless `permanent`; audience default
+    assert len(role) <= 33_200, len(role)
     assert "<!-- ttp:" not in role and "<!-- /ttp:" not in role
     assert role in coord.prompt_parts(p)[0]
     # Rules for features that are off are left out; turning one on brings its rules in.
