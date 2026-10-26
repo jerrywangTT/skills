@@ -11967,6 +11967,13 @@ def test_a_stored_landed_wait_without_a_way_to_check_it_waits_on_the_task_being_
     for t in (plain, chain):
         _settle_deferred(d, t, until=lambda: _ready(p, t))
         assert _ready(p, t) and not _events(p, t, "deferral_probe_broken"), t
+    # A done producer with nothing open to land it is no dead wait here: its end is the wait's end.
+    from ttp import deadwait
+    gone = p.db.add_task("done, never landed", "s", kind="code", status="done")
+    held = p.db.add_task("after that", "s", kind="work", status="queued", labels=[f"start_when:landed:#{gone}"])
+    rows = p.db.q("SELECT * FROM tasks WHERE id=?", (held,))
+    for at in (time.time(), time.time() + 2 * deadwait.GRACE_S):
+        d._dead_landed_waits(rows, at)
     assert not p.db.q("SELECT * FROM events WHERE kind='landed_wait_dead'")
 
 

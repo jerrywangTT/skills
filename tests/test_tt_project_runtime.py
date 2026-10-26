@@ -31318,6 +31318,7 @@ def test_a_landed_wait_with_no_path_to_landing_wakes_the_coordinator_once_and_cl
     one landed_wait_dead event after the grace; a fix that appears clears it, a new dead end raises
     it again."""
     p = make(env)
+    p.set_config("delivery.push_branch", "origin/work")   # landed:#<id> is checkable here
     from ttp import deadwait
     from ttp.daemon import Daemon
     code, branch, _, (rev,) = _finish_code(env, p, "feature", {"app.py": 40})
@@ -31359,6 +31360,7 @@ def test_a_dead_landed_wait_survives_a_daemon_restart_and_broken_probe_verdicts(
     are and raises no second one; a path appearing still clears it. A landed:#X inside a longer
     probe is not judged."""
     p = make(env)
+    p.set_config("delivery.push_branch", "origin/work")   # landed:#<id> is checkable here
     from ttp import deadwait
     from ttp.daemon import Daemon
     code, branch, _, (rev,) = _finish_code(env, p, "feature", {"app.py": 40})
@@ -31400,6 +31402,7 @@ def test_a_landed_wait_on_a_push_queue_landing_is_not_dead_and_agrees_with_ttp_l
     with no landing of any kind still raises it. deadwait and `ttp landed --task` (task_shas) read
     the same saved landings, so they agree on every fixture."""
     p = make(env)
+    p.set_config("delivery.push_branch", "origin/work")   # landed:#<id> is checkable here
     from ttp import deadwait, landed
     from ttp.daemon import Daemon
     dead = lambda x: p.db.q("SELECT * FROM events WHERE kind=? AND task=?", (deadwait.DEAD_EVENT, x))
