@@ -3795,7 +3795,11 @@ def test_tried_ledger_labels_a_landed_task_landed_whatever_its_summary_says_and_
     p = make(env)
     from ttp import timefmt, tried
     db = p.db
-    now = time.time()
+    # The last midday in the project's zone, so 'today' holds every row (up to 2 h back) at any hour.
+    from datetime import datetime, timedelta
+    local = datetime.now(timefmt.tzinfo(p))
+    noon = local.replace(hour=12, minute=0, second=0, microsecond=0)
+    now = (noon if noon <= local else noon - timedelta(days=1)).timestamp()
     said = "Added the guard. 3 tests fail with the runtime change reverted and pass with it."
 
     def done(title, summary, ago, **res):
