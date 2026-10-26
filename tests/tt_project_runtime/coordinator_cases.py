@@ -15452,11 +15452,102 @@ def test_correction_audit_lists_each_correction_of_the_day_with_its_class_fix(en
         {"msg": 10, "ts": now - 60, "why": "phrase 'why didn't'", "fix": "reason", "shown": False}])
     line = (f"corrections from the user or a chat: 3, 1 with a class fix: #8 (phrase 'nobody noticed') class fix "
             f"#{tid}; #9 (open Course check) none; #10 (phrase 'why didn't') none (reason given)")
-    assert correction.audit_line(p.db, now - 86400) == line
+    assert correction.audit_line(p.db, now - 86400) == line   # no repeats: no repeat clause
     assert line in audit.lines(p.db, now)
     p.db.set_kv(correction.KEY, [])
     assert not any("corrections from" in x for x in audit.lines(p.db, now))
 
+
+
+def _said(p, text, days=0.0, direction="in"):
+    mid = p.db.post(direction, text, chat="c1")
+    p.db.x("UPDATE messages SET ts=? WHERE id=?", (time.time() - days * 86400, mid))
+    return mid
+
+
+def test_a_repeated_instruction_is_flagged_with_its_first_message_and_needs_a_class_fix(env):
+    from ttp import correction
+    p = make(env)
+    first = _said(p, "Run the full suite before pushing.", days=2)
+    again = _said(p, "Status? Please, run the full suite before pushing!")
+    flagged = correction.flag(p.db, p.config(), _rows(p, again))
+    assert flagged == {again: f"repeats #{first}"}
+    correction.settle(p.db, {"corrections": flagged}, [], "handled", time.time() - 1)
+    assert f"#{again}" in correction.digest_lines(p.db)[0], "a repeat with no class fix gets the Course check line"
+    for said in ("I already told you to do that", "As I said, many times"):
+        assert correction.phrase(said)
+
+
+def test_short_outbound_and_week_old_sentences_never_count_as_repeats(env):
+    from ttp import correction
+    p = make(env)
+    _said(p, "Yes go ahead.", days=1)
+    _said(p, "check the queue on every box", direction="out", days=1)
+    _said(p, "rebuild the docs after each release", days=8)
+    kept = _said(p, "deploy the web app after each merge", days=6.9)   # inside the week: the control
+    later = [_said(p, "Yes go ahead."), _said(p, "Check the queue on every box."),
+             _said(p, "Rebuild the docs after each release."), _said(p, "Deploy the web app after each merge.")]
+    assert correction.flag(p.db, p.config(), _rows(p, *later)) == {later[-1]: f"repeats #{kept}"}
+    # Outbound messages are never flagged themselves either.
+    out = _said(p, "Rebuild the docs after each release.", direction="out")
+    assert correction.flag(p.db, p.config(), _rows(p, out)) == {}
+
+
+def test_a_near_duplicate_instruction_flags_but_one_sharing_three_words_does_not(env):
+    from ttp import correction
+    p = make(env)
+    first = _said(p, "Always restart the broker service after every update.", days=1)
+    near = _said(p, "always restart the broker daemon after every update")
+    other = _said(p, "Check the broker queue every hour, please.")
+    assert correction.flag(p.db, p.config(), _rows(p, near, other)) == {near: f"repeats #{first}"}
+
+
+def test_the_audit_line_counts_repeated_instructions_and_names_the_top_one(env):
+    from ttp import correction
+    p = make(env)
+    now = time.time()
+    first = _said(p, "Run the full suite before pushing.", days=3)
+    a = _said(p, "run the full suite before pushing please", days=0.5)
+    b = _said(p, "Again: run the full suite before pushing.")
+    other = _said(p, "Write every time in the home time zone.", days=2)
+    c = _said(p, "write every time in the home time zone")
+    p.db.set_kv(correction.KEY, [
+        {"msg": first + 100, "ts": now - 2 * 86400, "why": f"repeats #{other}", "fix": "", "shown": True},  # too old
+        {"msg": a, "ts": now - 3600, "why": f"repeats #{first}", "fix": "", "shown": True},
+        {"msg": c, "ts": now - 1800, "why": f"repeats #{other}", "fix": "reason", "shown": True},
+        {"msg": b, "ts": now - 60, "why": f"repeats #{first}", "fix": "", "shown": False}])
+    line = correction.audit_line(p.db, now - 86400)
+    assert line.endswith(f'; repeated instructions, 24 h: 3 (top: "run the full suite before pushing" x2, '
+                         f"first #{first})"), line
+    p.db.set_kv(correction.KEY, [{"msg": a, "ts": now - 60, "why": "phrase 'you missed'", "fix": "", "shown": True}])
+    assert "repeated instructions" not in correction.audit_line(p.db, now - 86400)
+
+
+def test_repeat_matching_stays_bounded_with_two_thousand_stored_sentences(env):
+    import random
+    from ttp import correction
+    p = make(env)
+    rng = random.Random(7)
+    words = [f"w{i}" for i in range(3000)]
+    for _ in range(400):
+        _said(p, ". ".join(" ".join(rng.sample(words, 8)) for _ in range(5)), days=1)
+    old = p.db.one("SELECT id, text FROM messages WHERE direction='in' ORDER BY id DESC LIMIT 1 OFFSET 399")
+    new = _said(p, "Nothing here matches any stored sentence at all. Another quite unrelated line of words.")
+    rows = _rows(p, new)
+    best = min(_timed(lambda: correction.flag(p.db, p.config(), rows)) for _ in range(3))
+    assert correction.flag(p.db, p.config(), rows) == {}
+    # The oldest stored sentence is still found exactly; near matches scan a bounded window.
+    again = _said(p, old["text"].split(". ")[2])
+    assert correction.flag(p.db, p.config(), _rows(p, again)) == {again: f"repeats #{old['id']}"}
+    assert correction.REPEAT_NEAR <= 400 and correction.REPEAT_ROWS <= 1000
+    print(f"\nrepeat flag with 2000 stored sentences: {best * 1000:.1f} ms")
+    assert best < 0.05, best
+
+
+def _timed(fn):
+    t = time.perf_counter()
+    fn()
+    return time.perf_counter() - t
 
 def test_repeated_reply_waits_stay_routine_while_the_peer_recovers_and_raise_once_it_is_ready(env, monkeypatch):
     p = make(env)

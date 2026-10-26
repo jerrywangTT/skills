@@ -5,7 +5,9 @@ done itself. The coordinator fixes that case and adds a `harness` task for the c
 detector, rule or default that would have caught it), so the next case is not left to the user.
 
 Model-free, no model calls. At a coordinator turn's start the daemon flags each new inbound message
-that is a likely correction (`flag`): one matching a small generic phrase list (PHRASES), or any
+that is a likely correction (`flag`): one matching a small generic phrase list (PHRASES), one
+repeating an earlier instruction (`repeats`: a sentence of REPEAT_WORDS+ words matching an inbound
+sentence of the last REPEAT_S, exactly once normalized or nearly over the last REPEAT_NEAR), or any
 message that arrives while something says the project is stuck (`open_stall`: a stall event or a
 Course check line; a correction still without a class fix is not one, or it would flag every later
 message, and neither is Resource trouble, a machine fault rather than a miss). The digest tags
@@ -13,8 +15,8 @@ the message `[likely correction: <why>]`. After the turn (`settle`), each flagge
 with its class fix: a `harness` task (or one titled `upstream: ...`) the turn added, or the turn's
 `summary` naming `correction #<id>` with its reason. One with neither gets a Course check line in the
 next digest, once (`digest_lines`); a later harness task clears it. The daily review's efficiency
-audit lists each correction of the last 24 h and the task that fixed its class, or none
-(`audit_line`)."""
+audit lists each correction of the last 24 h and the task that fixed its class, or none, and counts
+the repeated instructions (`audit_line`)."""
 from __future__ import annotations
 
 import re
@@ -31,17 +33,75 @@ DAY = 86400
 PHRASES = ("why didn't", "why did nobody", "why did no one", "why hasn't", "why haven't", "why wasn't",
            "keeps failing", "keep failing", "kept failing", "still failing", "stuck for", "you missed",
            "nobody noticed", "no one noticed", "didn't notice", "failed to notice", "failing to notice",
-           "should have noticed", "should have caught", "lack of progress", "no progress")
+           "should have noticed", "should have caught", "lack of progress", "no progress",
+           "i already asked", "i already told", "i told you", "as i said", "many times")
 # Event kinds of a stall detector (no progress on a task or the project). Any such event not yet
 # handled makes the next user message a likely correction.
 STALL_KINDS = ("no_progress", "stall")
 FIX_KINDS = ("harness",)
+# A repeated instruction: a user round trip and a standing rule that did not reach the prompts. A
+# sentence this short ('yes go ahead') repeats by nature; a near match is token-set Jaccard >= REPEAT_J
+# (0.75: one word changed in 8 is 7/9), checked against only the newest REPEAT_NEAR sentences, and at
+# most REPEAT_ROWS messages are read, so a flag costs the same however long the chat is.
+REPEAT_WORDS = 5
+REPEAT_S = 7 * 86400
+REPEAT_J = 0.75
+REPEAT_NEAR = 400
+REPEAT_ROWS = 1000
 
 
 def phrase(text: str) -> str:
     """The first PHRASES entry in `text`, or ''."""
     low = " ".join(str(text or "").lower().replace("’", "'").split())
     return next((x for x in PHRASES if x in low), "")
+
+
+def sentences(text: str) -> list[tuple[str, ...]]:
+    """`text`'s sentences of REPEAT_WORDS+ words, each lowercased to its words only."""
+    out = []
+    for part in re.split(r"[.!?;\n]+", str(text or "").lower().replace("’", "'")):
+        words = tuple(re.findall(r"[a-z0-9]+(?:'[a-z]+)?", part))
+        if len(words) >= REPEAT_WORDS:
+            out.append(words)
+    return out
+
+
+def _near(a: frozenset, b: frozenset) -> bool:
+    return len(a & b) >= REPEAT_J * len(a | b)
+
+
+def repeats(db: DB, msgs: list[dict], now: float | None = None) -> dict[int, tuple[int, str]]:
+    """{message id: (first id, sentence)} for the inbound messages in `msgs` with a sentence an earlier
+    inbound message of the last REPEAT_S already had: the first message that said it, and the
+    sentence as first said."""
+    now = time.time() if now is None else now
+    new = sorted((m for m in msgs if m.get("direction", "in") == "in" and sentences(m.get("text") or "")),
+                 key=lambda m: int(m["id"]))
+    if not new:
+        return {}
+    rows = db.q("SELECT id, text FROM messages WHERE direction='in' AND ts>=? AND id<? ORDER BY id DESC LIMIT ?",
+                (now - REPEAT_S, int(new[-1]["id"]), REPEAT_ROWS))[::-1]
+    first: dict[tuple, tuple[int, str]] = {}   # normalized sentence: (first id, its words)
+    recent: list[tuple[frozenset, tuple]] = []
+    out, i = {}, 0
+    for m in new:
+        mid = int(m["id"])
+        while i < len(rows) and int(rows[i]["id"]) < mid:   # earlier messages only
+            for s in sentences(rows[i]["text"]):
+                if s not in first:
+                    first[s] = (int(rows[i]["id"]), " ".join(s))
+                    recent.append((frozenset(s), s))
+            i += 1
+        recent = recent[-REPEAT_NEAR:]
+        for s in sentences(m.get("text") or ""):
+            hit = first.get(s)
+            if not hit:
+                toks = frozenset(s)
+                hit = next((first[o] for t, o in recent if _near(toks, t)), None)   # oldest first
+            if hit:
+                out[mid] = hit
+                break
+    return out
 
 
 def _records(db: DB) -> list[dict]:
@@ -83,7 +143,7 @@ def open_stall(db: DB, cfg: dict | None, now: float | None = None) -> str:
 def flag(db: DB, cfg: dict | None, msgs: list[dict], now: float | None = None) -> dict[int, str]:
     """{message id: why} for the inbound messages in `msgs` that are likely corrections. Rows without
     a `text` column (the daemon's turn-sizing query) get theirs read here."""
-    out, stall = {}, None
+    out, stall, rep = {}, None, None
     bare = [int(m["id"]) for m in msgs if "text" not in m]
     if bare:
         full = {r["id"]: r for r in db.q(f"SELECT id, direction, text FROM messages WHERE id IN "
@@ -95,6 +155,11 @@ def flag(db: DB, cfg: dict | None, msgs: list[dict], now: float | None = None) -
         hit = phrase(m.get("text") or "")
         if hit:
             out[int(m["id"])] = f"phrase '{hit}'"
+            continue
+        if rep is None:
+            rep = repeats(db, msgs, now)
+        if int(m["id"]) in rep:
+            out[int(m["id"])] = f"repeats #{rep[int(m['id'])][0]}"
             continue
         if stall is None:
             stall = open_stall(db, cfg, now)
@@ -160,7 +225,8 @@ def digest_lines(db: DB, now: float | None = None) -> list[str]:
 
 
 def audit_line(db: DB, since: float) -> str:
-    """The self-efficiency audit's line: each correction since `since` and its class fix; '' with none."""
+    """The self-efficiency audit's line: each correction since `since` and its class fix, and the
+    repeated instructions with the most repeated one; '' with none."""
     got = [r for r in _records(db) if float(r.get("ts") or 0) >= since]
     if not got:
         return ""
@@ -169,4 +235,23 @@ def audit_line(db: DB, since: float) -> str:
         return f"class fix {fix}" if fix.startswith("#") else "none (reason given)" if fix == "reason" else "none"
     return (f"corrections from the user or a chat: {len(got)}, {sum(str(r.get('fix') or '').startswith('#') for r in got)} "
             "with a class fix: " + "; ".join(f"#{r['msg']} ({r.get('why')}) {fixed(r)}" for r in got[:8])
-            + (f"; and {len(got) - 8} more" if len(got) > 8 else ""))
+            + (f"; and {len(got) - 8} more" if len(got) > 8 else "") + _repeat_clause(db, got))
+
+
+def _repeat_clause(db: DB, got: list[dict]) -> str:
+    """'; repeated instructions, 24 h: N (top: "<sentence>" xK, first #id)' for the records in `got`
+    flagged as repeats, or ''."""
+    by: dict[int, int] = {}
+    for r in got:
+        if m := re.fullmatch(r"repeats #(\d+)", str(r.get("why") or "")):
+            by[int(m.group(1))] = by.get(int(m.group(1)), 0) + 1
+    if not by:
+        return ""
+    top, k = max(by.items(), key=lambda x: (x[1], -x[0]))
+    later = [int(r["msg"]) for r in got if r.get("why") == f"repeats #{top}"][-1]
+    text = {r["id"]: r["text"] for r in db.q("SELECT id, text FROM messages WHERE id IN (?,?)", (top, later))}
+    pairs = [(len(set(a) & set(b)) / len(set(a) | set(b)), " ".join(a))
+             for a in sentences(text.get(top, "")) for b in sentences(text.get(later, ""))]
+    said = max(pairs)[1] if pairs else ""   # the sentence as first said
+    return (f"; repeated instructions, 24 h: {sum(by.values())} (top: "
+            + (f'"{said[:60]}" ' if said else "") + f"x{k}, first #{top})")
