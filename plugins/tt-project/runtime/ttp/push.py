@@ -353,7 +353,7 @@ def check_argv(cmd: str, top: str | Path | None = None, env: dict | None = None,
     cmd = remotecheck.exports(exports) + cmd
     bash = shutil.which("bash")
     argv = [bash, "-e", "-o", "pipefail", "-c", cmd] if bash else ["sh", "-e", "-c", cmd]
-    return sandbox.wrap(argv, isolate)
+    return sandbox.wrap(argv, isolate, env)
 
 
 def sandbox_lines(checks: list) -> list[str]:

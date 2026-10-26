@@ -227,3 +227,153 @@ def test_ttp_checks_reports_a_push_check_that_opts_out_of_the_sandbox(env, tmp_p
 def test_the_tool_hook_sees_the_command_inside_ttp_sandbox():
     from ttp import hook
     assert hook._strip_prefix("ttp sandbox -- pytest -q tests".split()) == ["pytest", "-q", "tests"]
+
+
+def _sandbox_with(monkeypatch, tool):
+    """A live sandbox that uses only `tool` (unshare or bwrap); skips where that one does not work."""
+    from ttp import sandbox
+    monkeypatch.setattr(sandbox, "_STATE", {})
+    monkeypatch.setattr(sandbox, "inside", lambda: False)
+    which = shutil.which
+    monkeypatch.setattr(sandbox.shutil, "which",
+                        lambda name, *a, **k: None if name in ("unshare", "bwrap") and name != tool else which(name, *a, **k))
+    pre, why = sandbox.status()
+    if not pre:
+        pytest.skip(f"no {tool} sandbox on this host: {why}")
+    return sandbox
+
+
+def _fake_device_nodes(tmp_path, monkeypatch):
+    """A stand-in for the device nodes: a directory holding a node and a node file, never a real device."""
+    (tmp_path / "devdir").mkdir()
+    (tmp_path / "devdir" / "0").write_text("chip")
+    (tmp_path / "node").write_text("chip")
+    monkeypatch.setenv("TTP_DEVICE_NODES", f"{tmp_path / 'devdir'}:{tmp_path / 'node'}")
+    probe = (f"import os\nprint(os.listdir({str(tmp_path / 'devdir')!r}))\n"
+             f"try:\n    print(open({str(tmp_path / 'node')!r}).read() == 'chip')\n"
+             "except OSError:\n    print(False)\n")
+    return [sys.executable, "-c", probe]
+
+
+@pytest.mark.parametrize("tool", ["unshare", "bwrap"])
+def test_a_no_device_sandbox_hides_the_device_nodes(tool, tmp_path, monkeypatch):
+    sandbox = _sandbox_with(monkeypatch, tool)
+    probe = _fake_device_nodes(tmp_path, monkeypatch)
+    monkeypatch.setenv("TTP_NO_DEVICE", "1")
+    r = subprocess.run(sandbox.wrap(probe), capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.splitlines() == ["[]", "False"]
+    # Outside nothing changed, and the command cannot unmount them again (no CAP_SYS_ADMIN left).
+    assert os.listdir(tmp_path / "devdir") == ["0"] and (tmp_path / "node").read_text() == "chip"
+    r = subprocess.run(sandbox.wrap(["sh", "-c", f"umount {tmp_path / 'devdir'} 2>/dev/null; ls -A {tmp_path / 'devdir'}"]),
+                       capture_output=True, text=True, timeout=60)
+    assert r.stdout == "", r.stdout
+
+
+@pytest.mark.parametrize("value", ["0", None])
+def test_a_sandbox_of_a_run_that_may_use_a_device_keeps_the_nodes(value, tmp_path, monkeypatch):
+    sandbox = _live_sandbox(monkeypatch)
+    probe = _fake_device_nodes(tmp_path, monkeypatch)
+    if value is None:
+        monkeypatch.delenv("TTP_NO_DEVICE", raising=False)
+    else:
+        monkeypatch.setenv("TTP_NO_DEVICE", value)
+    r = subprocess.run(sandbox.wrap(probe), capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.splitlines() == ["['0']", "True"]
+
+
+def test_a_sandbox_nested_in_one_that_left_the_nodes_visible_hides_them(tmp_path, monkeypatch):
+    from ttp import sandbox
+    _fake_device_nodes(tmp_path, monkeypatch)
+    monkeypatch.setattr(sandbox, "inside", lambda: True)
+    monkeypatch.setattr(sandbox, "status", lambda: (["unshare", "--user"], ""))
+    monkeypatch.setenv("TTP_NO_DEVICE", "0")
+    assert sandbox.wrap(["true"]) == ["true"]
+    # A check's own environment decides (push.check_argv passes it), not the caller's.
+    from ttp import push
+    assert "--keep-caps" in push.check_argv("true", env={**os.environ, "TTP_NO_DEVICE": "1"})
+    monkeypatch.setenv("TTP_NO_DEVICE", "1")
+    argv = sandbox.wrap(["true"])
+    assert argv[:2] == ["unshare", "--keep-caps"] and f"--hide={tmp_path / 'devdir'}" in argv
+    (tmp_path / "devdir" / "0").unlink()
+    monkeypatch.setenv("TTP_DEVICE_NODES", str(tmp_path / "devdir"))   # empty: already hidden
+    assert sandbox.wrap(["true"]) == ["true"]
+
+
+def test_sudo_fails_inside_the_sandbox(monkeypatch):
+    if not shutil.which("sudo"):
+        pytest.skip("no sudo on this host")
+    sandbox = _live_sandbox(monkeypatch)
+    r = subprocess.run(sandbox.wrap(["sudo", "-n", "true"]), capture_output=True, text=True, timeout=60)
+    assert r.returncode != 0, r.stderr
+
+
+def _device_hook(monkeypatch, tmp_path, device_host=True, works=True, no_device="1"):
+    from ttp import hook, machines, sandbox
+    monkeypatch.setenv("TTP_RUN_DIR", str(tmp_path))
+    monkeypatch.delenv("TTP_PROJECT", raising=False)
+    if no_device is None:
+        monkeypatch.delenv("TTP_NO_DEVICE", raising=False)
+    else:
+        monkeypatch.setenv("TTP_NO_DEVICE", no_device)
+    monkeypatch.setattr(machines, "device_host", lambda known=None: device_host)
+    monkeypatch.setattr(sandbox, "status", lambda: (["unshare"], "") if works else (None, "no unshare"))
+
+    def call(cmd):
+        out, _ = hook.pre_tool_use({"tool_name": "Bash", "tool_input": {"command": cmd}, "cwd": str(tmp_path)})
+        return out
+    return call
+
+
+@pytest.mark.parametrize("cmd, shown", [
+    ("pytest -q tests/x.py", "ttp clip -- ttp sandbox -- pytest -q tests/x.py"),
+    ("python3 -m pytest -k 'a and b'", "ttp clip -- ttp sandbox -- python3 -m pytest -k 'a and b'"),
+    ("ttp clip -- python -m pytest", "ttp clip -- ttp sandbox -- python -m pytest"),
+    ("PYTHONPATH=$PWD timeout 600 ctest --test-dir build", "PYTHONPATH=$PWD timeout 600 ttp clip -- ttp sandbox -- ctest"),
+    ("cd x && ttp detach t -- pytest", "ttp detach t -- ttp sandbox -- pytest"),
+    ("ttp sandbox -- true; pytest", "ttp clip -- ttp sandbox -- pytest"),
+    ("bash -lc 'pytest -q'", "ttp clip -- ttp sandbox -- pytest -q"),
+    ("ttp lock build -- pytest", "ttp lock build -- ttp sandbox -- pytest"),
+])
+def test_the_hook_refuses_a_no_device_test_run_outside_the_sandbox_on_a_device_host(cmd, shown, tmp_path, monkeypatch):
+    out = _device_hook(monkeypatch, tmp_path)(cmd)
+    why = out["hookSpecificOutput"]["permissionDecisionReason"]
+    assert out["hookSpecificOutput"]["permissionDecision"] == "deny" and "TTP_NO_DEVICE=1" in why
+    assert shown in why, why
+
+
+@pytest.mark.parametrize("cmd", ["TTP_NO_DEVICE=0 ttp clip -- ttp sandbox -- pytest",
+                                 "env -i PATH=$PATH ttp sandbox -- pytest", "unset TTP_NO_DEVICE; ttp sandbox -- pytest",
+                                 "env -u TTP_NO_DEVICE ttp sandbox -- ctest"])
+def test_the_hook_refuses_a_sandboxed_test_run_that_drops_ttp_no_device(cmd, tmp_path, monkeypatch):
+    out = _device_hook(monkeypatch, tmp_path)(cmd)
+    assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert "leave TTP_NO_DEVICE" in out["hookSpecificOutput"]["permissionDecisionReason"]
+
+
+@pytest.mark.parametrize("cmd", [
+    "ttp clip -- ttp sandbox -- python3 -m pytest -q tests/x.py",
+    "ttp sandbox -- ctest",
+    "ttp sandbox -- bash -c 'pytest'",
+    "TTP_NO_DEVICE=1 ttp sandbox -- pytest",
+    "ttp lock box-device -- pytest -q",
+    "ttp devq submit box --id a -- pytest -q",
+    "git status; ls",
+    "grep -n pytest notes.txt",
+])
+def test_the_hook_allows_sandboxed_device_and_non_test_runs(cmd, tmp_path, monkeypatch):
+    assert _device_hook(monkeypatch, tmp_path)(cmd) is None
+
+
+@pytest.mark.parametrize("kw", [{"no_device": "0"}, {"no_device": None}, {"device_host": False}])
+def test_the_hook_allows_test_runs_of_device_runs_and_on_other_hosts(kw, tmp_path, monkeypatch):
+    assert _device_hook(monkeypatch, tmp_path, **kw)("pytest -q") is None
+
+
+def test_the_hook_gives_one_notice_where_no_sandbox_works(tmp_path, monkeypatch):
+    call = _device_hook(monkeypatch, tmp_path, works=False)
+    out = call("pytest -q")
+    assert "permissionDecision" not in out["hookSpecificOutput"]
+    assert "no process sandbox works here (no unshare)" in out["hookSpecificOutput"]["additionalContext"]
+    assert call("pytest -q") is None

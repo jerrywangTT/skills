@@ -1429,6 +1429,21 @@ def test_the_no_device_pytest_plugin_deselects_device_tests_only_under_ttp_no_de
         assert {ln.split("::")[1] for ln in r.stdout.splitlines() if "::" in ln} == {"test_cpu"}, r.stdout
 
 
+def test_the_no_device_pytest_plugin_deselects_hardware_markers_by_default(tmp_path):
+    import subprocess
+    import shutil
+    shutil.copy(SKILLS / "tt-project-harness" / "ttp_no_device.py", tmp_path / "ttp_no_device.py")
+    (tmp_path / "conftest.py").write_text('pytest_plugins = ["ttp_no_device"]\n')
+    (tmp_path / "test_x.py").write_text(
+        "import pytest\n\ndef test_cpu():\n    pass\n\n@pytest.mark.requires_hardware\ndef test_hw():\n    pass\n\n"
+        "@pytest.mark.device\ndef test_dev():\n    pass\n\n@pytest.mark.silicon\ndef test_si():\n    pass\n")
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("TTP_", "PYTEST_"))}
+    for no_device, expect in (("1", {"test_cpu"}), ("0", {"test_cpu", "test_hw", "test_dev", "test_si"})):
+        r = subprocess.run([sys.executable, "-m", "pytest", "-p", "no:cacheprovider", "--collect-only", "-q"],
+                           cwd=tmp_path, env={**env, "TTP_NO_DEVICE": no_device}, capture_output=True, text=True)
+        assert {ln.split("::")[1] for ln in r.stdout.splitlines() if "::" in ln} == expect, r.stdout + r.stderr
+
+
 def test_worker_prompt_detached_driver_retries_transient_faults():
     text = (PLUGIN / "template/prompts/worker.md").read_text()
     assert "Retry transient faults" in text

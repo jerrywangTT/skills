@@ -8,7 +8,8 @@ Outside a tt-project run, or with `TTP_NO_DEVICE` unset or `0`, it does nothing.
 A test opens a device when it uses a device fixture (directly or through another fixture) or carries
 a device marker. Both lists are configurable, as globs:
 - ini `ttp_device_fixtures` / env `TTP_DEVICE_FIXTURES` (comma-separated); default `*device`.
-- ini `ttp_device_markers` / env `TTP_DEVICE_MARKERS` (comma-separated); default none.
+- ini `ttp_device_markers` / env `TTP_DEVICE_MARKERS` (comma-separated); default `*hardware*`,
+  `*device*`, `silicon` (so `requires_hardware` or `device` deselect with no ini setting).
 The environment wins over the ini file. Deselected tests are counted in the summary; a selection
 left empty exits 5 (no tests ran), which says the requested tests need a device.
 """
@@ -18,13 +19,14 @@ import fnmatch
 import os
 
 DEFAULT_FIXTURES = ["*device"]
+DEFAULT_MARKERS = ["*hardware*", "*device*", "silicon"]
 
 
 def pytest_addoption(parser):
     parser.addini("ttp_device_fixtures", "Fixture name globs that open a device (ttp_no_device).",
                   type="linelist", default=list(DEFAULT_FIXTURES))
     parser.addini("ttp_device_markers", "Marker name globs of tests that open a device (ttp_no_device).",
-                  type="linelist", default=[])
+                  type="linelist", default=list(DEFAULT_MARKERS))
 
 
 def _active() -> bool:

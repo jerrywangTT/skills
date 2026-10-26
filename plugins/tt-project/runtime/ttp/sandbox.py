@@ -6,7 +6,15 @@ tree: a kill, pkill or os.kill aimed at any other pid on the host reaches nothin
 it started ends with it. Network, files, environment, working directory and exit code stay as they
 are. It needs unprivileged user namespaces and util-linux `unshare` or bubblewrap `bwrap`; where
 neither works (a sysctl or AppArmor setting, a missing tool, not Linux) commands run as before and
-`notice` says why, once per run. A command already in a sandbox runs as it is."""
+`notice` says why, once per run. A command already in a sandbox runs as it is.
+
+Under `TTP_NO_DEVICE=1` (a run that holds no device) the device driver's nodes
+(machines.device_nodes()) are hidden too: an empty tmpfs over each that exists (bwrap --tmpfs; under
+unshare, sandbox_init mounts it in the namespace's own mounts and then drops the capabilities), so a
+raw open, or reset code that ignores TT_VISIBLE_DEVICES, finds no device. A sandbox nested in one
+that left them visible hides them itself. sudo fails inside either way (host root is not mapped).
+Accepted gap: a power command sent over the network to a board management controller needs neither
+a device node nor sudo, and nothing here stops it."""
 from __future__ import annotations
 
 import os
@@ -97,12 +105,41 @@ def inside() -> bool:
     return False
 
 
-def wrap(argv: list[str], on: bool = True) -> list[str]:
-    """`argv` run in a sandbox where one works and `on`; as it is otherwise or when already in one."""
-    if not on or inside():
+def device_nodes(env: dict | None = None) -> list[str]:
+    """The device nodes a command started with `env` (default this process's) must not see: those
+    that exist, under TTP_NO_DEVICE=1."""
+    if (os.environ if env is None else env).get("TTP_NO_DEVICE", "").strip() != "1":
+        return []
+    from .machines import device_nodes as nodes
+    return [p for p in nodes() if os.path.lexists(p)]
+
+
+def _visible(paths: list[str]) -> bool:
+    """Any of `paths` still shows something: a node, or a directory that is not empty."""
+    for p in paths:
+        try:
+            if not os.path.isdir(p) or os.listdir(p):
+                return True
+        except OSError:
+            return True
+    return False
+
+
+def wrap(argv: list[str], on: bool = True, env: dict | None = None) -> list[str]:
+    """`argv` run in a sandbox where one works and `on`; as it is otherwise or when already in one
+    that hides what this run must not see. `env` is the command's environment (default this process's)."""
+    hide = device_nodes(env) if on else []
+    if not on or (inside() and not _visible(hide)):
         return list(argv)
     pre, _ = status()
-    return [*pre, *_init(), *argv] if pre else list(argv)
+    if not pre:
+        return list(argv)
+    if not hide:
+        return [*pre, *_init(), *argv]
+    if os.path.basename(pre[0]) == "bwrap":
+        mounts = [w for p in hide for w in (["--tmpfs", p] if os.path.isdir(p) else ["--ro-bind", "/dev/null", p])]
+        return [*pre, *mounts, *_init(), *argv]
+    return [pre[0], "--keep-caps", *pre[1:], *_init(), *[f"--hide={p}" for p in hide], *argv]
 
 
 def notice(on: bool = True) -> str:
@@ -113,7 +150,10 @@ def notice(on: bool = True) -> str:
     if inside():
         return ""
     pre, why = status()
-    return "" if pre else f"no process sandbox: {why}. Commands run unisolated and can see and signal other processes"
+    if pre:
+        return ""
+    devices = " and open the device nodes" if device_nodes() else ""
+    return f"no process sandbox: {why}. Commands run unisolated and can see and signal other processes{devices}"
 
 
 def run(argv: list[str]) -> int:

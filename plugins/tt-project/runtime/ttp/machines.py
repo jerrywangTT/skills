@@ -45,6 +45,8 @@ DIGEST_MACHINES = 20        # machines the digest lists at most
 TROUBLE_AT = 2              # failures in 24 h that put a resource in trouble
 WAITS_AT = 6                # or this many waits on it (it may be down, not busy)
 BAD_RUNS = ("failed", "lost", "timeout", "stalled")
+# The device driver's nodes: `ttp sandbox` hides them from a run that holds no device (sandbox.py).
+DEVICE_NODES = ("/dev/tenstorrent",)
 
 
 def path() -> Path:
@@ -481,6 +483,14 @@ def device_host(known: dict[str, dict] | None = None) -> bool:
     """Whether this machine's entry is tagged `device`."""
     hit = here(known)
     return bool(hit) and "device" in tag_list(hit[1].get("tags"))
+
+
+def device_nodes() -> list[str]:
+    """DEVICE_NODES, or the paths in env TTP_DEVICE_NODES (separated by `:` or `,`; tests use it)."""
+    raw = os.environ.get("TTP_DEVICE_NODES")
+    if raw is None:
+        return list(DEVICE_NODES)
+    return [p for p in re.split(r"[:,]", raw) if p.strip()]
 
 
 def mask_devices(env: dict, known: dict[str, dict] | None = None) -> dict:

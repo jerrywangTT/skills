@@ -39,6 +39,10 @@ A Bash call that would print more than WIDE_READ_LINES lines of one file (sed -n
 cat of a large file) gets a reminder to grep first and read narrow ranges, as added context; it is
 never denied (wide_read). `ttp stats --tools` shows how much of the runs' tool output is file reads.
 
+A run that holds no device (TTP_NO_DEVICE=1) on a machine tagged `device` is refused pytest and ctest
+runs outside `ttp sandbox`, which hides the device nodes; a device `ttp lock` or `ttp devq` passes,
+and where no sandbox works it gets one notice instead (device_test_run).
+
 Otherwise it fails open: any error prints nothing, and the run goes on unchanged.
 """
 from __future__ import annotations
@@ -48,6 +52,7 @@ import json
 import os
 import posixpath
 import re
+import shlex
 import sys
 from pathlib import Path
 from typing import Callable
@@ -414,7 +419,9 @@ def _segments(cmd: str, strip: bool = True) -> list[list[str]]:
     return [s for s in out if s]
 
 
-def _strip_prefix(argv: list[str]) -> list[str]:
+def _strip_prefix(argv: list[str], ttp_wrappers: list[list[str]] | None = None) -> list[str]:
+    """`argv` without its wrappers; each `ttp lock|clip|detach|sandbox ... --` stripped is added to
+    `ttp_wrappers` when given."""
     i = 0
     while i < len(argv):
         w = argv[i]
@@ -424,7 +431,10 @@ def _strip_prefix(argv: list[str]) -> list[str]:
                 or os.path.basename(w) in WRAPPERS or w in RESERVED:
             i += 1
         elif w == "ttp" and argv[i + 1:i + 2] in (["lock"], ["clip"], ["detach"], ["sandbox"]) and "--" in argv[i:]:
-            i = argv.index("--", i) + 1
+            end = argv.index("--", i)
+            if ttp_wrappers is not None:
+                ttp_wrappers.append(argv[i + 1:end])
+            i = end + 1
         else:
             break
     return argv[i:]
@@ -537,8 +547,11 @@ def pre_tool_use(payload: dict) -> tuple[dict | None, None]:
         _log_bypass(cmd)
     if not why:
         why = full_suite(cmd, segments, str(payload.get("cwd") or os.getcwd()))
+    hint = None
     if not why:
-        hint = wide_read(commands, str(payload.get("cwd") or os.getcwd()))
+        why, hint = device_test_run(commands)
+    if not why:
+        hint = "\n\n".join(h for h in (hint, wide_read(commands, str(payload.get("cwd") or os.getcwd()))) if h)
         return ({"hookSpecificOutput": {"hookEventName": "PreToolUse", "additionalContext": hint}}
                 if hint else None), None
     return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
@@ -894,6 +907,95 @@ def _log_refusal(cmd: str, check: str) -> None:
                                 "command": cmd[:500]}) + "\n")
     except OSError:
         pass
+
+
+DEVICE_NOTICE_FILE = "device-sandbox.notice"   # in the run dir: the no-sandbox notice was given
+SAFE_WORD_RE = re.compile(r"[\w@%+=:,./$~-]+")
+
+
+def _device_lock(words: list[str]) -> bool:
+    """`ttp lock <resource>[,...] ...` takes a device lock (ends in `-device`, or config device.locks)."""
+    res = next((w for w in words[1:] if not w.startswith("-")), "")
+    names = [n for n in res.split(",") if n]
+    if any(n.endswith("-device") for n in names):
+        return True
+    try:
+        from .locks import device_locks
+        from .project import Project
+        p = Project(os.environ["TTP_PROJECT"])
+        return bool(set(names) & device_locks(p.config()))
+    except Exception:
+        return False
+
+
+def _unsandboxed_test(commands: str, kept: bool, depth: int = 0) -> tuple[list[str], int, bool] | None:
+    """(the simple command, where its test command starts, whether a ttp wrapper is before it) for
+    the first pytest or ctest run in `commands` (or in a `sh -c` string there) that neither `ttp
+    sandbox` (when `kept`: the command keeps TTP_NO_DEVICE, which tells it to hide the devices) nor a
+    sanctioned way to a device (a device `ttp lock`, `ttp devq`) wraps; None when there is none."""
+    for raw in _segments(commands, strip=False):
+        wrappers: list[list[str]] = []
+        argv = _strip_prefix(raw, wrappers)
+        if not argv or any((w[:1] == ["sandbox"] and kept) or (w[:1] == ["lock"] and _device_lock(w))
+                           for w in wrappers):
+            continue
+        name = os.path.basename(argv[0])
+        if _pytest_args(argv) is not None or name == "ctest":
+            return raw, len(raw) - len(argv), bool(wrappers)
+        if name in SHELLS and depth < 3:
+            inner = next((argv[i + 1] for i, a in enumerate(argv[1:-1], 1) if re.fullmatch(r"-[a-z]*c[a-z]*", a)), None)
+            if inner and (hit := _unsandboxed_test(inner, kept, depth + 1)):
+                return hit
+    return None
+
+
+# A command that changes or drops TTP_NO_DEVICE (`TTP_NO_DEVICE=0`, `unset`, `env -u`, `env -i`):
+# a `ttp sandbox` in it may not hide the devices.
+NO_DEVICE_CHANGE_RE = re.compile(r"TTP_NO_DEVICE(?![\w=])|TTP_NO_DEVICE=(?![\"']?1\b)|"
+                                 r"\benv\s+(?:-\w*i\b|--ignore-environment\b|-\s)")
+
+
+def device_test_run(commands: str) -> tuple[str | None, str | None]:
+    """(why the call is refused, a notice) for a test run outside `ttp sandbox` by a run that holds no
+    device (TTP_NO_DEVICE=1) on a machine tagged `device`. TT_VISIBLE_DEVICES only asks: a raw open
+    or reset code still reaches the devices, while `ttp sandbox` hides their nodes. Where no sandbox
+    works the call goes on with one notice per run. It guards against accidents, not a determined
+    bypass, and only refuses new calls; it never signals a running process."""
+    if os.environ.get("TTP_NO_DEVICE", "").strip() != "1":
+        return None, None
+    hit = _unsandboxed_test(commands, not NO_DEVICE_CHANGE_RE.search(commands))
+    if not hit:
+        return None, None
+    from . import machines, sandbox
+    try:
+        if not machines.device_host():
+            return None, None
+    except Exception:
+        return None, None
+    pre, why = sandbox.status()
+    if pre:
+        raw, k, wrapped = hit
+        lead = "this run holds no device (TTP_NO_DEVICE=1) on a device host"
+        tail = "Tests that need a device go through the device broker, `ttp lock <device> --` or `ttp devq`"
+        if "sandbox" in raw[:k] or NO_DEVICE_CHANGE_RE.search(commands):
+            return (f"{lead}, and `ttp sandbox` hides the device nodes only while TTP_NO_DEVICE=1 reaches it: "
+                    f"leave TTP_NO_DEVICE and the environment as they are (no `TTP_NO_DEVICE=`, `unset`, "
+                    f"`env -u` or `env -i`). {tail}"), None
+        words = [*raw[:k], *([] if wrapped else ["ttp", "clip", "--"]), "ttp", "sandbox", "--", *raw[k:]]
+        cmd = " ".join(w if SAFE_WORD_RE.fullmatch(w) else shlex.quote(w) for w in words)
+        return (f"{lead}, and a test run outside `ttp sandbox` can still open or reset the devices "
+                f"(TT_VISIBLE_DEVICES only asks). Run it as `{cmd}`: the sandbox hides the device nodes. "
+                f"{tail}"), None
+    mark = Path(os.environ["TTP_RUN_DIR"]) / DEVICE_NOTICE_FILE
+    if mark.exists():
+        return None, None
+    try:
+        mark.write_text(why + "\n")
+    except OSError:
+        pass
+    return None, (f"tt-project: this run holds no device (TTP_NO_DEVICE=1) on a device host, but no process "
+                  f"sandbox works here ({why}), so test runs can open the device nodes. Open a device only "
+                  f"through the device broker, `ttp lock <device> --` or `ttp devq`")
 
 
 HANDLERS = {"PostToolUse": post_tool_use, "PreToolUse": pre_tool_use}

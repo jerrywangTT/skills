@@ -154,10 +154,14 @@ read the one for the lever you change.
 - For a pytest repo whose tests open a device through fixtures, ship `ttp_no_device.py` from this
   skill's folder: copy it next to the repo's root `conftest.py` and add
   `pytest_plugins = ["ttp_no_device"]`. Under `TTP_NO_DEVICE=1` it deselects tests that use a device
-  fixture (globs, default `*device`) or marker (none by default). Set the lists per repo with the
-  `ttp_device_fixtures` / `ttp_device_markers` ini keys or the `TTP_DEVICE_FIXTURES` /
+  fixture (globs, default `*device`) or marker (default `*hardware*`, `*device*`, `silicon`). Set
+  the lists per repo with the `ttp_device_fixtures` / `ttp_device_markers` ini keys or the `TTP_DEVICE_FIXTURES` /
   `TTP_DEVICE_MARKERS` variables (comma-separated).
 - Do not rely on `-m 'not device'` alone: a marker the repo does not define deselects nothing.
+- `TT_VISIBLE_DEVICES` only asks: a raw open or reset code still reaches the device. Under
+  `TTP_NO_DEVICE=1`, `ttp sandbox` also hides the device nodes (an empty tmpfs over
+  `/dev/tenstorrent`), and on a host tagged `device` the worker hook refuses pytest and ctest runs
+  outside it. A power command sent over the network to a board management controller is not stopped.
 
 ## Test runs never reach other processes
 
