@@ -605,11 +605,21 @@ def _command(title: str, body: str, url: str | None, severity: str = "high") -> 
     return sys.platform, None, f"no desktop notification backend on {sys.platform}"
 
 
+PREVIEW = 240   # chars of a message a desktop notification shows
+MORE = " (full text in the chat and web)"
+
+
+def preview(body: str) -> str:
+    """`body` on one line, cut to PREVIEW with a pointer to the full text when it is longer."""
+    full = " ".join(str(body or "").split())
+    return full if len(full) <= PREVIEW else headline.clip(full, PREVIEW - len(MORE)) + MORE
+
+
 def show(title: str, body: str, url: str | None = None, severity: str = "high") -> dict:
     """Show one notification. Returns and records (DELIVERY) {backend, ok, confirmed, error, ts}; a
     failure (non-zero exit, timeout, no backend) also goes to the notifier log. `confirmed`: the backend
     says it was shown; on macOS exit 0 only means it was handed over, a blocked app shows nothing."""
-    body = headline.clip(body, 240)
+    body = preview(body)
     backend, args, why = _command(title, body, url, severity)
     res = {"backend": backend, "ok": False, "confirmed": False, "error": why, "ts": time.time()}
     if args:

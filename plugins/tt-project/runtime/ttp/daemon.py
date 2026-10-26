@@ -39,6 +39,7 @@ from . import askrethink
 from . import audit
 from . import replica
 from . import replymsg
+from . import msgparts
 from . import awake
 from . import budget as bud
 from . import budgetkind
@@ -3922,7 +3923,8 @@ class Daemon:
             if need and need not in summary:
                 text += f"\nNeeds from you: {need}"
             chat = None if task["reply_chat"] == "all" else task["reply_chat"]
-            db.post("out", text[:6000], chat=chat, kind="reply", severity="normal")
+            msgparts.post(db, msgparts.cut(text, f"task #{task['id']}'s hand-off (`ttp task {self.p.name} show {task['id']}`)"),
+                          chat=chat, kind="reply", severity="normal")
         sev = "high" if new == "blocked" else "normal"
         fups = result.get("followups") if isinstance(result, dict) else None
         fups = [f for f in fups if isinstance(f, dict) and f.get("title")] if isinstance(fups, list) else []

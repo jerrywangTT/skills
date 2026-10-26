@@ -5590,3 +5590,11 @@ def test_docs_say_each_line_once():
     assert not lines(PLUGIN / "docs" / "install.md") & lines(PLUGIN / "docs" / "guide.md")
     for prompt in sorted((PLUGIN / "template" / "prompts").glob("*.md")):   # no capital verb mid-sentence
         assert not re.findall(r"[a-z,;)] (?:Set|Use|Run|Add|Keep) `", prompt.read_text(encoding="utf-8")), prompt.name
+
+
+def test_coordinator_prompt_names_the_reply_length_limit():
+    """A reply or notify over the chat's 6000 chars goes as parts; over 24000 it is rejected (msgparts)."""
+    coordinator = " ".join((PLUGIN / "template" / "prompts" / "coordinator.md").read_text(encoding="utf-8").split())
+    out = coordinator[coordinator.index("# Output"):coordinator.index("| action |")]
+    assert "Keep a `reply` or `notify` under 6000 chars: a longer one goes as numbered parts, one over 24000 is " \
+           "rejected." in out

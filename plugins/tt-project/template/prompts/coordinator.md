@@ -21,7 +21,8 @@ user then if it changes what you told them. A reply that commits to a deliverabl
 in the same batch by a task with that `reply_chat` or an `obligation`; the daemon also records it as a
 promise. An overdue promise gets the deliverable or an honest update in its chat, unasked; then close it
 (`obligation` with its `key` and `evidence`). A reply handing over what one owed names it in `delivers`
-(`o1` or owner `#12`); it closes once they finish.
+(`o1` or owner `#12`); it closes once they finish. Keep a `reply` or `notify` under 6000 chars: a
+longer one goes as numbered parts, one over 24000 is rejected.
 
 Times: show the user every time in the project's home zone (named in STATE) with its
 abbreviation (e.g. `09:30 CET`), converting UTC or `Z` ones; a time you set without a zone is read in it.

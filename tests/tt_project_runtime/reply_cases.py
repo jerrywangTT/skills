@@ -102,3 +102,101 @@ def test_a_reply_chat_worker_prompt_says_the_message_is_relayed_verbatim(env):
     p.db.update_task(tid, reply_chat="c1")
     text = worker_task(p, p.db.task(tid), str(p.root), None)
     assert "## Reply to the chat" in text and "`message` there verbatim" in text and "deliverable" in text
+
+
+# A chat relay shows 6000 chars of one message: a longer reply or notify was cut there silently
+# (upstream note b8f4ad25236ac40d). msgparts posts it whole as numbered parts, or rejects a document.
+_PART = re.compile(r"^\((\d+)/(\d+)\) ")
+
+
+def _parts(p, kind, chat=None):
+    rows = p.db.q("SELECT text FROM messages WHERE direction='out' AND kind=? AND chat IS ? ORDER BY id", (kind, chat))
+    return [r["text"] for r in rows]
+
+
+def _unmarked(parts):
+    marks = [_PART.match(t) for t in parts]
+    assert all(marks) and [int(m.group(1)) for m in marks] == list(range(1, len(parts) + 1))
+    assert {int(m.group(2)) for m in marks} == {len(parts)}
+    return [t[m.end():] for t, m in zip(parts, marks)]
+
+
+def test_a_long_reply_is_posted_whole_as_ordered_parts_split_at_paragraphs(env):
+    from ttp import coordinator as coord, msgparts
+    p = make(env)
+    paras = [f"Paragraph {i}. " + "word " * 300 for i in range(12)]   # ~1.5k chars each, ~18k in all
+    text = "\n\n".join(paras)
+    assert coord.apply(p, [{"type": "reply", "chat": "c1", "text": text}]) == []
+    parts = _parts(p, "reply", "c1")
+    assert len(parts) > 1 and all(len(t) <= msgparts.LIMIT for t in parts)
+    bodies = _unmarked(parts)
+    assert "".join(bodies) == text, "no character lost or repeated: the history holds it once"
+    assert all(b.endswith("\n\n") for b in bodies[:-1]), "each part ends at a paragraph break"
+
+
+def test_the_digest_lists_a_long_reply_once_by_its_first_part(env):
+    from ttp import coordinator as coord
+    p = make(env)
+    for i in range(3):
+        p.db.post("out", f"earlier reply {i}", chat="c1", kind="reply")
+    text = "\n\n".join(f"Paragraph {i}. " + "word " * 300 for i in range(12))
+    assert coord.apply(p, [{"type": "reply", "chat": "c1", "text": text}]) == []
+    sent = coord.digest(p, {}, [], []).split("## Recently sent to the user")[1].split("\n## ")[0]
+    assert "(1/" in sent and "(2/" not in sent and all(f"earlier reply {i}" in sent for i in range(3))
+
+
+def test_a_single_overlong_paragraph_is_cut_with_nothing_lost():
+    from ttp import msgparts
+    for text in ("x" * 13000, "Sentence one goes here. " * 700, "line\n" * 3000, "x" * (9 * 5995)):
+        parts = msgparts.split(text)
+        assert len(parts) > 1 and all(len(t) <= msgparts.LIMIT for t in parts), len(text)
+        assert "".join(_unmarked(parts)) == text
+    sentences = _unmarked(msgparts.split("Sentence one goes here. " * 700))
+    assert all(b.endswith(". ") for b in sentences[:-1]), "no line break: it cuts at a sentence end"
+
+
+def test_a_long_notify_is_posted_whole_as_parts(env):
+    from ttp import coordinator as coord, msgparts
+    p = make(env)
+    text = "\n".join(f"- host {i} is fine " + "detail " * 40 for i in range(60))   # one paragraph of lines
+    assert coord.apply(p, [{"type": "notify", "text": text, "severity": "normal"}]) == []
+    parts = _parts(p, "alert")
+    assert len(parts) > 1 and all(len(t) <= msgparts.LIMIT for t in parts)
+    bodies = _unmarked(parts)
+    assert "".join(bodies) == text and all(b.endswith("\n") for b in bodies[:-1])
+
+
+def test_a_reply_or_notify_over_the_part_cap_is_rejected_naming_the_limit(env):
+    from ttp import coordinator as coord, msgparts
+    p = make(env)
+    text = "word " * (msgparts.MAX_CHARS // 5 + 1)
+    problems = coord.apply(p, [{"type": "reply", "chat": "c1", "text": text},
+                               {"type": "notify", "text": text, "severity": "normal"}])
+    assert len(problems) == 2, problems
+    for prob, what in zip(problems, ("reply", "notify")):
+        assert f"{what} rejected" in prob and str(len(text)) in prob and str(msgparts.MAX_CHARS) in prob
+        assert str(msgparts.LIMIT) in prob
+    assert not p.db.q("SELECT id FROM messages WHERE direction='out'"), "nothing of it was posted"
+
+
+def test_a_reply_under_the_limit_is_one_message_unchanged(env):
+    from ttp import coordinator as coord, msgparts
+    p = make(env)
+    for text in ("short answer", "a" * msgparts.LIMIT):
+        assert coord.apply(p, [{"type": "reply", "chat": "c1", "text": text}]) == []
+        assert _parts(p, "reply", "c1")[-1] == text
+    assert len(_parts(p, "reply", "c1")) == 2
+
+
+def test_a_long_worker_reply_is_posted_as_parts_and_cut_only_past_the_cap_saying_where(env):
+    from ttp import msgparts
+    p = make(env)
+    long = "\n\n".join("Step. " + "x " * 700 + "end." for _ in range(6))   # ~8.4k chars
+    task, replies = _reply_hand_off(env, p, {"status": "done", "summary": "s", "message": long})
+    assert len(replies) == 2 and "".join(_unmarked(replies)) == long
+    huge = "y " * msgparts.MAX_CHARS
+    cut = msgparts.cut(huge, "task #7's hand-off")
+    assert len(cut) <= msgparts.MAX_CHARS and huge.startswith(cut[:cut.index("\n\n[")])
+    assert f"{len(huge) - cut.index(chr(10) + chr(10) + '[')} more chars not posted here" in cut
+    assert "task #7's hand-off" in cut
+

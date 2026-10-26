@@ -154,8 +154,10 @@ const NOTIFY_TEXT = {
 const NOTIFY_PILL = { ask: "Turn on notifications", blocked: "Notifications blocked", insecure: "Notifications unavailable", unsupported: "Notifications unavailable" };
 // "" once shown, else why not (Chrome on Android shows them only from a service worker). Each stays
 // until the user closes it, where the browser supports that (requireInteraction).
+// A preview of `s` in `n` chars: when cut, it says where the full text is.
+const preview = (s, n, where) => (s = String(s || "")).length <= n ? s : s.slice(0, n - where.length - 4) + "… (" + where + ")";
 function popup(title, body, tag) {
-  try { const n = new Notification(title, { body: String(body || "").slice(0, 240), tag, requireInteraction: true }); n.onclick = () => { window.focus(); n.close(); }; return ""; }
+  try { const n = new Notification(title, { body: preview(body, 240, "full text in the web chat"), tag, requireInteraction: true }); n.onclick = () => { window.focus(); n.close(); }; return ""; }
   catch (e) { return String((e && e.message) || e); }
 }
 let slackState = null;
@@ -216,7 +218,7 @@ function board(st) {
     ["queued", "Queued", st.tasks.filter((t) => t.status === "queued").map((t) => [`#${t.id} ${t.title}${deferred(t) ? ` (${t.starts})` : waiting(t) ? ` (waiting, next try ${at(t.not_before)})` : ""}`])],
   ];
   R.rows($("#board"), cols.map(([cls, name, items]) => ({ key: cls, html: `<div class="col ${cls}"><h3>${name}<span class="n">${items.length}</span></h3>` +
-    (items.slice(0, 6).map(([x, tail, head]) => `<div class="item">${head || ""}${esc(x.slice(0, cls === "you" ? 320 : 160))}${tail || ""}</div>`).join("") || `<div class="item muted">—</div>`) + `</div>` })));
+    (items.slice(0, 6).map(([x, tail, head]) => `<div class="item">${head || ""}${esc(cls === "you" ? preview(x, 320, "full text below") : x.slice(0, 160))}${tail || ""}</div>`).join("") || `<div class="item muted">—</div>`) + `</div>` })));
 }
 
 let lastOk = 0;

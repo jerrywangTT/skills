@@ -18,7 +18,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
-from . import checkdirs, batch, conflictfix, coordinator as coord, envfault, locks, push, replymsg, runner, scopehold, sharedchecks, timefmt, upstream
+from . import checkdirs, batch, conflictfix, coordinator as coord, envfault, locks, msgparts, push, replymsg, runner, scopehold, sharedchecks, timefmt, upstream
 from .db import (TERMINAL_TASK_STATES, BranchIndex, continues_id, dependency_ids, dump_result, load_result,
                  pin_of, review_subject, reviewed_ids)
 from .landed import on_branch
@@ -192,8 +192,8 @@ def _reply(db, task: dict, new: str, text: str, need: str | None = None) -> None
     text = text if new == "done" else f"(task #{task['id']} {new}) {text}"
     if need and need not in text:
         text += f"\nNeeds from you: {need}"
-    db.post("out", text[:6000], chat=None if task["reply_chat"] == "all" else task["reply_chat"],
-            kind="reply", severity="normal")
+    msgparts.post(db, msgparts.cut(text, f"task #{task['id']}'s hand-off"),
+                  chat=None if task["reply_chat"] == "all" else task["reply_chat"], kind="reply", severity="normal")
 
 
 def _done_text(prev: dict, summary: str, tail: str) -> str:

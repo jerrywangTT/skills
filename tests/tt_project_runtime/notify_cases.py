@@ -193,3 +193,12 @@ console.log(JSON.stringify(out));
     assert out["sticky"] == [True, True, True]          # each stays until the user closes it
     assert "blocked by this browser" in out["blocked"][0] and "address bar" in out["blocked"][0]
     assert out["blocked"][1:] == [False, True] and out["ask"] == [False, False]
+
+
+def test_a_desktop_preview_of_a_long_message_says_where_the_full_text_is():
+    from ttp import notifier
+    assert notifier.preview("short alert") == "short alert"
+    long = notifier.preview("word " * 200)
+    assert len(long) <= notifier.PREVIEW and long.endswith("(full text in the chat and web)")
+    js = (RUNTIME / "ttp" / "web" / "app.js").read_text()
+    assert 'preview(body, 240, "full text in the web chat")' in js and ".slice(0, 240)" not in js

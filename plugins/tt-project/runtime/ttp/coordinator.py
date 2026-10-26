@@ -25,7 +25,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from . import locks
-from . import ackwait, anchors, askrethink, broadcast, budgetkind, cachettl, chaincap, correction, course, credits, deploy, effort, ends, failover, forbidden, heal, hostcycle, jevuse, landed, machine_ledger, machines, mitigate, obligations, outagemsg, pauseends, prguard, progress, projpause, push, relay, responsibilities, restriction_audit, reviewcap, reviewreuse, settinghold, settled, shared, sharedchecks, sweep, timefmt, tried, unblock, upstream, verified, watchdup, worktree
+from . import ackwait, anchors, askrethink, broadcast, budgetkind, cachettl, chaincap, correction, course, credits, deploy, effort, ends, failover, forbidden, heal, hostcycle, jevuse, landed, machine_ledger, machines, mitigate, msgparts, obligations, outagemsg, pauseends, prguard, progress, projpause, push, relay, responsibilities, restriction_audit, reviewcap, reviewreuse, settinghold, settled, shared, sharedchecks, sweep, timefmt, tried, unblock, upstream, verified, watchdup, worktree
 from . import overlap as file_overlap   # apply() has a local `overlap`
 from . import screen as scr
 from . import schedule as sched
@@ -962,7 +962,8 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
     section("promises", obligations.promise_lines(db, now, home))
     lines = []
     sent = db.q("SELECT * FROM messages WHERE direction='out' AND kind IN ('reply','ask','alert') "
-                "ORDER BY id DESC LIMIT ?", (RECENT_OUT,))
+                "ORDER BY id DESC LIMIT ?", (RECENT_OUT * msgparts.MAX_PARTS,))
+    sent = [m for m in sent if not msgparts.continued(m["text"])][:RECENT_OUT]   # a long reply: its first part
     if sent:
         lines.append("## Recently sent to the user (do not repeat these)")
         for m in reversed(sent):
@@ -1544,9 +1545,11 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
         try:
             a = normalize_action(a)
             if t == "reply":
+                if why := msgparts.too_long(a["text"], "reply"):
+                    raise ValueError(why)
                 chat = a.get("chat") or default_chat
-                replies.append(db.post("out", a["text"], chat=None if chat in (None, "all") else chat, kind="reply",
-                                       severity=_norm_severity(a.get("severity") or "normal")))
+                replies.append(msgparts.post(db, a["text"], chat=None if chat in (None, "all") else chat, kind="reply",
+                                             severity=_norm_severity(a.get("severity") or "normal"))[0])
                 sent.append((replies[-1], chat, a["text"]))
                 if a.get("delivers"):
                     delivered.append((replies[-1], chat, list(a["delivers"])))
@@ -2081,8 +2084,10 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     or (outagemsg.bare(a["text"]) if a.get("outage") is True else "")
                 if why:
                     raise ValueError(f"notify rejected: {why}")
-                sent.append((db.post("out", a["text"], chat=None, kind="alert", severity=_norm_severity(a.get("severity"))),
-                             None, a["text"]))
+                if why := msgparts.too_long(a["text"], "notify"):
+                    raise ValueError(why)
+                sent.append((msgparts.post(db, a["text"], chat=None, kind="alert",
+                                           severity=_norm_severity(a.get("severity")))[0], None, a["text"]))
             elif t == "memory_add" and a.get("memory_kind") == settled.KIND:
                 rec = settled.from_action(p, a, key)
                 notes.append(f"memory_add: settled area {rec['id']} added to {settled.FILE} "
