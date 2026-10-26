@@ -608,7 +608,13 @@ _DELIVER = (r"(?:report|deliver|share|confirm|follow up|come back|get back|circl
             r"update you|ping you|reply|write (?:it |this |that )?up|send (?:you|it over|back|an update|word)|"
             r"post (?:it|them|an update|updates|the results?|back|here)|have (?:it|them|the|a|an|your|that|this)\b"
             r"[^.;!?]{0,80}?\bready)\b")
-COMMIT_RE = re.compile(_FUTURE + r"(?:[\w'’-]+\s+){0,3}?" + _DELIVER, re.I)
+# "I'll post each result here", "we'll open a PR": a send verb, a few words, then the object it delivers
+_SEND = (r"(?:post|send|open|share)\s+(?:[\w'’/-]+\s+){0,6}?"
+         r"(?:here|results?|table|PR|pull request|numbers|link)\b")
+# "... and it goes up as the draft PR": a delivery the sender owns, told in the third person (not "if it goes up")
+_GOES_UP = (r"(?<!\bif\s)(?<!\bwhen\s)(?<!\bwhether\s)(?<!\bunless\s)"
+            r"\b(?:it|the fix|the change)\s+goes\s+up\s+as\s+(?:a|the)\s+(?:draft\s+)?(?:PR|pull request)\b")
+COMMIT_RE = re.compile(_FUTURE + r"(?:[\w'’-]+\s+){0,3}?(?:" + _DELIVER + "|" + _SEND + ")|" + _GOES_UP, re.I)
 FUTURE_RE = re.compile(_FUTURE + r"|\byou(?:'ll|’ll|\s+will)\s+(?:have|get|see|hear)\b", re.I)
 ETA_RE = re.compile(r"\bETA\b", re.I)
 OFFER_RE = re.compile(r"\b(?:if you (?:want|like|wish|prefer|agree|approve|say so)|if you'd like|should I|want\s+me\s+to|"
@@ -632,7 +638,8 @@ def _has_time(sentence: str) -> bool:
 
 def commitments(text: str) -> list[str]:
     """The sentences of `text` that commit the sender to a deliverable or a time: first-person future with
-    a delivery verb ("I'll report back"), first-person future with a time ("we'll have it by 15:00"), or
+    a delivery verb ("I'll report back") or a send verb and its object ("I'll post each result here"),
+    "it goes up as the draft PR", first-person future with a time ("we'll have it by 15:00"), or
     an ETA with a time. Never a question or an offer ("if you want, I'll ...")."""
     out = []
     for s in _sentences(text):
@@ -858,6 +865,31 @@ def close_promise(db, oid: str, why: str, by: str, now: float | None = None) -> 
         _retire(db, now, "promise closed", prefix=f"obligation:{oid}:promise")
         db.set_kv(KV, st)
     return True
+
+
+def promise_outcomes(db, since: float, now: float | None = None) -> dict:
+    """The promises that fell due between `since` and `now` and how each ended: kept on time (its receipt
+    came by the due time), kept late (after it; the longest delay in hours), dropped, or still open."""
+    now = time.time() if now is None else now
+    due = [o for o in items(db) if o.get("promise") and since <= float(o["promise"]["due"]) <= now]
+    late = [(float(o["receipt"]["at"]) - float(o["promise"]["due"])) / 3600 for o in due
+            if o["receipt"] and float(o["receipt"]["at"]) > float(o["promise"]["due"])]
+    kept = sum(bool(o["receipt"]) for o in due)
+    return {"due": len(due), "on_time": kept - len(late), "late": len(late),
+            "max_late_h": round(max(late), 1) if late else None,
+            "dropped": sum(bool(o.get("dropped")) and not o["receipt"] for o in due),
+            "open": [o["id"] for o in due if _open(o)]}
+
+
+def audit_line(db, since: float, now: float | None = None) -> str:
+    """The self-efficiency audit's line on the promises due since `since`; '' with none due."""
+    now = time.time() if now is None else now
+    r = promise_outcomes(db, since, now)
+    if not r["due"]:
+        return ""
+    return (f"promises, {(now - since) / 3600:g} h: {r['due']} due, {r['on_time']} kept on time, {r['late']} kept late"
+            + (f" (max {r['max_late_h']:.1f} h)" if r["late"] else "") + f", {len(r['open'])} overdue and open"
+            + (f" ({', '.join(r['open'])})" if r["open"] else "") + (f", {r['dropped']} dropped" if r["dropped"] else ""))
 
 
 # delivery ----------------------------------------------------------------------------------------

@@ -13479,6 +13479,122 @@ def test_promise_not_recorded_for_non_commitments_questions_or_offers(env, monke
     assert ob.items(p.db) == []
 
 
+PROMISE_CORPUS_POS = (
+    "I'll post each result here as it comes in.",
+    "I'll post the per-tray count here.",
+    "When the task hands off, I'll post the root cause and the PR link here.",
+    "Once the run ends I'll post the numbers.",
+    "I'll send the comparison table once both runs finish.",
+    "We'll open a PR with the fix after the checks pass.",
+    "I'll open the pull request when the review is clean.",
+    "I'll share the log link when it is uploaded.",
+    "We will post the final table here tomorrow.",
+    "I'm going to post the bisect result here.",
+    "The checks are green, and it goes up as the draft PR for you to merge.",
+    "The fix goes up as a draft PR after the review.",
+    "Once reviewed, the change goes up as the PR.",
+    "I'll report back when the sweep finishes.",
+    "I'll let you know once the board is free.",
+    "I'll post the results.",
+    "We'll send you the trace link here.",
+    "I'll post a short summary of each failure here.",
+    "I will send the per-chip numbers after the rerun.",
+    "I'll post the perf numbers for both configs here.",
+)
+PROMISE_CORPUS_NEG = (
+    "I posted the results here an hour ago.",
+    "Should I post the numbers here?",
+    "If you want, I'll post the table here.",
+    "I'll post it if asked?",
+    "We will not post the table here.",
+    "The CI bot will post the results here.",
+    "I won't open a PR for this one.",
+    "It went up as the draft PR yesterday.",
+    "If it goes up as a draft PR, CI runs on it.",
+    "I would post the numbers here, but the run failed.",
+)
+
+
+def test_promise_shapes_post_object_here_and_goes_up_as_the_pr():
+    """'I'll post <up to a few words> here|result|table|PR|numbers|link' and '<it|the fix|the change> goes
+    up as (a|the) (draft) PR' are commitments; the common false shapes (another actor, a won't, a past
+    'went up', a conditional 'if|when|whether it goes up', a 'would') are not."""
+    from ttp import obligations as ob
+    for text in ("I'll post each result here as it comes in.", "I'll post the per-tray count here.",
+                 "When the task hands off, I'll post the root cause and the PR link here.",
+                 "Tests pass, and it goes up as the draft PR for you to merge.",
+                 "The fix goes up as a PR once reviewed.", "The change goes up as the draft PR tonight."):
+        assert ob.commitments(text) == [text], text
+    for text in ("Will you post the numbers here?", "If you want, I'll post the table here.", "I'll post it if asked?",
+                 "we will not post the numbers here", "The CI bot will post the results here.",
+                 "I won't open a PR for this one.", "It went up as the draft PR yesterday.",
+                 "If it goes up as a draft PR, CI runs on it.", "When it goes up as the draft PR, CI runs.",
+                 "Whether the fix goes up as a PR is your call.", "I would post the numbers here, but the run failed."):
+        assert ob.commitments(text) == [], text
+
+
+def test_promise_corpus_replay_recall_and_no_false_positives():
+    """A fixed generic corpus of 30 chat sentences: at least 90% of the 20 promises are found and none
+    of the 10 non-promises."""
+    from ttp import obligations as ob
+    assert len(PROMISE_CORPUS_POS) + len(PROMISE_CORPUS_NEG) == 30
+    found = [s for s in PROMISE_CORPUS_POS if ob.commitments(s) == [s]]
+    missed = sorted(set(PROMISE_CORPUS_POS) - set(found))
+    assert len(found) / len(PROMISE_CORPUS_POS) >= 0.9, missed
+    assert [s for s in PROMISE_CORPUS_NEG if ob.commitments(s)] == []
+
+
+def _promise_item(oid: str, due: float, closed: float | None = None, dropped: float | None = None) -> dict:
+    return {"id": oid, "text": f"promise {oid}", "by": "coordinator", "created": due - 3600, "owners": {},
+            "receipt": {"at": closed, "task": None, "evidence": "sent"} if closed is not None else None,
+            "dropped": {"at": dropped, "by": "user", "why": "not owed"} if dropped is not None else None,
+            "episode": 0, "raised": None, "covered": [],
+            "promise": {"chat": "c1", "message": 1, "due": due, "timed": True, "tasks": [], "obligations": [],
+                        "raised": None}}
+
+
+def test_promise_audit_line_counts_kept_on_time_late_and_overdue_open(env):
+    """Three promises due in the last 24 h: one closed before its due time, one 5 h after it, one still
+    open: 2 kept (1 late, max 5.0 h) and 1 overdue and open. Promises due outside the window, not yet
+    due, or plain obligations do not count; the audit's lines and `ttp audit --json` carry it."""
+    from ttp import audit
+    from ttp import obligations as ob
+    p = make(env)
+    now = time.time()
+    st = ob._load(p.db)
+    st["items"] = {o["id"]: o for o in (
+        _promise_item("o1", now - 10 * 3600, closed=now - 11 * 3600),
+        _promise_item("o2", now - 8 * 3600, closed=now - 3 * 3600),
+        _promise_item("o3", now - 2 * 3600),
+        _promise_item("o4", now - 30 * 3600, closed=now - 2 * 3600),
+        _promise_item("o5", now + 3600))}
+    st["items"]["o6"] = {**_promise_item("o6", now - 3600), "promise": None}
+    p.db.set_kv(ob.KV, st)
+    line = ob.audit_line(p.db, now - 86400, now)
+    assert line == "promises, 24 h: 3 due, 1 kept on time, 1 kept late (max 5.0 h), 1 overdue and open (o3)", line
+    assert line in audit.lines(p.db, now)
+    row = audit.report(p.db, now)["promises"]
+    assert (row["due"], row["on_time"], row["late"], row["max_late_h"], row["open"]) == (3, 1, 1, 5.0, ["o3"])
+    st["items"]["o3"]["dropped"] = {"at": now - 3600, "by": "user", "why": "not owed"}
+    p.db.set_kv(ob.KV, st)
+    assert ob.audit_line(p.db, now - 86400, now) == \
+        "promises, 24 h: 3 due, 1 kept on time, 1 kept late (max 5.0 h), 0 overdue and open, 1 dropped"
+
+
+def test_promise_audit_line_is_empty_with_nothing_due_in_the_window(env):
+    from ttp import audit
+    from ttp import obligations as ob
+    p = make(env)
+    now = time.time()
+    assert ob.audit_line(p.db, now - 86400, now) == ""
+    st = ob._load(p.db)
+    st["items"] = {o["id"]: o for o in (_promise_item("o1", now + 3600), _promise_item("o2", now - 30 * 3600))}
+    p.db.set_kv(ob.KV, st)
+    assert ob.audit_line(p.db, now - 86400, now) == ""
+    assert not [x for x in audit.lines(p.db, now) if x.startswith("promises,")]
+    assert audit.report(p.db, now)["promises"]["due"] == 0
+
+
 def test_promise_closes_by_obligation_key_and_by_sweep_outcome(env, monkeypatch):
     """`obligation` with the promise's key and evidence closes it and retires its queued overdue event;
     a blocker sweep `closed` outcome closes another, which then leaves the sweep."""

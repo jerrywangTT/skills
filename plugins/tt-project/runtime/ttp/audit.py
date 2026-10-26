@@ -38,7 +38,7 @@ import json
 import time
 from typing import Any
 
-from . import budget, chaincap, correction, ends, quietgate, reviewstats, schedule, sharedchecks, suitecost, sweepskip, turngate, unblock, upstream
+from . import budget, chaincap, correction, ends, obligations, quietgate, reviewstats, schedule, sharedchecks, suitecost, sweepskip, turngate, unblock, upstream
 from .db import DB, continues_id
 from .project import Project
 
@@ -330,6 +330,8 @@ def lines(db: DB, now: float | None = None, window_s: float = WINDOW_S, blocked_
             for t in cont[:TOP]) + _more(cont))
     if fixes := correction.audit_line(db, since):
         out.append(fixes)
+    if promised := obligations.audit_line(db, since, now):
+        out.append(promised)
     if chains := chaincap.audit_line(db, since, TOP):
         out.append(chains)
     if shared := sharedchecks.audit_line(db, since):
@@ -430,4 +432,4 @@ def report(db: DB, now: float | None = None, window_s: float = WINDOW_S, blocked
             "finished": done, "per_outcome": per_outcome(done),
             "stuck": stuck_long(db, now, blocked_h), "review_loops": review_loops(db, since),
             "reviews": {**reviewstats.summary(db, since), "rows": reviewstats.rows(db, since)},
-            "overrides": overrides(p, db, now, blocked_h)}
+            "overrides": overrides(p, db, now, blocked_h), "promises": obligations.promise_outcomes(db, since, now)}
