@@ -1393,19 +1393,19 @@ def test_pr_watch_stops_at_its_deadline_keeps_what_it_read_and_resumes_there(env
     d = Daemon(p.base)
     errors = lambda: p.db.q("SELECT status, count FROM issues WHERE source=?",
                             (scr.error_source("watcher:prs"),))
-    status = watchers.run_builtin(d, "prs", {"deadline_s": 90})
+    one = {"deadline_s": 90, "pr_workers": 1}   # one PR at a time: the fake clock is shared
+    status = watchers.run_builtin(d, "prs", one)
     # Two PRs (a view and a GraphQL read each) take 120 s: the third is not started.
     assert status.startswith("cut short (2 of 5 PRs read"), status
     assert viewed == urls[:2] and set(p.db.kv("pr_signatures")) == set(urls[:2])
     assert [e["status"] for e in errors()] == ["open"]
-    status = watchers.run_builtin(d, "prs", {"deadline_s": 90})
+    status = watchers.run_builtin(d, "prs", one)
     assert status.startswith("cut short") and viewed[2:] == urls[2:4]
     assert [e["status"] for e in errors()] == ["open"], "a second cut run is the same error"
     step[0] = 0.0
-    assert watchers.run_builtin(d, "prs", {"deadline_s": 90}).startswith("ok (5 PRs")
+    assert watchers.run_builtin(d, "prs", one).startswith("ok (5 PRs")
     assert viewed[4:] == [urls[4], *urls[:4]], "it starts at the PR the cut run did not reach"
     assert [e["status"] for e in errors()] == ["fixed"]
-    assert p.db.kv(watchers.PR_CURSOR_KEY) is None
 
 
 def test_a_hanging_gh_call_is_killed_at_the_watchers_deadline(env, monkeypatch, tmp_path):
@@ -1438,6 +1438,190 @@ def test_builtin_watcher_bounds_come_from_the_payload_then_the_config_and_are_ca
     assert watchers.bounds(d, {}) == (50, 10)
     assert watchers.bounds(d, {"deadline_s": 5}) == (5, 5), "a call never outlasts the deadline"
     assert watchers.bounds(d, {"deadline_s": 10_000, "gh_timeout_s": "x"}) == (watchers.DEADLINE_MAX_S, 10)
+
+
+HANGING_GH = r'''#!/bin/sh
+# Fake gh: PR numbers listed in $HANG hang (a child of their own too), the rest answer at once with
+# failing CI and no review comments.
+for n in $HANG; do
+  case "$*" in
+    *"pull/$n "*|*"pull/$n") sleep 60 & echo $! >> "$PIDS"; echo $$ >> "$PIDS"; wait; exit 1 ;;
+  esac
+done
+case "$1" in
+  api) echo '{"data":{"repository":{"pullRequest":{"comments":{"nodes":[]},"reviews":{"nodes":[]},"reviewThreads":{"nodes":[]}}}}}' ;;
+  pr) printf '{"url":"%s","state":"OPEN","isDraft":true,"title":"t","headRefOid":"abc","statusCheckRollup":[{"name":"build","conclusion":"FAILURE","status":"COMPLETED"}]}\n' "$3" ;;
+  *) exit 1 ;;
+esac
+'''
+
+
+def _fake_gh_prs(env, monkeypatch, tmp_path, n: int, hang: str):
+    """n PR tasks on a made-up repo, and the fake gh on PATH; returns (project, urls, pids file)."""
+    p = make(env)
+    urls = [f"https://github.com/acme/widgets/pull/{i}" for i in range(1, n + 1)]
+    for url in urls:
+        p.db.x("INSERT INTO tasks(title,kind,status,pr_url,created) VALUES(?,?,?,?,?)",
+               ("t", "code", "done", url, time.time()))
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    (bindir / "gh").write_text(HANGING_GH)
+    (bindir / "gh").chmod(0o755)
+    pids = tmp_path / "pids"
+    pids.write_text("")
+    monkeypatch.setenv("PATH", f"{bindir}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setenv("HANG", hang)
+    monkeypatch.setenv("PIDS", str(pids))
+    return p, urls, pids
+
+
+def _all_gone(pids) -> bool:
+    """Every pid the fake gh wrote is gone (a zombie waiting for its reaper counts as gone)."""
+    for _ in range(40):
+        left = []
+        for pid in {int(x) for x in pids.read_text().split()}:
+            try:
+                with open(f"/proc/{pid}/stat") as f:
+                    state = f.read().rsplit(")", 1)[1].split()[0]
+            except OSError:
+                continue
+            if state != "Z":
+                left.append(pid)
+        if not left:
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def test_pr_watch_reads_prs_in_parallel_and_a_hung_one_times_out_alone(env, monkeypatch, tmp_path):
+    """Each PR's gh reads run in their own process groups, several at once, within a per-PR timeout:
+    a hung PR times out, is reported not checked, and leaves no process; the others still report."""
+    from ttp import watchers
+    from ttp.daemon import Daemon
+    p, urls, pids = _fake_gh_prs(env, monkeypatch, tmp_path, 3, "2")
+    d = Daemon(p.base)
+    t0 = time.monotonic()
+    status = watchers.run_builtin(d, "prs", {"deadline_s": 30, "gh_timeout_s": 20, "pr_timeout_s": 1.5,
+                                             "pr_workers": 2})
+    assert time.monotonic() - t0 < 6, "the hung PR is cut at its own timeout, not the deadline"
+    assert "acme/widgets#2 (1.5 s per-PR timeout)" in status and status.startswith("cut short (2 of 3"), status
+    found = {r["task"] for r in p.db.q("SELECT task FROM events WHERE kind='pr_findings'")}
+    ids = {r["pr_url"]: r["id"] for r in p.db.q("SELECT id, pr_url FROM tasks")}
+    assert found == {ids[urls[0]], ids[urls[2]]}
+    assert pids.read_text().split(), "the fake gh hung"
+    assert _all_gone(pids), "the hung gh and its child were killed with their group"
+
+
+def test_pr_watch_honours_the_schedules_deadline_up_to_its_ceiling(env):
+    from ttp import watchers
+    from ttp.daemon import Daemon, SCHEDULE_GRACE_S
+    d = Daemon(make(env).base)
+    assert watchers.bounds(d, {"deadline_s": 1000}) == (1000, watchers.GH_TIMEOUT_S)
+    assert watchers.bounds(d, {"deadline_s": 10_000})[0] == watchers.DEADLINE_MAX_S == 1800
+    s = {"name": "prs", "kind": "watcher"}
+    assert d._schedule_timeout(s, {"builtin": "prs", "deadline_s": 1000}) == 1000 + SCHEDULE_GRACE_S
+    assert watchers.pr_bounds(d, {}) == (watchers.PR_WORKERS, watchers.PR_TIMEOUT_S)
+    assert watchers.pr_bounds(d, {"pr_workers": 999, "pr_timeout_s": 5}) == (watchers.PR_WORKERS_MAX, 5)
+
+
+def test_pr_watch_rotates_so_a_hung_pr_cannot_starve_the_rest(env, monkeypatch):
+    """A PR that outlasts the whole deadline does not hold the next runs: it counts as checked (timed
+    out) and waits behind the others, so every PR is read within a bounded number of runs, from the
+    durable record a new daemon reads too."""
+    from ttp import watchers
+    from ttp.daemon import Daemon
+    p = make(env)
+    urls = [f"https://github.com/acme/widgets/pull/{n}" for n in range(1, 7)]
+    for url in urls:
+        p.db.x("INSERT INTO tasks(title,kind,status,pr_url,created) VALUES(?,?,?,?,?)",
+               ("t", "code", "done", url, time.time()))
+    clock, viewed = [1000.0], []
+    monkeypatch.setattr(watchers, "_now", lambda: clock[0])
+
+    def gh(args, cwd):
+        if args[0] == "api":
+            clock[0] += 10
+            return None
+        viewed.append(args[2])
+        if args[2] == urls[0]:
+            clock[0] += 100   # hangs past its own timeout and the run's deadline
+            return None
+        clock[0] += 10
+        return {"url": args[2], "state": "OPEN", "title": "t", "isDraft": True, "headRefOid": HEAD}
+    monkeypatch.setattr(watchers, "_gh", gh)
+    one = {"deadline_s": 90, "pr_workers": 1, "pr_timeout_s": 40}
+    for _ in range(3):
+        watchers.run_builtin(Daemon(p.base), "prs", one)
+    assert viewed[0] == urls[0] and viewed[1] != urls[0], "the hung PR does not go first again"
+    assert set(viewed[:viewed.index(urls[0], 1)]) == set(urls), "every PR read before the hung one's next turn"
+    assert set(p.db.kv(watchers.PR_TRIED_KEY)) == set(urls)
+
+
+def test_pr_watch_stops_reading_merged_and_closed_prs(env, monkeypatch):
+    from ttp import watchers
+    from ttp.daemon import Daemon
+    p = make(env)
+    urls = [f"https://github.com/acme/widgets/pull/{n}" for n in (1, 2, 3)]
+    for url in urls:
+        p.db.x("INSERT INTO tasks(title,kind,status,pr_url,created) VALUES(?,?,?,?,?)",
+               ("t", "code", "done", url, time.time()))
+    state = {u: "OPEN" for u in urls}
+    calls = []
+
+    def gh(args, cwd):
+        calls.append(args[2] if args[0] == "pr" else args[-1])
+        if args[0] == "api":
+            return None
+        return {"url": args[2], "state": state[args[2]], "title": "t", "isDraft": True, "headRefOid": HEAD}
+    monkeypatch.setattr(watchers, "_gh", gh)
+    d = Daemon(p.base)
+    watchers.watch_prs(d)
+    state[urls[1]], state[urls[2]] = "MERGED", "CLOSED"
+    watchers.watch_prs(d)
+    assert p.db.one("SELECT COUNT(*) n FROM events WHERE kind='pr_changed' AND text LIKE '%MERGED%'")["n"] == 1
+    calls.clear()
+    assert watchers.watch_prs(d).startswith("ok (1 PRs")
+    assert calls == [urls[0], "number=1"], "merged and closed PRs are not read again"
+
+
+def test_pr_watch_logs_each_gh_calls_duration_and_what_a_cut_run_skipped(env, monkeypatch):
+    from ttp import screen as scr, watchers
+    from ttp.daemon import Daemon
+    p = make(env)
+    urls = [f"https://github.com/acme/widgets/pull/{n}" for n in (1, 2, 3)]
+    for url in urls:
+        p.db.x("INSERT INTO tasks(title,kind,status,pr_url,created) VALUES(?,?,?,?,?)",
+               ("t", "code", "done", url, time.time()))
+    clock = [1000.0]
+    monkeypatch.setattr(watchers, "_now", lambda: clock[0])
+
+    def gh(args, cwd):
+        clock[0] += 7 if args[0] == "pr" else 3
+        return None if args[0] == "api" else {"url": args[2], "state": "OPEN", "title": "t", "isDraft": True}
+    monkeypatch.setattr(watchers, "_gh", gh)
+    d = Daemon(p.base)
+    status = watchers.run_builtin(d, "prs", {"deadline_s": 15, "pr_workers": 1})
+    assert status.startswith("cut short (2 of 3 PRs read"), status
+    assert "acme/widgets#2 (deadline: findings not read)" in status
+    assert "acme/widgets#3 (deadline: not started)" in status
+    line = [x for x in (p.logs / "daemon.log").read_text().splitlines() if "pr-watch:" in x][-1]
+    assert "acme/widgets#1 view 7.0 s, graphql 3.0 s (no answer)" in line and "acme/widgets#2 view 7.0 s" in line
+    assert "not checked: acme/widgets#2 (deadline: findings not read); acme/widgets#3 (deadline: not started)" in line
+    issue = p.db.one("SELECT * FROM issues WHERE source=?", (scr.error_source("watcher:prs"),))
+    assert issue is not None and issue["status"] == "open" and "cut short" in issue["title"], "never silent"
+
+
+def test_pr_watch_leaves_no_gh_process_behind_at_its_deadline(env, monkeypatch, tmp_path):
+    """Every PR hangs past the run's deadline: the run ends near it, reports them not checked, and
+    each gh's whole group (its children too) is killed."""
+    from ttp import watchers
+    from ttp.daemon import Daemon
+    p, urls, pids = _fake_gh_prs(env, monkeypatch, tmp_path, 2, "1 2")
+    t0 = time.monotonic()
+    status = watchers.run_builtin(Daemon(p.base), "prs", {"deadline_s": 1.5, "pr_timeout_s": 30})
+    assert time.monotonic() - t0 < 6
+    assert status.startswith("cut short (0 of 2 PRs read") and "#1 (deadline)" in status, status
+    assert len(pids.read_text().split()) == 4 and _all_gone(pids)
 
 
 

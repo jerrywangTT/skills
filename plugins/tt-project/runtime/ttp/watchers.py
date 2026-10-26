@@ -16,9 +16,13 @@
   comments is no activity (a person's inline-only review, or one whose comments are unknown, counts; a failed read keeps the last known activity). A move of an open PR's CI alone raises no pr_changed: those reports cover it.
 - `logfile`: tails files named in the payload and screens new lines (rules, then Jev if enabled).
 
-Each run has a total deadline (`watchers.deadline_s`, a payload's `deadline_s` wins) and each gh call a
-timeout (`watchers.gh_timeout_s`, or the payload's), cut to the time left: a run past its deadline stops,
-keeps what it read, and reports one error saying it was cut short. The next run starts where it stopped.
+Each run has a total deadline (`watchers.deadline_s`, a payload's `deadline_s` wins, up to DEADLINE_MAX_S)
+and each gh call a timeout (`watchers.gh_timeout_s`, or the payload's), cut to the time left: a run past its
+deadline stops, keeps what it read, and reports one error saying it was cut short. The `prs` watcher reads
+`pr_workers` PRs at once, each PR's gh calls in their own process groups and within `pr_timeout_s`, so one
+slow or hung PR times out alone while the others are read. It reads the least recently checked PRs first
+(PR_TRIED_KEY), so a run cut short is continued by the next and every PR gets its turn; a merged or closed
+PR is no longer read. Each run logs every gh call's duration per PR and which PRs it did not check, and why.
 """
 from __future__ import annotations
 
@@ -28,7 +32,9 @@ import os
 import re
 import contextvars
 import subprocess
+import signal
 import time
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 
 from . import prguard
@@ -38,12 +44,20 @@ DAY = 86400.0
 GH_LOG_MARGIN_S = 3600.0   # runs' gh calls this long before a PR was last seen in draft still count
 GH_TIMEOUT_S = 20.0        # one gh call's default timeout
 DEADLINE_S = 90.0          # one builtin run's default total bound, well below the daemon's tick watchdog
-DEADLINE_MAX_S = 240.0     # a configured deadline is capped here (the daemon's WATCHER_MAX_S)
-PR_CURSOR_KEY = "pr_watch_next"   # kv: the PR a run cut short did not reach; the next run starts there
+# A configured deadline is capped here. Builtin runs go off the daemon's tick (schedrun), which kills one
+# past its deadline plus SCHEDULE_GRACE_S, so a schedule's own deadline_s is honoured up to half an hour.
+DEADLINE_MAX_S = 1800.0
+PR_WORKERS = 4             # PRs the prs watcher reads at once (`watchers.pr_workers`)
+PR_WORKERS_MAX = 16
+PR_TIMEOUT_S = 60.0        # one PR's reads together (view, then GraphQL; `watchers.pr_timeout_s`)
+PR_TRIED_KEY = "pr_watch_tried"   # kv: {url: number of the run that last checked it}; the least recent go first
+DONE_STATES = ("MERGED", "CLOSED")   # a PR last seen so is no longer read
 
 _now = time.monotonic
 # (deadline on the _now clock, per-call gh timeout) of the builtin run in progress
 _BOUND: contextvars.ContextVar[tuple[float, float] | None] = contextvars.ContextVar("watcher_bound", default=None)
+# the schedule run (schedrun.Run) of the builtin run in progress: its timeout or a daemon stop kills gh's groups
+_RUN: contextvars.ContextVar = contextvars.ContextVar("watcher_run", default=None)
 
 
 def _seconds(*values, default: float) -> float:
@@ -67,6 +81,14 @@ def bounds(daemon, payload: dict) -> tuple[float, float]:
                          deadline)
 
 
+def pr_bounds(daemon, payload: dict) -> tuple[int, float]:
+    """(workers, pr_timeout_s) of one prs run: the payload's, else the config's `watchers`, else the defaults."""
+    cfg = (getattr(daemon, "cfg", None) or {}).get("watchers") or {}
+    workers = _seconds(payload.get("pr_workers"), cfg.get("pr_workers"), default=PR_WORKERS)
+    return (max(1, min(int(workers), PR_WORKERS_MAX)),
+            _seconds(payload.get("pr_timeout_s"), cfg.get("pr_timeout_s"), default=PR_TIMEOUT_S))
+
+
 def _left() -> float | None:
     """Seconds left before the running builtin's deadline (None: unbounded)."""
     b = _BOUND.get()
@@ -84,18 +106,21 @@ def run_builtin(daemon, name: str, payload: dict) -> str:
     source = f"watcher:{name}"
     started = time.time()
     token = _BOUND.set((_now() + deadline, per_call))
+    from . import schedrun
+    run_token = _RUN.set(schedrun.current())
     try:
         if kind == "prs":
-            status = watch_prs(daemon)
+            status = watch_prs(daemon, payload)
         elif kind == "logfile":
             status = watch_logs(daemon, payload)
         else:
             return f"unknown builtin {kind}"
     finally:
+        _RUN.reset(run_token)
         _BOUND.reset(token)
     if status.startswith("cut short"):   # one error per stint: its key holds while runs keep being cut
-        daemon.observe(scr.error_source(source), f"builtin watcher {name} was cut short at its {deadline:g} s "
-                       f"deadline: {status}; the next run continues where it stopped", "normal",
+        daemon.observe(scr.error_source(source), f"builtin watcher {name} was cut short ({deadline:g} s "
+                       f"deadline): {status}; the next run continues with what it did not check", "normal",
                        lifecycle=scr.ERROR, key=f"{source}:cut-short")
     else:   # a whole run: an earlier cut-short error is over
         scr.settle_receipts(daemon.p.db, source, started, ())
@@ -104,22 +129,48 @@ def run_builtin(daemon, name: str, payload: dict) -> str:
 
 def _gh(args: list[str], cwd: str) -> dict | None:
     """gh's JSON answer, or None. Its timeout is the running builtin's per-call one, cut to the time
-    left before its deadline; past the deadline it is not called."""
+    left before its deadline; past the deadline it is not called. gh runs in a process group of its
+    own, killed whole at the timeout, and known to the schedule run while it lives."""
     left, b = _left(), _BOUND.get()
     timeout = GH_TIMEOUT_S if b is None else min(b[1], left)
     if timeout <= 0:
         return None
     try:
-        out = subprocess.run(["gh", *args], capture_output=True, text=True, timeout=timeout, cwd=cwd,
-                             stdin=subprocess.DEVNULL)
+        proc = subprocess.Popen(["gh", *args], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                cwd=cwd, stdin=subprocess.DEVNULL, start_new_session=True)
     except (OSError, subprocess.SubprocessError):
         return None
-    if out.returncode != 0:
+    run = _RUN.get()
+    if run is not None:
+        run.groups[proc.pid] = None
+    try:
+        out, _ = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _kill_group(proc)
+        return None
+    except BaseException:
+        _kill_group(proc)
+        raise
+    finally:
+        if run is not None:
+            run.groups.pop(proc.pid, None)
+    if proc.returncode != 0:
         return None
     try:
-        return json.loads(out.stdout)
+        return json.loads(out)
     except ValueError:
         return None
+
+
+def _kill_group(proc: subprocess.Popen) -> None:
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except OSError:
+        pass
+    try:
+        proc.communicate(timeout=5)
+    except subprocess.TimeoutExpired:   # a child that left the group still holds the pipes
+        pass
 
 
 TTP_MARKER = "<!-- ttp -->"
@@ -181,11 +232,76 @@ def pr_signature(pr: dict) -> dict:
             "failing": failing[:10], "activity": activity, "n_human": len(human)}
 
 
-def watch_prs(daemon) -> str:
+PR_FIELDS = "state,isDraft,mergeable,reviewDecision,statusCheckRollup,comments,reviews,url,title,author,headRefOid,headRefName"
+
+
+def _read_pr(t: dict, root: str, end: float, run_end: float | None) -> dict:
+    """One PR's gh reads on a pool thread: its view, then an open PR's GraphQL, all before `end` on the
+    _now clock (its own timeout or the run's deadline, whichever comes first). It only calls gh.
+    `cut` says why a read was not made or did not answer in time: "deadline" or "timeout"."""
+    b = _BOUND.get()
+    _BOUND.set((end, b[1] if b else GH_TIMEOUT_S))
+    out: dict = {"pr": None, "data": None, "calls": [], "cut": None}
+
+    def gh(what: str, args: list[str]) -> dict | None:
+        if not _over():
+            t0 = _now()
+            r = _gh(args, root)
+            out["calls"].append(f"{what} {_now() - t0:.1f} s" + ("" if r is not None else " (no answer)"))
+            if r is not None or not _over():
+                return r
+        out["cut"] = "deadline" if run_end is not None and end >= run_end else "timeout"
+        return None
+
+    out["pr"] = gh("view", ["pr", "view", t["pr_url"], "--json", PR_FIELDS])
+    key = prguard.pr_key((out["pr"] or {}).get("url") or t["pr_url"])
+    if key and out["pr"] is not None and out["pr"].get("state") == "OPEN":   # a closed PR's change is reported
+        owner, rest = key.split("/", 1)
+        name, number = rest.split("#")
+        out["data"] = gh("graphql", ["api", "graphql", "-f", f"query={BOT_QUERY}", "-f", f"owner={owner}",
+                                     "-f", f"name={name}", "-F", f"number={number}"])
+    return out
+
+
+def _read_prs(order: list[dict], root: str, workers: int, pr_timeout: float) -> dict[str, dict]:
+    """Read the PRs of `order` (in that order), `workers` at once, each within `pr_timeout` and the
+    run's deadline; none is started past the deadline. Returns {url: _read_pr's answer} of those
+    started. It returns only once every read it started ended, so it leaves no gh process behind."""
+    b = _BOUND.get()
+    run_end = b[0] if b else None
+    results: dict[str, dict] = {}
+    todo, live = list(order), {}
+    pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="pr-watch")
+    try:
+        while todo or live:
+            while todo and len(live) < workers and not _over():
+                t = todo.pop(0)
+                end = _now() + pr_timeout if run_end is None else min(run_end, _now() + pr_timeout)
+                live[pool.submit(contextvars.copy_context().run, _read_pr, t, root, end, run_end)] = t
+            if not live:
+                break
+            done, _ = wait(live, return_when=FIRST_COMPLETED)
+            for f in done:
+                results[live.pop(f)["pr_url"]] = f.result()
+    finally:
+        pool.shutdown(wait=True)
+    return results
+
+
+def _log(daemon, msg: str) -> None:
+    try:
+        from .daemon import log
+        log(daemon.p, msg)
+    except (OSError, AttributeError):
+        pass
+
+
+def watch_prs(daemon, payload: dict | None = None) -> str:
     db, root = daemon.p.db, str(daemon.p.root)
     rows = db.q("SELECT id, title, pr_url, status FROM tasks WHERE pr_url IS NOT NULL AND pr_url!='' "
                 "AND status NOT IN ('cancelled')")
     seen = db.kv("pr_signatures", {})
+    workers, pr_timeout = pr_bounds(daemon, payload or {})
     # PRs already out of draft when this check first ran predate the guard and are not flagged.
     before = db.kv(prguard.PREDATES_KEY)
     if before is None:
@@ -196,33 +312,39 @@ def watch_prs(daemon) -> str:
     heads = dict(db.kv(prguard.HEADS_KEY, {}) or {})
     drafts = dict(db.kv(prguard.DRAFT_SEEN_KEY, {}) or {})
     changed = 0
-    # A run cut short starts the next one at the PR it did not reach, so each PR gets its turn.
-    cursor = db.kv(PR_CURSOR_KEY)
-    start = next((i for i, t in enumerate(rows) if t["pr_url"] == cursor), 0)
-    order, stopped = rows[start:] + rows[:start], None
-    for i, t in enumerate(order):
-        if _over():
-            stopped = i
-            break
-        pr = _gh(["pr", "view", t["pr_url"], "--json", "state,isDraft,mergeable,reviewDecision,statusCheckRollup,"
-                  "comments,reviews,url,title,author,headRefOid,headRefName"], root)
-        if pr is None:
-            if _over():
-                stopped = i   # cut off mid-read: this PR goes first next time
-                break
+    # Merged and closed PRs are no longer read. The least recently checked go first, so a run cut short
+    # is continued by the next and a PR that keeps timing out waits behind the others.
+    watch = [t for t in rows if (seen.get(t["pr_url"]) or {}).get("state") not in DONE_STATES]
+    tried = {u: n for u, n in (db.kv(PR_TRIED_KEY, {}) or {}).items() if u in {t["pr_url"] for t in watch}}
+    stint = max(tried.values(), default=0) + 1
+    order = sorted(watch, key=lambda t: tried.get(t["pr_url"], 0))
+    t0 = _now()
+    results = _read_prs(order, root, workers, pr_timeout)
+    read, missed, timings = 0, [], []
+    for t in order:
+        r = results.get(t["pr_url"])
+        name = prguard.pr_key(t["pr_url"]) or t["pr_url"]
+        if r is None:
+            missed.append(f"{name} (deadline: not started)")
             continue
+        timings.append(f"{name} {', '.join(r['calls']) or 'no call'}")
+        if r["cut"]:
+            why = "deadline" if r["cut"] == "deadline" else f"{pr_timeout:g} s per-PR timeout"
+            missed.append(f"{name} ({why}" + (": findings not read)" if r["pr"] is not None else ")"))
+        pr, data = r["pr"], r["data"]
+        if pr is None and r["cut"] == "deadline":
+            continue   # cut off mid-read by the deadline: it goes first next time
+        tried[t["pr_url"]] = stint   # a PR that timed out on its own waits behind the others
+        if pr is None:
+            read += not r["cut"]   # gh answered with an error: read, nothing to report
+            continue
+        read += 1
         key = prguard.pr_key(pr.get("url") or t["pr_url"])
         if key and pr.get("headRefOid") and (heads.get(key) or {}).get("sha") != pr["headRefOid"]:
             heads[key] = {"sha": pr["headRefOid"], "seen": time.time()}   # what an approval binds to
         # One GraphQL read serves the findings and which empty reviews only wrap the runs' replies.
-        data = None
         wrappers = any(str(r.get("state") or "").upper() == "COMMENTED" and not str(r.get("body") or "").strip()
                        for r in pr.get("reviews") or [])
-        if key and pr.get("state") == "OPEN":   # a closed PR's change is reported; no read per poll
-            owner, rest = key.split("/", 1)
-            name, number = rest.split("#")
-            data = _gh(["api", "graphql", "-f", f"query={BOT_QUERY}", "-f", f"owner={owner}", "-f", f"name={name}",
-                        "-F", f"number={number}"], root)
         pr = _with_review_comments(pr, data)
         sig = pr_signature(pr)
         _check_unapproved(daemon, t, pr, sig, before, flagged, drafts)
@@ -266,11 +388,14 @@ def watch_prs(daemon) -> str:
     db.set_kv(prguard.HEADS_KEY, heads)
     keys = {prguard.pr_key(t["pr_url"]) for t in rows}
     db.set_kv(prguard.DRAFT_SEEN_KEY, {k: v for k, v in drafts.items() if k in keys})
-    db.set_kv(PR_CURSOR_KEY, order[stopped]["pr_url"] if stopped is not None else None)
+    db.set_kv(PR_TRIED_KEY, tried)
+    _log(daemon, f"pr-watch: {len(order)} PRs in {_now() - t0:.1f} s ({workers} at once); gh calls: "
+         + ("; ".join(timings) or "none") + (f"; not checked: {'; '.join(missed)}" if missed else ""))
     unapproved = f", {len(flagged)} out of draft unapproved" if flagged else ""
-    if stopped is not None:
-        return f"cut short ({stopped} of {len(rows)} PRs read, {changed} changed{unapproved})"
-    return f"ok ({len(rows)} PRs, {changed} changed{unapproved})"
+    if missed:
+        shown = "; ".join(missed[:10]) + (f"; {len(missed) - 10} more" if len(missed) > 10 else "")
+        return f"cut short ({read} of {len(order)} PRs read, {changed} changed{unapproved}; not checked: {shown})"
+    return f"ok ({len(order)} PRs, {changed} changed{unapproved})"
 
 
 def _check_unapproved(daemon, t: dict, pr: dict, sig: dict, before: set, flagged: dict, drafts: dict) -> None:

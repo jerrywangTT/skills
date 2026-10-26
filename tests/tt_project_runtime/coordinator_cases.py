@@ -10129,7 +10129,7 @@ def test_pr_watch_reads_inline_comments_only_for_open_prs(env, monkeypatch):
     calls.clear()
     watchers.watch_prs(d)
     watchers.watch_prs(d)
-    assert "api" not in calls and calls.count("pr") == 2
+    assert calls == ["pr"], "the read that reports the merge is the last one"
     kinds = [e["text"] for e in p.db.q("SELECT text FROM events WHERE kind='pr_changed'")]
     assert len(kinds) == 1 and "OPEN → MERGED" in kinds[0] and "activity" not in kinds[0]
 

@@ -338,10 +338,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # run reporting nothing closed, sent again under its key within this many hours at the same or a
     # lower severity, only counts; it stays closed and wakes nobody (null or 0: off).
     "screen": {"wake_min_severity": "normal", "rewake_after_h": 6, "same_subject_warn": 3, "reraise_window_h": 6},
-    # Builtin watchers (prs, logfile): one run stops at deadline_s (capped at 240), keeps what it read
+    # Builtin watchers (prs, logfile): one run stops at deadline_s (capped at 1800), keeps what it read
     # and reports one error saying it was cut short; each gh call times out after gh_timeout_s, cut to
-    # the time left. A schedule's payload may set either for itself.
-    "watchers": {"deadline_s": 90, "gh_timeout_s": 20},
+    # the time left. The prs watcher reads pr_workers PRs at once, each within pr_timeout_s. A schedule's
+    # payload may set any of them for itself.
+    "watchers": {"deadline_s": 90, "gh_timeout_s": 20, "pr_workers": 4, "pr_timeout_s": 60},
     # Who hears of a heal check its self-fix task could not repair (a heal block's own `escalate`
     # wins): "user" gets a high alert; "coordinator" gets one high observation per episode instead.
     # paused_quiet_s: how long an outage stays quiet under a pause the user did not set and whose reason
