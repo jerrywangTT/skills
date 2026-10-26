@@ -1436,7 +1436,7 @@ def _lineage_tie(p: Project, kind: str, labels: list[str], skip: set) -> tuple[i
     """(id, what it shares) of the newest queued, running or waiting task a new task of `kind` with
     `labels` shares a branch or worktree with (worktree.claims: the branch it carries or rebases, the task it
     continues and that task's branch): the new task starts only once that one ends (worktree.LINEAGE_HOLD,
-    Daemon._branch_hold). Tasks in `skip` (the one it continues) never count; files alone chain only
+    Daemon._branch_clash). Tasks in `skip` (the one it continues) never count; files alone chain only
     through _overlap_chain."""
     if kind in worktree.NEVER_OWN_KINDS:
         return None

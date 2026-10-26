@@ -1218,3 +1218,30 @@ def test_a_waiting_tasks_probe_stall_lifts_through_probe_passed_or_wakes_once_wi
     assert json.loads(b["result"])["woke"] == "probe stale: released once by the blocker sweep"
     assert b["not_before"] <= time.time() and b["spec"].count("your probe has said not yet") == 1
     assert _dispose(p, d, now + 60) == ({}, [])
+
+
+def test_stall_check_stays_quiet_for_a_task_held_by_a_live_task_s_branch_or_its_waits_end_label(env, monkeypatch):
+    """Dispatch holds a task while another live task uses its branch (Daemon._branch_clash, inside
+    _start_hold): the stall and slot-wait checks see the same hold, so no false 'Stall' (review #3783)."""
+    from ttp import budget as bud
+    p, d, now, check = _stall_setup(env, monkeypatch)
+    holder = _ready_task(p, "Holder", ["pr_branch:feat/x"])
+    p.db.update_task(holder, status="running", kind="code")
+    held = p.db.add_task("Same branch", "s", kind="code", tier="light", origin="coordinator",
+                         labels=["pr_branch:feat/x"])
+    assert check(now) == [] and check(now + 2 * 3600) == [] and check(now + 4 * 3600) == [], \
+        "a task held behind a running task's branch is no stall"
+    # A waiting holder the new task was chained after (waits_end label), and no live claim at all.
+    p.db.update_task(holder, status="waiting")
+    p.db.update_task(held, labels=json.dumps(["pr_branch:feat/x", f"waits_end:{holder}"]))
+    assert check(now + 5 * 3600) == [] and check(now + 7 * 3600) == [] and check(now + 9 * 3600) == []
+    # Every slot taken: still the branch hold, never 'waits only for a slot' (check_slot_wait).
+    d.gates = {"claude": bud.Gate(provider="claude", regime="windows", max_parallel=0)}
+    ctx = {"now": now, "paused": {}, "busy": {}, "committed": None, "logged_out": {}}
+    assert d._start_hold(p.db.task(held), "claude", ctx) == "held" and held not in ctx["full"]
+    assert ctx["branch"][held][0] == holder, ctx["branch"]
+    # The holder ends: it is startable again, so a long wait with nothing starting is a stall.
+    d.gates = {}
+    p.db.update_task(holder, status="done")
+    assert check(now + 10 * 3600) == []
+    assert len(check(now + 14 * 3600)) == 1, "the hold outlived its holder"

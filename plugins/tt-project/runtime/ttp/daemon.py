@@ -6004,16 +6004,14 @@ class Daemon:
             rank = {t: i for i, t in enumerate(bud.TIER_ORDER)}
             ready = [t for t in ready if not logged_out[t["provider"] or core]] + \
                 sorted(out, key=lambda t: rank.get(t["tier"], len(rank)))
-        ctx = {"now": now, "paused": paused, "logged_out": logged_out, "busy": busy, "committed": None}
-        holds = settinghold.active(db, self.cfg, self.p.root) if ready else {}
         live = self._live_claims() if ready else {}
+        ctx = {"now": now, "paused": paused, "logged_out": logged_out, "busy": busy, "committed": None, "live": live}
+        holds = settinghold.active(db, self.cfg, self.p.root) if ready else {}
         for task in ready:
             if not self.lease_held():   # lapsed during this tick (a slow start or store): start nothing more
                 break
             # Before _start_hold, which may reserve the task's resource.
             if holds and self._setting_hold(task, holds, now):
-                continue
-            if self._branch_hold(task, live):
                 continue
             # No run starts without a dollar cap: an unbudgeted run would get no --max-budget-usd and
             # commit nothing toward the dollar caps, so one tick could start several past them. The
@@ -6028,6 +6026,8 @@ class Daemon:
             provider = task["provider"] or core
             why = self._start_hold(task, provider, ctx, reserve=True)
             if why == "held":
+                if task["id"] in ctx["branch"]:
+                    self._note_branch_hold(task, ctx["branch"][task["id"]])
                 continue
             # A paused resource holds its tasks in the queue, attempts untouched, until it resumes.
             note = task["blocked_reason"] or ""
@@ -6146,12 +6146,13 @@ class Daemon:
         return {t["id"]: worktree.claims(self.p, t) for t in self.p.db.q(
             "SELECT * FROM tasks WHERE status='running' AND kind NOT IN ('review','harness')")}
 
-    def _branch_hold(self, task: dict, live: dict) -> bool:
-        """Hold `task` in the queue (attempts untouched) while a running task, or one started earlier
-        this tick, works on a branch or worktree it would use (worktree.claims), or while the task
-        task_add chained it after (worktree.lineage_hold) is queued, running or waiting. Two workers on one
-        branch or in one worktree lose each other's work; the running one is never touched. Once it
-        ends, the held task starts in a worktree of its own (worktree.ensure) from that branch's head."""
+    def _branch_clash(self, task: dict, live: dict) -> tuple[int, str] | None:
+        """(holder id, what it uses) while a running task, or one started earlier this tick (`live`:
+        _live_claims plus dispatch's starts), works on a branch or worktree `task` would use
+        (worktree.claims), or while the task task_add chained it after (worktree.lineage_hold) is
+        queued, running or waiting; else None. Two workers on one branch or in one worktree lose each
+        other's work; the running one is never touched. Once it ends, the held task starts in a worktree
+        of its own (worktree.ensure) from that branch's head. Changes nothing (_start_hold runs it)."""
         db = self.p.db
         mine, why = worktree.claims(self.p, task), None
         for tid, theirs in sorted(live.items()):
@@ -6161,13 +6162,14 @@ class Daemon:
         if why is None and (hid := worktree.lineage_hold(task)) and (h := db.task(hid)) \
                 and h["status"] in ("queued", "running", "waiting"):
             why = (hid, worktree.clash(mine, worktree.claims(self.p, h)) or "its lineage")
-        if why is None:
-            return False
+        return why
+
+    def _note_branch_hold(self, task: dict, why: tuple[int, str]) -> None:
+        """Record a _branch_clash hold as the task's blocked_reason (once; attempts untouched)."""
         held = f"{BRANCH_HELD_NOTE}{why[0]}, which is using {why[1]}; it starts once #{why[0]} ends"[:500]
         if (task["blocked_reason"] or "") != held:
-            db.update_task(task["id"], blocked_reason=held)
+            self.p.db.update_task(task["id"], blocked_reason=held)
             log(self.p, f"task {task['id']} held: {held}")
-        return True
 
     def _start_cost(self, task: dict) -> tuple[float, float]:
         """What the task may still spend, and what its start commits under the dollar caps."""
@@ -6175,8 +6177,9 @@ class Daemon:
         return remaining, (max(remaining, 0.5) if task["budget_usd"] else 0.0)
 
     def _start_hold(self, task: dict, provider: str, ctx: dict, reserve: bool = False) -> str | None:
-        """Why dispatch would not start this ready task now, or None when it would: 'held' (the disk
-        guard, a review's prechecks), 'paused' (a paused resource), 'logged_out', 'net' (its API host
+        """Why dispatch would not start this ready task now, or None when it would: 'held' (another
+        live task's branch or worktree, _branch_clash, recorded in ctx["branch"][task id]; the disk
+        guard; a review's prechecks), 'paused' (a paused resource), 'logged_out', 'net' (its API host
         does not resolve), 'gate' (the budget gate or its provider's slots), 'optional', 'device'
         (device task slots), 'budget' (task budget spent), 'caps' (dollar caps) or 'resource' (busy,
         including `ttp lock` and device-lock aliases). With 'paused' or 'resource' it records what holds
@@ -6186,10 +6189,17 @@ class Daemon:
         so check_stall counts exactly what dispatch would start. Nothing changes but with `reserve`
         (_resource_hold) and ctx's caches: ctx holds now, paused, logged_out (provider -> bool), busy
         (provider -> running), committed (dollars running work may still spend under the caps; None:
-        not read yet); it sets gate (the task's budget gate, once that check is reached)."""
+        not read yet), live (_live_claims, read once when absent; dispatch adds its starts); it sets
+        gate (the task's budget gate, once that check is reached)."""
         now = ctx["now"]
         ctx.setdefault("holds", {}).pop(task["id"], None)
         ctx.setdefault("full", {}).pop(task["id"], None)
+        ctx.setdefault("branch", {}).pop(task["id"], None)
+        if "live" not in ctx:
+            ctx["live"] = self._live_claims()
+        if why := self._branch_clash(task, ctx["live"]):
+            ctx["branch"][task["id"]] = why
+            return "held"
         if self._disk_holds(task) or self._precheck_holds(task, now):
             return "held"
         if coord.task_resources(task) & ctx["paused"].keys():
@@ -11209,7 +11219,7 @@ PAUSED_NOTE = "waits for a paused resource:"
 RESOURCE_BUSY_NOTE = "its resource stayed busy"   # an exclusive run that lost the race for its slot
 LOGGED_OUT_NOTE = "held: logged out"
 NET_HELD_NOTE = "held: network,"
-BRANCH_HELD_NOTE = "held: waits for #"   # Daemon._branch_hold: another live task uses its branch or worktree
+BRANCH_HELD_NOTE = "held: waits for #"   # Daemon._branch_clash: another live task uses its branch or worktree
 LOGIN_CHECK_PASSED = "its login check passed"
 ACCOUNT_SWITCH_EVENT = "login_account_changed"   # recorded when a login comes back as another account
 

@@ -15730,9 +15730,9 @@ def test_task_add_chains_a_continuation_after_an_open_task_on_the_same_branch(en
     new = p.db.one("SELECT * FROM tasks WHERE title='redo it again'")
     assert worktree.lineage_hold(new) == first, new["labels"]
     d = Daemon(p.base)
-    assert d._branch_hold(new, {}) and f"#{first}" in p.db.task(new["id"])["blocked_reason"]
+    assert d._branch_clash(new, {}) == (first, f"branch ttp/t{old}-failed-work")
     p.db.update_task(first, status="failed")
-    assert not d._branch_hold(p.db.task(new["id"]), {}), "the hold outlived the task it waits for"
+    assert d._branch_clash(p.db.task(new["id"]), {}) is None, "the hold outlived the task it waits for"
     # pr_branch: the same branch chains; another branch does not.
     p.db.update_task(first, status="queued", labels=json.dumps(["pr_branch:feat/x"]))
     assert coord.apply(p, [{"type": "task_add", "kind": "code", "title": "on x", "spec": "s\npr_branch: feat/x"},

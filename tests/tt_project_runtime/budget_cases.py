@@ -3582,3 +3582,15 @@ def test_ttp_task_add_takes_a_budget_and_otherwise_stores_its_tier_default(env, 
         with pytest.raises(SystemExit):
             cli.main(["task", "demo", *bad])
     assert "--budget" in capsys.readouterr().err
+
+
+def test_idle_capacity_still_reported_when_the_only_ready_task_is_branch_held(env, monkeypatch):
+    """A task dispatch holds behind a running task's branch (_branch_clash in _start_hold) will not
+    fill a free slot, so it never hides idle capacity (review #3783)."""
+    p, d, now, prov, check = _idle_setup(env, monkeypatch)
+    holder = p.db.add_task("on feat/x", "s", kind="code", tier="light", origin="coordinator",
+                           labels=["pr_branch:feat/x"])
+    p.db.update_task(holder, status="running")
+    p.db.add_task("also feat/x", "s", kind="code", tier="light", origin="coordinator", labels=["pr_branch:feat/x"])
+    check(now)
+    assert len(check(now + 3 * 3600)) == 1, "a branch-held task hid the free slot"

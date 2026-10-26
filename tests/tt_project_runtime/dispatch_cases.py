@@ -654,16 +654,15 @@ def test_a_task_continuing_a_running_task_s_lineage_is_held_by_worktree_path_too
     p.db.update_task(a, status="running")
     d = dm.Daemon(p.base)
     live = d._live_claims()
-    assert d._branch_hold(p.db.task(b), live)
-    assert f"worktree {p.worktrees / f't{old}'}" in p.db.task(b)["blocked_reason"]
-    assert not d._branch_hold(p.db.task(review), live)
+    assert d._branch_clash(p.db.task(b), live) == (a, f"worktree {p.worktrees / f't{old}'}")
+    assert d._branch_clash(p.db.task(review), live) is None
     # A task cancelled before it ran has no worktree or branch: two redos of it do not tie.
     never = p.db.add_task("never ran", "s", kind="code", tier="light", origin="user")
     p.db.update_task(never, status="cancelled")
     c = p.db.add_task("redo c", "s", kind="code", tier="light", origin="user", labels=[f"continues:{never}"])
     e = p.db.add_task("redo e", "s", kind="code", tier="light", origin="user", labels=[f"continues:{never}"])
     p.db.update_task(c, status="running")
-    assert not d._branch_hold(p.db.task(e), d._live_claims())
+    assert d._branch_clash(p.db.task(e), d._live_claims()) is None
 
 
 def test_code_prompt_tells_a_task_in_a_root_that_is_no_git_repo_to_make_its_own_worktree(env):
