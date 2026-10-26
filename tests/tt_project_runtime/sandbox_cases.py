@@ -335,6 +335,7 @@ def _device_hook(monkeypatch, tmp_path, device_host=True, works=True, no_device=
     ("ttp sandbox -- true; pytest", "ttp clip -- ttp sandbox -- pytest"),
     ("bash -lc 'pytest -q'", "ttp clip -- ttp sandbox -- pytest -q"),
     ("ttp lock build -- pytest", "ttp lock build -- ttp sandbox -- pytest"),
+    ("uv run pytest -q", "uv run ttp clip -- ttp sandbox -- pytest -q"),
 ])
 def test_the_hook_refuses_a_no_device_test_run_outside_the_sandbox_on_a_device_host(cmd, shown, tmp_path, monkeypatch):
     out = _device_hook(monkeypatch, tmp_path)(cmd)

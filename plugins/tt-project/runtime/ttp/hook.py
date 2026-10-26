@@ -910,6 +910,7 @@ def _log_refusal(cmd: str, check: str) -> None:
 
 
 DEVICE_NOTICE_FILE = "device-sandbox.notice"   # in the run dir: the no-sandbox notice was given
+ENV_RUNNERS = {"uv", "poetry", "pipenv", "pdm", "hatch"}   # `<runner> run <cmd>` runs <cmd>
 SAFE_WORD_RE = re.compile(r"[\w@%+=:,./$~-]+")
 
 
@@ -939,6 +940,10 @@ def _unsandboxed_test(commands: str, kept: bool, depth: int = 0) -> tuple[list[s
         if not argv or any((w[:1] == ["sandbox"] and kept) or (w[:1] == ["lock"] and _device_lock(w))
                            for w in wrappers):
             continue
+        if os.path.basename(argv[0]) in ENV_RUNNERS and argv[1:2] == ["run"]:   # uv run [opts] pytest
+            argv = next((argv[i:] for i in range(2, len(argv)) if not argv[i].startswith("-")), [])
+            if not argv:
+                continue
         name = os.path.basename(argv[0])
         if _pytest_args(argv) is not None or name == "ctest":
             return raw, len(raw) - len(argv), bool(wrappers)
