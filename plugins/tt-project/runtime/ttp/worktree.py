@@ -655,6 +655,58 @@ def on_carried(p: Project, task: dict) -> str:
     return branch if carried_head(p, task) else ""
 
 
+LINEAGE_HOLD = "waits_end:"   # + task id: task_add chained this task after an open one on its branch or lineage
+
+
+def lineage_hold(task: dict) -> int | None:
+    """The task id a LINEAGE_HOLD label names, or None."""
+    try:
+        labels = json.loads(task.get("labels") or "[]")
+    except (ValueError, TypeError):
+        return None
+    return next((int(lb[len(LINEAGE_HOLD):]) for lb in labels if isinstance(lb, str)
+                 and lb.startswith(LINEAGE_HOLD) and lb[len(LINEAGE_HOLD):].isdigit()), None)
+
+
+def _shared_branches(p: Project) -> set[str]:
+    """Branches many tasks start from without working on them alone: main, master, the push branch,
+    delivery.base_ref and the charter's branches, with and without `origin/`. No git command."""
+    d = p.config().get("delivery") or {}
+    out = {"main", "master"}
+    for ref in (str(d.get("push_branch") or "").strip(), str(d.get("base_ref") or "").strip(), *charter_branches(p)):
+        if ref:
+            out |= {ref, ref[7:] if ref.startswith("origin/") else ref}
+    return out
+
+
+def claims(p: Project, task: dict) -> tuple[set[str], set[str]]:
+    """(branches, worktree paths) a task outside NEVER_OWN_KINDS works on: its recorded branch, the one
+    it carries (pr_branch:) or rebases, the branch of the task it continues, and its own and that task's
+    worktree paths (worktrees/t<id>: in a project root that is no git repo the worker makes its worktree
+    itself, and may pick the continued task's). Shared branches (_shared_branches) never count. Empty for
+    a review or harness task. No git command: dispatch runs it for every ready task each tick."""
+    t = dict(task)
+    if t.get("kind") in NEVER_OWN_KINDS:
+        return set(), set()
+    branches = {t.get("branch") or "", carried_branch(t), rebased_branch(t)}
+    paths = {str(p.worktrees / f"t{t['id']}")}
+    from .db import continues_id
+    old = p.db.task(cid) if (cid := continues_id(t)) else None
+    if old and old["kind"] not in NEVER_OWN_KINDS:
+        branches.add(old["branch"] or "")
+        paths.add(str(p.worktrees / f"t{old['id']}"))
+    return branches - _shared_branches(p) - {""}, paths
+
+
+def clash(mine: tuple[set[str], set[str]], theirs: tuple[set[str], set[str]]) -> str:
+    """What two claims share, as 'branch <b>' or 'worktree <path>' (a branch first), or ""."""
+    if b := sorted(mine[0] & theirs[0]):
+        return f"branch {b[0]}"
+    if w := sorted(mine[1] & theirs[1]):
+        return f"worktree {w[0]}"
+    return ""
+
+
 LINK_PATHS = [".venv"]   # worktree.link_paths: the default
 NEVER_OWN_KINDS = ("review", "harness")   # reviews work in the change's worktree, harness tasks in the harness
 
