@@ -639,6 +639,22 @@ def superseded(db, tids) -> dict[int, list[tuple[str, str]]]:
     return out
 
 
+def superseded_rows(p, tid: int) -> list[dict]:
+    """The `ttp task superseded` records of task `tid`, oldest first: sha, head, ts and `on_branch`
+    (True/False: that commit is an ancestor of the push branch's local tip; None when it cannot be read)."""
+    out = []
+    for r in p.db.q("SELECT head, sha, ts FROM task_superseded WHERE task=? ORDER BY ts", (int(tid),)):
+        on = None
+        try:
+            tip = _commit(p.root, _push_ref(p, p.root))
+            if tip:
+                on = _git(p.root, "merge-base", "--is-ancestor", r["sha"], tip).returncode == 0
+        except (ValueError, OSError, subprocess.SubprocessError):
+            pass
+        out.append({"sha": r["sha"], "head": r["head"], "ts": r["ts"], "on_push_branch": on})
+    return out
+
+
 def abandoned(db, tid: int) -> tuple[str, float] | None:
     """(why, when) of `ttp task abandon` for task `tid`, None when it was not abandoned."""
     r = db.one("SELECT why, ts FROM task_abandoned WHERE task=?", (int(tid),))

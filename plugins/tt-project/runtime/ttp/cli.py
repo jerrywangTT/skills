@@ -5008,13 +5008,18 @@ def cmd_task(a) -> None:
         t = p.db.task(int(a.title))
         if not t:
             die(f"no task #{int(a.title)} in {p.name}", 1)
-        from .landed import abandoned
+        from .landed import abandoned, superseded_rows
         gone = abandoned(p.db, t["id"])
+        sup = superseded_rows(p, t["id"])
         if a.json:
-            print(json.dumps({**t, **({"abandoned": {"why": gone[0], "ts": gone[1]}} if gone else {})},
-                             indent=2, default=str))
+            print(json.dumps({**t, **({"abandoned": {"why": gone[0], "ts": gone[1]}} if gone else {}),
+                              **({"superseded": sup} if sup else {})}, indent=2, default=str))
         else:
-            print(show_task(t) + (f"\n\nabandoned {timefmt.long(gone[1], p)}: {gone[0]}" if gone else ""))
+            lines = [f"superseded by {r['sha'][:10]} ({'on' if r['on_push_branch'] else 'not on' if r['on_push_branch'] is False else 'cannot read'}"
+                     f" the push branch), recorded {timefmt.long(r['ts'], p)}" for r in sup]
+            if gone:
+                lines.append(f"abandoned {timefmt.long(gone[1], p)}: {gone[0]}")
+            print(show_task(t) + ("\n\n" + "\n".join(lines) if lines else ""))
     elif a.action == "cancel":
         from .runner import stop_runs
         if not a.title.strip().isdigit():

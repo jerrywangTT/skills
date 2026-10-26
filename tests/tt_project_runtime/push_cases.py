@@ -12158,3 +12158,34 @@ def test_a_push_check_past_its_time_limit_is_ended_and_fails_the_push_loudly(env
             push.check_limit_of(bad, None)
     p.set_config("delivery.push_checks_timeout_s", "soon")
     assert _ttp("push") == push.REFUSED and "push_checks_timeout_s" in capsys.readouterr().err
+
+
+def test_task_show_prints_a_superseded_record_with_its_commit_and_whether_it_is_on_the_push_branch(env, monkeypatch, capsys):
+    import json
+    from ttp import landed
+    p, repo, other, tid, path, branch, head = _landed_setup(env, monkeypatch)
+    tip = _git_out(repo, "rev-parse", landed._push_ref(p, repo))
+    p.db.x("INSERT INTO task_superseded(task, head, sha, ts) VALUES(?,?,?,?)", (tid, head, tip, 1000.0))
+    p.db.x("INSERT INTO task_superseded(task, head, sha, ts) VALUES(?,?,?,?)", (tid, "b" * 40, "c" * 40, 2000.0))
+    capsys.readouterr()
+    assert _ttp_task(p, "show", str(tid)) == 0
+    out = capsys.readouterr().out
+    assert f"superseded by {tip[:10]} (on the push branch), recorded" in out
+    assert f"superseded by {'c' * 10} (not on the push branch), recorded" in out
+    assert _ttp_task(p, "show", str(tid), "--json") == 0
+    rows = json.loads(capsys.readouterr().out)["superseded"]
+    assert [(r["sha"], r["on_push_branch"]) for r in rows] == [(tip, True), ("c" * 40, False)]
+
+
+def test_task_show_prints_an_abandoned_record_with_its_reason_and_time(env, monkeypatch, capsys):
+    import json
+    p, repo, other, landed_tid, path, branch, head = _landed_setup(env, monkeypatch)
+    tid, tpath, tbranch = _code_task(p, "dropped approach")
+    _commit(tpath, "dropped.txt", "dropped\n")
+    assert _ttp_task(p, "abandon", str(tid), "stricter design landed instead") == 0
+    capsys.readouterr()
+    assert _ttp_task(p, "show", str(tid)) == 0
+    assert "abandoned " in (out := capsys.readouterr().out) and ": stricter design landed instead" in out
+    assert _ttp_task(p, "show", str(tid), "--json") == 0
+    ab = json.loads(capsys.readouterr().out)["abandoned"]
+    assert ab["why"] == "stricter design landed instead" and ab["ts"] > 0
