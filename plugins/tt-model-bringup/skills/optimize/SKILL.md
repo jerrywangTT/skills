@@ -256,6 +256,20 @@ Use this reference while optimizing functional TTNN code. It captures repo-local
 - For DRAM-sharded decode matmul, weights should be width-sharded in DRAM and activations/outputs width-sharded in L1 on the matching core grid.
 - Keep the primary optimization target single-user batch-1 prefill/decode. This is not permission to remove larger-batch support; preserve correct batch handling and verify up to batch/concurrency 32 for complete model and serving paths when hardware and memory allow it. For MoE decoders on non-Galaxy systems, preserve gate-selected active-expert execution and prefer the GPT-OSS `ttnn.sparse_matmul` path for sparse expert projections plus score weighting and expert reduction. Dense all-expert execution is a debug baseline, not the optimized target.
 
+## Op-Family Cards
+
+Measured guidance for specific op families lives in `cards/`, one file per family. Read the card for a family when its
+rows are material in `tt-perf-report`:
+
+- [cards/matmul.md](cards/matmul.md): decode matmuls bound by DRAM weight reads (streaming weights in large reads,
+  readers on their bank's row, bank balance, per-chip reader placement on harvested meshes, LM-head top-k).
+- [cards/fusion.md](cards/fusion.md): fewer programs, fewer host waits and fewer DRAM round trips (layer boundaries,
+  packed all-reduce, selection inside the producing kernel, one-program blocks, L1 residency, launch rectangles).
+- [cards/sparse_matmul.md](cards/sparse_matmul.md): mixture-of-experts decode and prefill (routed experts only, union
+  of rows' experts, expert prefetch, routed (row, expert) pairs, gathers avoided, routing kept small).
+
+For draft-and-verify speculative decoding on top of an optimized decode, use $speculative-decoding.
+
 ## Optimization Advice
 
 ### OPT-001: Treat split decode QKV as a topology defect until proven otherwise

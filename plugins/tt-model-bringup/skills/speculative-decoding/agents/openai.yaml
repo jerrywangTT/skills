@@ -1,0 +1,7 @@
+interface:
+  display_name: "Speculative Decoding"
+  short_description: "Add and optimize draft-and-verify decoding"
+  default_prompt: "Use $speculative-decoding to add or optimize draft-and-verify speculative decoding for this TTNN model, keeping each round on the device, verifying all draft rows in one pass, and reporting round time split by pass, tokens per round and teacher-forced agreement against plain greedy decode."
+
+policy:
+  allow_implicit_invocation: true
