@@ -10,8 +10,10 @@ repeating an earlier instruction (`repeats`: a sentence of REPEAT_WORDS+ words m
 sentence of the last REPEAT_S, exactly once normalized or nearly over the last REPEAT_NEAR), or any
 message that arrives while something says the project is stuck (`open_stall`: a stall event or a
 Course check line; a correction still without a class fix is not one, or it would flag every later
-message, and neither is Resource trouble, a machine fault rather than a miss). The digest tags
-the message `[likely correction: <why>]`. After the turn (`settle`), each flagged message is recorded
+message, and neither is Resource trouble, a machine fault rather than a miss). A relayer's own findings
+(kind 'finding') and a relay re-send (`resends`: the same words delivered twice within RESEND_S, or
+relayed again with context) are never flagged: neither is the user saying something again. The digest
+tags the message `[likely correction: <why>]`. After the turn (`settle`), each flagged message is recorded
 with its class fix: a `harness` task (or one titled `upstream: ...`) the turn added, or the turn's
 `summary` naming `correction #<id>` with its reason. One with neither gets a Course check line in the
 next digest, once (`digest_lines`); a later harness task clears it. The daily review's efficiency
@@ -48,6 +50,7 @@ REPEAT_S = 7 * 86400
 REPEAT_J = 0.75
 REPEAT_NEAR = 400
 REPEAT_ROWS = 1000
+RESEND_S = 60   # the same words again this soon are one message delivered twice, not a repeat
 
 
 def phrase(text: str) -> str:
@@ -75,13 +78,14 @@ def repeats(db: DB, msgs: list[dict], now: float | None = None) -> dict[int, tup
     inbound message of the last REPEAT_S already had: the first message that said it, and the
     sentence as first said."""
     now = time.time() if now is None else now
-    new = sorted((m for m in msgs if m.get("direction", "in") == "in" and sentences(m.get("text") or "")),
-                 key=lambda m: int(m["id"]))
+    new = sorted((m for m in msgs if m.get("direction", "in") == "in" and m.get("kind", "user") != "finding"
+                  and sentences(m.get("text") or "")), key=lambda m: int(m["id"]))
     if not new:
         return {}
-    rows = db.q("SELECT id, text FROM messages WHERE direction='in' AND ts>=? AND id<? ORDER BY id DESC LIMIT ?",
-                (now - REPEAT_S, int(new[-1]["id"]), REPEAT_ROWS))[::-1]
+    rows = db.q("SELECT id, ts, text FROM messages WHERE direction='in' AND kind!='finding' AND ts>=? AND id<? "
+                "ORDER BY id DESC LIMIT ?", (now - REPEAT_S, int(new[-1]["id"]), REPEAT_ROWS))[::-1]
     first: dict[tuple, tuple[int, str]] = {}   # normalized sentence: (first id, its words)
+    last: dict[tuple, float] = {}              # normalized sentence: when it was last said
     recent: list[tuple[frozenset, tuple]] = []
     out, i = {}, 0
     for m in new:
@@ -91,16 +95,43 @@ def repeats(db: DB, msgs: list[dict], now: float | None = None) -> dict[int, tup
                 if s not in first:
                     first[s] = (int(rows[i]["id"]), " ".join(s))
                     recent.append((frozenset(s), s))
+                last[s] = float(rows[i]["ts"] or 0)
             i += 1
         recent = recent[-REPEAT_NEAR:]
+        ts = float(m.get("ts") or now)
         for s in sentences(m.get("text") or ""):
-            hit = first.get(s)
+            hit = s if s in first else None
             if not hit:
                 toks = frozenset(s)
-                hit = next((first[o] for t, o in recent if _near(toks, t)), None)   # oldest first
-            if hit:
-                out[mid] = hit
+                hit = next((o for t, o in recent if _near(toks, t)), None)   # oldest first
+            if hit and ts - last[hit] > RESEND_S:   # sooner: one message delivered twice (`resends`)
+                out[mid] = first[hit]
                 break
+    return out
+
+
+def _same(text: str) -> str:
+    return " ".join(str(text or "").lower().split())
+
+
+def resends(db: DB, msgs: list[dict], now: float | None = None) -> set[int]:
+    """The ids of the messages in `msgs` that a relay sent again, not the user repeating them: words
+    (case and whitespace aside) an earlier inbound message already had within RESEND_S (one message
+    delivered twice), or, for a relayed message (with a relayer's context), one of the last REPEAT_S
+    from the same chat (the same words passed on again to carry new context)."""
+    now = time.time() if now is None else now
+    out = set()
+    for m in msgs:
+        said = _same(m.get("text") or "")
+        if m.get("direction", "in") != "in" or m.get("kind", "user") != "user" or not said:
+            continue
+        ts, relayed = float(m.get("ts") or now), bool((m.get("context") or "").strip())
+        rows = db.q("SELECT ts, chat, text FROM messages WHERE direction='in' AND kind='user' AND ts>=? AND id<? "
+                    "ORDER BY id DESC LIMIT ?", (min(now, ts) - (REPEAT_S if relayed else RESEND_S), int(m["id"]),
+                                                 REPEAT_ROWS))
+        if any(_same(r["text"]) == said and (float(r["ts"]) >= ts - RESEND_S or relayed and r["chat"] == m.get("chat"))
+               for r in rows):
+            out.add(int(m["id"]))
     return out
 
 
@@ -146,9 +177,12 @@ def flag(db: DB, cfg: dict | None, msgs: list[dict], now: float | None = None) -
     out, stall, rep = {}, None, None
     bare = [int(m["id"]) for m in msgs if "text" not in m]
     if bare:
-        full = {r["id"]: r for r in db.q(f"SELECT id, direction, text FROM messages WHERE id IN "
+        full = {r["id"]: r for r in db.q(f"SELECT id, ts, direction, kind, chat, text, context FROM messages WHERE id IN "
                                          f"({','.join('?' * len(bare))})", bare)}
         msgs = [full.get(int(m["id"]), m) if "text" not in m else m for m in msgs]
+    msgs = [dict(m) for m in msgs if m.get("kind", "user") != "finding"]
+    again = resends(db, msgs, now)
+    msgs = [m for m in msgs if int(m["id"]) not in again]
     for m in msgs:
         if m.get("direction", "in") != "in":
             continue

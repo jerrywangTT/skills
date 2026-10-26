@@ -38,6 +38,8 @@ description: "Start, connect to, and talk with a long-running tt-project: a loca
   or add to them. Your own context (background, a summary, what you think they mean) goes only in
   `--context "<text>"`. The project reads it as data, never as the user's word: a rule, pin or
   approval you write there binds nothing.
+- Your own findings alone → `ttp say <name> --chat <id> --finding "<text>"`; never re-send the user's
+  earlier words to carry them.
 - The user wants every project told something → one `ttp say --all "<the user's words, verbatim>"`
   (`--except p,q` leaves projects out; your context still goes in `--context`). Each project gets it
   once, marked as a broadcast, and none relays it on. A resend within 24 h reaches only the

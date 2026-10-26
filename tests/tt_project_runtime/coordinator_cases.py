@@ -15549,6 +15549,120 @@ def _timed(fn):
     fn()
     return time.perf_counter() - t
 
+
+def test_say_finding_is_stored_and_shown_as_relayer_data_never_the_users_word(env, capsys, monkeypatch):
+    """`ttp say <p> --finding <text>`: a relayer's own findings with no user's words. Stored with no
+    text, labeled as relayer data in the digest, and never the user's word: not a user turn, not an
+    approval, not a correction, and a rule quoting it is refused."""
+    from ttp import cli, correction, prguard, relay
+    from ttp import coordinator as coord
+    p = make(env)
+    p.db.x("UPDATE messages SET handled=1 WHERE direction='in'")
+    finding = "Why didn't the nightly build on box-a run? Its queue held every job from all teams."
+    cli.main(["say", "demo", "--chat", "c1", "--finding", finding])
+    assert f"as {relay.FINDING}" in capsys.readouterr().out
+    m = p.db.one("SELECT * FROM messages WHERE direction='in' ORDER BY id DESC LIMIT 1")
+    assert (m["kind"], m["text"], m["context"], m["chat"], m["handled"]) == ("finding", "", finding, "c1", 0)
+    digest = coord.digest(p, {}, [], [m["id"]])
+    assert f"{relay.FINDING}: {finding}" in digest and "not the user's word for any decision" in digest
+    assert relay.VERBATIM not in digest and "[user message" not in digest
+    assert not coord.user_turn(p.db, [m["id"]])
+    assert correction.flag(p.db, p.config(), _rows(p, m["id"])) == {}, "a finding is never a correction"
+    with pytest.raises(ValueError):
+        prguard.approve(p.db, "acme/widgets#7", m["id"], "approve acme/widgets#7")
+    problems = coord.apply(p, [{"type": "memory_add", "memory_kind": "preference",
+                                "text": "User rule: its queue held every job from all teams"}],
+                           user_turn=coord.user_turn(p.db, [m["id"]]), messages=[m["id"]])
+    assert problems and "relayer" in problems[0], problems
+    # With the user's words too, the finding is more of the relayer's context on a normal message.
+    cli.main(["say", "demo", "--chat", "c1", "--finding", "box-a is idle", "--", "retry the build"])
+    m2 = p.db.one("SELECT * FROM messages WHERE direction='in' ORDER BY id DESC LIMIT 1")
+    assert (m2["kind"], m2["text"], m2["context"]) == ("user", "retry the build", "box-a is idle")
+    assert coord.user_turn(p.db, [m["id"], m2["id"]])
+    # To a project on another machine it goes as a finding too, with no user's words.
+    sent = []
+    monkeypatch.setattr(cli, "_ssh", lambda entry, argv, capture=False:
+                        sent.append(argv) or subprocess.CompletedProcess(argv, 0, "", ""))
+    assert cli._say_remote("far", {"host": "far-box", "dir": "/x"}, "", "c1", "box-b is idle", finding=True)[0] == 0
+    assert sent[-1][2:] == ["far", "--chat", "c1", "--finding", "box-b is idle", "--", ""]
+
+
+def test_a_finding_wakes_the_coordinator_after_a_daemon_restart(env, monkeypatch):
+    """A finding is an inbound message like any other: stored durably, normal severity, and it starts a
+    coordinator turn, also from a daemon started after it was sent."""
+    from ttp import cli, relay
+    from ttp.daemon import Daemon
+    p = make(env)
+    p.db.x("UPDATE messages SET handled=1 WHERE direction='in'")
+    Daemon(p.base).update_gates()   # a daemon ran, then stopped
+    cli.main(["say", "demo", "--chat", "c1", "--finding", "the watcher on box-a stopped at 01:00"])
+    mid = p.db.one("SELECT id, severity FROM messages WHERE kind='finding'")
+    assert mid["severity"] == "normal"
+    d = Daemon(p.base)   # the restarted daemon
+    d.update_gates()
+    calls = []
+    monkeypatch.setattr(d, "start_run", lambda role, prompt, *a, **k: calls.append((prompt, k)) or 1)
+    later = time.time() + 600   # past the debounce
+    monkeypatch.setattr(time, "time", lambda: later)
+    d.maybe_coordinate()
+    prompt, k = calls[-1]
+    assert f"{relay.FINDING}: the watcher on box-a stopped at 01:00" in prompt
+    assert mid["id"] in k["note"]["messages"]
+
+
+def test_say_with_context_alone_still_refuses_and_names_finding(env, capsys):
+    from ttp import cli
+    p = make(env)
+    before = p.db.one("SELECT COUNT(*) n FROM messages")["n"]
+    for argv in (["say", "demo", "--context", "only mine", "--", " "], ["say", "demo", "--context", "only mine"],
+                 ["say", "--all", "--context", "only mine", "--", " "]):
+        with pytest.raises(SystemExit) as e:
+            cli.main(argv)
+        assert e.value.code == 2
+        assert "--finding" in capsys.readouterr().err, argv
+    with pytest.raises(SystemExit):
+        cli.main(["say", "--all", "--finding", "mine", "--", "words"])
+    assert p.db.one("SELECT COUNT(*) n FROM messages")["n"] == before
+
+
+def test_relay_resends_and_findings_are_never_counted_as_repeats(env):
+    """A relay that re-sends one user sentence to carry new context, or delivers one message twice
+    within a minute, is not the user repeating it; nor is a relayer's finding."""
+    from ttp import correction
+    p = make(env)
+    said = "Run the full suite before pushing."
+    first = p.db.post("in", said, chat="c1", context="the user is on a laptop")
+    p.db.x("UPDATE messages SET ts=? WHERE id=?", (time.time() - 3600, first))
+    again = p.db.post("in", "  run the FULL suite   before pushing.", chat="c1", context="also: box-a is down")
+    twice = _said(p, "Deploy the web app after each merge.", days=1.07 / 86400)
+    dup = _said(p, "Deploy the web app after each merge.")
+    near = _said(p, "Please deploy the web app after each merge.")
+    finding = p.db.post("in", "", chat="c1", kind="finding", context=said)
+    rows = _rows(p, again, dup, near, finding)
+    assert correction.flag(p.db, p.config(), rows) == {}
+    # The daemon's turn start passes rows without text: read and judged the same way.
+    assert correction.flag(p.db, p.config(), [{"id": r["id"], "ts": r["ts"], "chat": r["chat"]} for r in rows]) == {}
+    correction.settle(p.db, {"corrections": {}}, [], "", time.time() - 1)
+    assert "repeated instructions" not in correction.audit_line(p.db, time.time() - 86400)
+
+
+def test_genuine_repeats_are_still_flagged_next_to_relay_resends(env):
+    """Typed again, sent through another chat, or a new verbatim block with other words: still a repeat.
+    The same words more than a minute apart are a repeat; within a minute they are one message twice."""
+    from ttp import correction
+    p = make(env)
+    first = p.db.post("in", "Run the full suite before pushing.", chat="c1", context="the user is on a laptop")
+    p.db.x("UPDATE messages SET ts=? WHERE id=?", (time.time() - 3600, first))
+    typed = _said(p, "Run the full suite before pushing.", days=0.02)
+    other_chat = p.db.post("in", "Run the full suite before pushing.", chat="c2", context="from the other chat")
+    p.db.x("UPDATE messages SET ts=? WHERE id=?", (time.time() - 900, other_chat))
+    new_words = p.db.post("in", "Status? Run the full suite before pushing!", chat="c1", context="mine")
+    rows = _rows(p, typed, other_chat, new_words)
+    assert correction.flag(p.db, p.config(), rows) == {m: f"repeats #{first}" for m in (typed, other_chat, new_words)}
+    early = _said(p, "Deploy the web app after each merge.", days=61 / 86400)
+    late = _said(p, "Deploy the web app after each merge.")
+    assert correction.flag(p.db, p.config(), _rows(p, late)) == {late: f"repeats #{early}"}
+
 def test_repeated_reply_waits_stay_routine_while_the_peer_recovers_and_raise_once_it_is_ready(env, monkeypatch):
     p = make(env)
     from ttp import coordinator as coord

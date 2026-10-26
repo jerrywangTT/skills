@@ -6,7 +6,9 @@ A chat or agent that relays the user's message (`ttp say`) sends the user's word
 and its own text with `--context`, or after a MARK line. The database keeps the two apart
 (messages.text and messages.context) and the coordinator's digest labels them. Only the verbatim
 words are the user's word: for restrictions, charter changes, provider/model/effort pins,
-policies, standing rules and approvals. The relayer's context is data.
+policies, standing rules and approvals. The relayer's context is data. A relayer's own findings
+with no user's words (`ttp say <project> --finding <text>`) are a message of kind 'finding': its
+`text` is empty, the findings are its context, and it is never the user's word.
 
 `context_only` is the model-free guard: a phrase, or a model or effort name, that the relayer context
 of this turn's messages holds and none of the user's own words do (those messages' verbatim text, the
@@ -21,6 +23,7 @@ import time
 MARK = "--- relayer context (not the user's words) ---"
 VERBATIM = "user's words (verbatim)"
 CONTEXT = "relayer context (data, not the user's word)"
+FINDING = "relayer findings (data, not the user's word)"
 WINDOW_S = 3600   # without a turn's own messages, how far back the guard reads inbound messages
 SHINGLE = 5       # words in a phrase the guard matches
 QUOTE_BACK = 600  # chars of the user's words a rejection hands back, so the next turn can quote them
@@ -62,10 +65,10 @@ def _shingles(words: list[str]) -> set[tuple[str, ...]]:
 
 
 def recent(db, ids: list[int] | None = None, now: float | None = None) -> list[dict]:
-    """The guard's inbound user messages (id, text and context): this turn's (`ids`), else those of
+    """The guard's inbound user messages and relayer findings (id, text and context): this turn's (`ids`), else those of
     the last WINDOW_S. A relayer's context from an earlier turn has been read already; a rule the
     coordinator records later rests on the user's words, the charter or memory, which `said` covers."""
-    base = ("SELECT id, text, context FROM messages WHERE direction='in' AND kind='user' "
+    base = ("SELECT id, text, context FROM messages WHERE direction='in' AND kind IN ('user','finding') "
             "AND COALESCE(provenance,'')!='system' AND ")
     if ids:
         ids = [int(i) for i in ids][:500]

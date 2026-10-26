@@ -737,8 +737,10 @@ class Handler(BaseHTTPRequestHandler):
             if url.path == "/api/messages":
                 q = parse_qs(url.query)
                 after = int(q.get("after", ["0"])[0])
-                rows = db.q("SELECT m.id,m.ts,m.direction,m.chat,m.channel,m.kind,m.severity,m.text,"
-                            "c.label chat_label FROM messages m LEFT JOIN chats c ON c.id=m.chat "
+                rows = db.q("SELECT m.id,m.ts,m.direction,m.chat,m.channel,m.kind,m.severity,"
+                            # a relayer's findings have no user's words: show the findings, labeled
+                            "CASE m.kind WHEN 'finding' THEN 'relayer findings: ' || COALESCE(m.context,'') "
+                            "ELSE m.text END text,c.label chat_label FROM messages m LEFT JOIN chats c ON c.id=m.chat "
                             "WHERE m.id>? ORDER BY m.id LIMIT 300", (after,))
                 return self._send(200, rows)
             if url.path.startswith("/api/run/"):

@@ -988,6 +988,10 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
         flagged = ({int(k): v for k, v in corrections.items()} if corrections is not None
                    else correction.flag(db, p.config(), rows, now))
         for m in rows:
+            if m["kind"] == "finding":   # a relayer's own findings, no user's words: never the user's word
+                lines.append(f"- [relayer message #{m['id']} via {m['channel']}, chat={m['chat'] or '-'}, no user's "
+                             f"words: not the user's word for any decision] {relay.FINDING}: {m['context'] or ''}")
+                continue
             prov = m["provenance"] or "unknown"
             # Only PR approvals need an approving channel; the verbatim words decide everything else.
             ok = "yes" if prov in prguard.APPROVING else ("no (PR ready/merge only; its verbatim words are the "
@@ -4756,6 +4760,14 @@ def _calls_undoable(text: str) -> bool:
 
 def _ws(text: str) -> str:
     return " ".join(text.split())
+
+
+def user_turn(db, messages: list[int]) -> bool:
+    """Whether a turn's inbound `messages` hold one with the user's words: a relayer's findings alone
+    (kind 'finding') never make it the user's turn."""
+    ids = [int(i) for i in messages or []]
+    return bool(ids) and bool(db.one(f"SELECT 1 FROM messages WHERE id IN ({','.join('?' * len(ids))}) "
+                                     "AND kind!='finding'", ids))
 
 
 def _users_own(db, messages: list[int]) -> list[int]:

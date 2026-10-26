@@ -337,11 +337,13 @@ def say_remote(name: str, entry: dict, text: str, chat: str | None, context: str
 
 
 def _say_remote(name: str, entry: dict, text: str, chat: str | None, context: str = "",
-                broadcast: str | None = None) -> tuple[int, str]:
+                broadcast: str | None = None, finding: bool = False) -> tuple[int, str]:
     """say_remote's exit code and where the message went: `client:<id>` (delivered) or
-    `queued:<host>`. A broadcast's client id is its broadcast id: a resend is a no-op there."""
-    argv = ["say", name, *(["--chat", chat] if chat else []), *(["--context", context] if context else []),
-            *(["--broadcast", broadcast] if broadcast else []), "--", text]
+    `queued:<host>`. A broadcast's client id is its broadcast id: a resend is a no-op there.
+    `finding`: `context` is a relayer's own findings, sent with no user's words."""
+    argv = (["say", name, *(["--chat", chat] if chat else []), "--finding", context, "--", ""] if finding else
+            ["say", name, *(["--chat", chat] if chat else []), *(["--context", context] if context else []),
+             *(["--broadcast", broadcast] if broadcast else []), "--", text])
     cid = broadcast or outbox.new_id()
     if flush_outbox(name, entry) is None and not outbox.entries(name):
         r = _send_say(entry, argv, cid)
@@ -961,23 +963,33 @@ def cmd_say(a) -> None:
         # among this process's ancestors counts too: a run can unset its environment.
         die("ttp say posts a message as the user and is refused inside a run; use `ttp note` or the hand-off")
     from . import broadcast, relay
+    finding = (getattr(a, "finding", "") or "").strip()
     if getattr(a, "all", False):
+        if finding:
+            die("--finding goes to one project: ttp say <project> --finding <text>")
         return _say_all(a)
     if getattr(a, "except_", None):
         die("--except goes with --all")
     p, entry = resolve(a.name)
     # Only the user's verbatim words are the message; what a relayer adds is kept apart (relay.py).
     text, context = relay.split(a.text if a.text != "-" else sys.stdin.read(), a.context)
-    if not text:
-        die("empty message" if not context else "no user's words: --context alone is not a message")
+    if finding and text:   # findings sent with the user's words are more of the relayer's context
+        context, finding = "\n".join(x for x in (context, finding) if x), ""
+    elif finding:   # the relayer's own findings alone: data, never the user's word
+        context = "\n".join(x for x in (finding, context) if x)
+    if not text and not finding:
+        die("empty message" if not context else NO_WORDS)
     bid = getattr(a, "broadcast", None)
     if entry:
-        rc, ref = _say_remote(a.name, entry, text, a.chat, context, bid)
-        if rc == 0:
+        rc, ref = _say_remote(a.name, entry, text, a.chat, context, bid, finding=bool(finding))
+        if rc == 0 and not finding:
             broadcast.note_delivery(text, a.name, ref, bid)
         sys.exit(rc)
     p = p or need(a.name, sys.argv[1:])
-    seen, mid = _say_local_or_die(p, a, text, context, bid)
+    seen, mid = _say_local_or_die(p, a, text, context, bid, kind="finding" if finding else "user")
+    if finding:
+        print(f"{'already received' if seen else 'sent'} (#{mid}) as {relay.FINDING}")
+        return
     # A plain say is recorded too: telling the projects one at a time builds the same record.
     broadcast.note_delivery(text, a.name, f"#{mid}", bid)
     if seen:
@@ -986,11 +998,16 @@ def cmd_say(a) -> None:
         print(f"sent (#{mid}); the coordinator answers in this chat when it has decided")
 
 
-def _say_local_or_die(p: Project, a, text: str, context: str, bid: str | None = None) -> tuple[dict | None, int]:
+NO_WORDS = ("no user's words: --context alone is not a message; send a relayer's own findings alone with "
+            "`ttp say <project> --finding <text>`")
+
+
+def _say_local_or_die(p: Project, a, text: str, context: str, bid: str | None = None,
+                      kind: str = "user") -> tuple[dict | None, int]:
     import sqlite3
     from .db import is_busy
     try:
-        return _say_local(p, a, text, context, bid)
+        return _say_local(p, a, text, context, bid, kind)
     except sqlite3.OperationalError as e:   # db.tx already waited and retried
         if not is_busy(e):
             raise
@@ -1009,6 +1026,21 @@ def _say_all_argv(argv: list[str]) -> list[str]:
     return ["say", SAY_ALL, *argv[1:]]
 
 
+_SAY_VALUED = ("--chat", "--context", "--finding", "--except", "--broadcast", "--client-id")
+
+
+def _say_finding_argv(argv: list[str]) -> list[str]:
+    """`ttp say <p> --finding <text>` has no user's words: give the required text an empty one (an
+    optional positional would swallow the text of `say <p> --chat c -- <text>`)."""
+    if argv[:1] != ["say"] or "--" in argv or not any(x == "--finding" or x.startswith("--finding=") for x in argv):
+        return argv
+    i, positional = 1, 0
+    while i < len(argv):
+        positional += not argv[i].startswith("-")
+        i += 2 if argv[i] in _SAY_VALUED else 1
+    return [*argv, "--", ""] if positional == 1 else argv
+
+
 def _say_all(a) -> None:
     """`ttp say --all`: the user's words to every project `ttp list` shows, once each. The words'
     broadcast (broadcast.py) skips the projects that already got them within its reuse window, and
@@ -1020,7 +1052,7 @@ def _say_all(a) -> None:
         die("ttp say --all takes only the message: ttp say --all [--except p,q] [--context ..] <text>")
     text, context = relay.split(a.text if a.text != "-" else sys.stdin.read(), a.context)
     if not text:
-        die("empty message" if not context else "no user's words: --context alone is not a message")
+        die("empty message" if not context else NO_WORDS)
     reg = load_registry().get("projects", {})
     skip = {n.strip() for n in (a.except_ or "").split(",") if n.strip()}
     for n in sorted(skip - set(reg)):
@@ -1063,13 +1095,15 @@ def _say_all(a) -> None:
     sys.exit(1 if failed else 0)
 
 
-def _say_local(p: Project, a, text: str, context: str, bid: str | None = None) -> tuple[dict | None, int]:
+def _say_local(p: Project, a, text: str, context: str, bid: str | None = None,
+               kind: str = "user") -> tuple[dict | None, int]:
+    """`kind` 'finding': a relayer's own findings, in `context` with no user's words (`text` '')."""
     seen = None
     with p.db.tx():   # a client id makes a resent message (its confirmation was lost) a no-op
         if a.client_id:
             seen = p.db.one("SELECT id FROM messages WHERE direction='in' AND ref=?", (f"client:{a.client_id}",))
         mid = seen["id"] if seen else p.db.post("in", text.strip(), chat=a.chat or None, channel="chat",
-                                                 kind="user", ref=f"client:{a.client_id}" if a.client_id else None,
+                                                 kind=kind, ref=f"client:{a.client_id}" if a.client_id else None,
                                                  provenance="cli-legacy", context=context, broadcast=bid)
         if a.chat:
             p.db.x("UPDATE chats SET last_active=? WHERE id=?", (time.time(), a.chat))
@@ -7630,6 +7664,8 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--chat", help="the chat it comes from (replies go there)")
     s.add_argument("--context", default="", help="a relayer's own context (data, never the user's word); "
                    "kept apart from the user's words")
+    s.add_argument("--finding", default="", help="a relayer's own findings, sent with no user's words; shown to "
+                   "the coordinator as data, never the user's word")
     s.add_argument("--all", action="store_true", help="send to every project `ttp list` shows, once each: "
                    "a resend within 24 h reaches only those that did not get it yet")
     s.add_argument("--except", dest="except_", metavar="P,Q", help="with --all: projects to leave out")
@@ -8519,7 +8555,8 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("dir", help="the project's tt-project folder")
     s.set_defaults(fn=cmd_daemon)
 
-    a = ap.parse_args(_project_name_argv(sub, _say_all_argv(sys.argv[1:] if argv is None else list(argv))))
+    a = ap.parse_args(_project_name_argv(sub, _say_finding_argv(_say_all_argv(
+        sys.argv[1:] if argv is None else list(argv)))))
     a.fn(a)
 
 

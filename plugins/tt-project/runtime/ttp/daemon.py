@@ -3148,7 +3148,7 @@ class Daemon:
             return
         db.set_kv("coordinator_failures", 0)
         default_chat = note.get("default_chat")
-        problems = coord.apply(self.p, actions, default_chat=default_chat, user_turn=bool(note.get("messages")),
+        problems = coord.apply(self.p, actions, default_chat=default_chat, user_turn=coord.user_turn(db, note.get("messages") or []),
                                turn=r.get("id"), messages=note.get("messages") or [])
         chaincap.clear_notices(db, float(r.get("started") or 0))   # this turn's digest showed them
         ids = note.get("messages", [])
