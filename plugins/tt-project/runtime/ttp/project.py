@@ -340,8 +340,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "screen": {"wake_min_severity": "normal", "rewake_after_h": 6, "same_subject_warn": 3, "reraise_window_h": 6},
     # Builtin watchers (prs, logfile): one run stops at deadline_s (capped at 1800), keeps what it read
     # and reports one error saying it was cut short; each gh call times out after gh_timeout_s, cut to
-    # the time left. The prs watcher reads pr_workers PRs at once, each within pr_timeout_s. A schedule's
-    # payload may set any of them for itself.
+    # the time left. The prs watcher reads pr_workers PRs at once, each within pr_timeout_s, each PR once
+    # however many tasks name it; with no deadline_s in its payload, its deadline grows with the PR count
+    # (up to 300 s). A schedule's payload may set any of them for itself.
     "watchers": {"deadline_s": 90, "gh_timeout_s": 20, "pr_workers": 4, "pr_timeout_s": 60},
     # Who hears of a heal check its self-fix task could not repair (a heal block's own `escalate`
     # wins): "user" gets a high alert; "coordinator" gets one high observation per episode instead.

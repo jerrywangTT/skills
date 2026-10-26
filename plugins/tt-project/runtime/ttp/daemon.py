@@ -4697,7 +4697,7 @@ class Daemon:
         """How long one run may go on: its own bounds plus SCHEDULE_GRACE_S, so they normally end it."""
         if s["kind"] == "watcher":
             from .watchers import bounds
-            return bounds(self, payload)[0] + SCHEDULE_GRACE_S
+            return bounds(self, payload, payload.get("builtin") or s["name"])[0] + SCHEDULE_GRACE_S
         if s["kind"] == "llm":   # its precheck, then the gates and the enqueue around it
             return _watcher_timeout({"timeout_s": payload.get("precheck_timeout_s")}) + 2 * SCHEDULE_GRACE_S
         t = _watcher_timeout(payload) if str(payload.get("command") or "").strip() else 0

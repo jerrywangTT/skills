@@ -23,6 +23,10 @@ deadline stops, keeps what it read, and reports one error saying it was cut shor
 slow or hung PR times out alone while the others are read. It reads the least recently checked PRs first
 (PR_TRIED_KEY), so a run cut short is continued by the next and every PR gets its turn; a merged or closed
 PR is no longer read. Each run logs every gh call's duration per PR and which PRs it did not check, and why.
+A PR is read once per run however many tasks name it (a hand-off's `pr` sets its task's pr_url, so fix,
+review and follow-up tasks of one PR all carry it): one row per owner/repo#N, its oldest task's. With no
+`deadline_s` in its payload, the prs run's deadline grows with the PR count (PR_READ_EST_S per PR per
+worker) up to PR_DEADLINE_AUTO_MAX_S, so a host with many PRs still reads them all in one run.
 """
 from __future__ import annotations
 
@@ -50,6 +54,8 @@ DEADLINE_MAX_S = 1800.0
 PR_WORKERS = 4             # PRs the prs watcher reads at once (`watchers.pr_workers`)
 PR_WORKERS_MAX = 16
 PR_TIMEOUT_S = 60.0        # one PR's reads together (view, then GraphQL; `watchers.pr_timeout_s`)
+PR_READ_EST_S = 3.0        # one PR's reads (view, then GraphQL) at a usual pace: sizes the prs run's deadline
+PR_DEADLINE_AUTO_MAX_S = 300.0   # the PR count raises the prs run's deadline up to this; a payload's deadline_s wins
 PR_TRIED_KEY = "pr_watch_tried"   # kv: {url: number of the run that last checked it}; the least recent go first
 DONE_STATES = ("MERGED", "CLOSED")   # a PR last seen so is no longer read
 
@@ -74,11 +80,16 @@ def _seconds(*values, default: float) -> float:
     return default
 
 
-def bounds(daemon, payload: dict) -> tuple[float, float]:
+def bounds(daemon, payload: dict, kind: str | None = None) -> tuple[float, float]:
     """(deadline_s, gh_timeout_s) of one run: the payload's, else the config's `watchers`, else the
-    defaults. The deadline is capped at DEADLINE_MAX_S and a gh call never outlasts it."""
+    defaults. The deadline is capped at DEADLINE_MAX_S and a gh call never outlasts it. A `prs` run
+    (`kind`, else the payload's builtin) whose payload sets no deadline gets at least the time its PR
+    count needs (_sized_deadline)."""
     cfg = (getattr(daemon, "cfg", None) or {}).get("watchers") or {}
-    deadline = min(_seconds(payload.get("deadline_s"), cfg.get("deadline_s"), default=DEADLINE_S), DEADLINE_MAX_S)
+    deadline = _seconds(payload.get("deadline_s"), cfg.get("deadline_s"), default=DEADLINE_S)
+    if (kind or payload.get("builtin")) == "prs" and not _seconds(payload.get("deadline_s"), default=0):
+        deadline = max(deadline, _sized_deadline(daemon, payload))
+    deadline = min(deadline, DEADLINE_MAX_S)
     return deadline, min(_seconds(payload.get("gh_timeout_s"), cfg.get("gh_timeout_s"), default=GH_TIMEOUT_S),
                          deadline)
 
@@ -89,6 +100,33 @@ def pr_bounds(daemon, payload: dict) -> tuple[int, float]:
     workers = _seconds(payload.get("pr_workers"), cfg.get("pr_workers"), default=PR_WORKERS)
     return (max(1, min(int(workers), PR_WORKERS_MAX)),
             _seconds(payload.get("pr_timeout_s"), cfg.get("pr_timeout_s"), default=PR_TIMEOUT_S))
+
+
+def _pr_rows(db) -> list[dict]:
+    """The tasks naming a PR, oldest first (cancelled ones are not watched)."""
+    return db.q("SELECT id, title, pr_url, status FROM tasks WHERE pr_url IS NOT NULL AND pr_url!='' "
+                "AND status NOT IN ('cancelled') ORDER BY id")
+
+
+def _one_per_pr(rows: list[dict], seen: dict) -> list[dict]:
+    """One row per PR (owner/repo#N, else its URL as written): the oldest task's, so a PR several tasks
+    name is read, reported and listed once. A PR last seen merged or closed is left out."""
+    out: dict[str, dict] = {}
+    for t in rows:
+        out.setdefault(prguard.pr_key(t["pr_url"]) or t["pr_url"], t)
+    return [t for t in out.values() if (seen.get(t["pr_url"]) or {}).get("state") not in DONE_STATES]
+
+
+def _sized_deadline(daemon, payload: dict) -> float:
+    """The seconds the prs watcher's PRs take at PR_READ_EST_S each, pr_workers at once, capped at
+    PR_DEADLINE_AUTO_MAX_S (0 when they cannot be counted)."""
+    try:
+        db = daemon.p.db
+        n = len(_one_per_pr(_pr_rows(db), db.kv("pr_signatures", {}) or {}))
+    except Exception:   # noqa: BLE001 - sizing only: the configured deadline stands
+        return 0.0
+    workers = pr_bounds(daemon, payload)[0]
+    return min(-(-n // workers) * PR_READ_EST_S, PR_DEADLINE_AUTO_MAX_S)
 
 
 def _left() -> float | None:
@@ -104,7 +142,7 @@ def _over() -> bool:
 
 def run_builtin(daemon, name: str, payload: dict) -> str:
     kind = payload.get("builtin") or name
-    deadline, per_call = bounds(daemon, payload)
+    deadline, per_call = bounds(daemon, payload, kind)
     source = f"watcher:{name}"
     started = time.time()
     token = _BOUND.set((_now() + deadline, per_call))
@@ -316,8 +354,7 @@ def _log(daemon, msg: str) -> None:
 
 def watch_prs(daemon, payload: dict | None = None) -> str:
     db, root = daemon.p.db, str(daemon.p.root)
-    rows = db.q("SELECT id, title, pr_url, status FROM tasks WHERE pr_url IS NOT NULL AND pr_url!='' "
-                "AND status NOT IN ('cancelled')")
+    rows = _pr_rows(db)
     seen = db.kv("pr_signatures", {})
     workers, pr_timeout = pr_bounds(daemon, payload or {})
     per_call = (_BOUND.get() or (0, GH_TIMEOUT_S))[1]
@@ -331,9 +368,10 @@ def watch_prs(daemon, payload: dict | None = None) -> str:
     heads = dict(db.kv(prguard.HEADS_KEY, {}) or {})
     drafts = dict(db.kv(prguard.DRAFT_SEEN_KEY, {}) or {})
     changed = 0
-    # Merged and closed PRs are no longer read. The least recently checked go first, so a run cut short
-    # is continued by the next and a PR that keeps timing out waits behind the others.
-    watch = [t for t in rows if (seen.get(t["pr_url"]) or {}).get("state") not in DONE_STATES]
+    # Each PR once, however many tasks name it; merged and closed PRs are no longer read. The least
+    # recently checked go first, so a run cut short is continued by the next and a PR that keeps timing
+    # out waits behind the others.
+    watch = _one_per_pr(rows, seen)
     tried = {u: n for u, n in (db.kv(PR_TRIED_KEY, {}) or {}).items() if u in {t["pr_url"] for t in watch}}
     stint = max(tried.values(), default=0) + 1
     order = sorted(watch, key=lambda t: tried.get(t["pr_url"], 0))
@@ -416,7 +454,8 @@ def watch_prs(daemon, payload: dict | None = None) -> str:
     unapproved = f", {len(flagged)} out of draft unapproved" if flagged else ""
     if missed:
         shown = "; ".join(missed[:10]) + (f"; {len(missed) - 10} more" if len(missed) > 10 else "")
-        return f"cut short ({read} of {len(order)} PRs read, {changed} changed{unapproved}; not checked: {shown})"
+        return (f"cut short ({read} of {len(order)} PRs read, {changed} changed{unapproved}; "
+                f"{len(missed)} not checked: {shown})")
     return f"ok ({len(order)} PRs, {changed} changed{unapproved})"
 
 

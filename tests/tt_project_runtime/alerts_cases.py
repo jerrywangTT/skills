@@ -1611,6 +1611,169 @@ def test_pr_watch_logs_each_gh_calls_duration_and_what_a_cut_run_skipped(env, mo
     assert issue is not None and issue["status"] == "open" and "cut short" in issue["title"], "never silent"
 
 
+def _pr_tasks(p, urls):
+    for url in urls:
+        p.db.x("INSERT INTO tasks(title,kind,status,pr_url,created) VALUES(?,?,?,?,?)",
+               ("t", "code", "done", url, time.time()))
+
+
+EMPTY_BOT_DATA = {"data": {"repository": {"pullRequest": {"comments": {"nodes": []}, "reviews": {"nodes": []},
+                                                          "reviewThreads": {"nodes": []}}}}}
+
+
+def test_pr_watch_reads_and_lists_a_pr_several_tasks_name_once(env, monkeypatch):
+    """A PR named by many tasks (a hand-off's `pr` sets each one's pr_url) is read once per run, and a
+    run cut short names it once in its not-checked list, with the count of PRs left unchecked."""
+    from ttp import prguard, watchers
+    from ttp.daemon import Daemon
+    p = make(env)
+    base = "https://github.com/example-org/example-repo/pull/"
+    _pr_tasks(p, [base + "1", *[base + "2"] * 10, base + "2/files", base + "2#issuecomment-1", base + "3"])
+    clock, step, viewed = [1000.0], [10.0], []
+    monkeypatch.setattr(watchers, "_now", lambda: clock[0])
+
+    def gh(args, cwd):
+        if args[0] == "api":
+            return EMPTY_BOT_DATA
+        clock[0] += step[0]
+        viewed.append(prguard.pr_key(args[2]))
+        return {"url": base + args[2].split("/pull/")[1][:1], "state": "OPEN", "title": "t", "isDraft": True,
+                "headRefOid": HEAD}
+    monkeypatch.setattr(watchers, "_gh", gh)
+    one = {"deadline_s": 15, "pr_workers": 1}
+    status = watchers.run_builtin(Daemon(p.base), "prs", one)
+    assert status.startswith("cut short (2 of 3 PRs read") and "2 not checked:" in status, status
+    assert status.count("example-org/example-repo#2 ") == 1 and status.count("example-org/example-repo#3 ") == 1
+    assert viewed == ["example-org/example-repo#1", "example-org/example-repo#2"]
+    step[0], viewed[:] = 0.0, []
+    assert watchers.run_builtin(Daemon(p.base), "prs", one).startswith("ok (3 PRs"), "three PRs, not 13"
+    assert sorted(viewed) == [f"example-org/example-repo#{n}" for n in (1, 2, 3)], "each PR fetched once"
+
+
+def test_pr_watch_two_runs_check_every_pr_when_one_run_cannot(env, monkeypatch):
+    """More PRs than one run's deadline fits, one of them named by several tasks: the next run starts
+    where the cut one stopped, so two runs together read every PR."""
+    from ttp import prguard, watchers
+    from ttp.daemon import Daemon
+    p = make(env)
+    urls = [f"https://github.com/example-org/example-repo/pull/{n}" for n in range(1, 7)]
+    _pr_tasks(p, [urls[0]] * 6 + urls[1:])
+    clock, viewed = [1000.0], []
+    monkeypatch.setattr(watchers, "_now", lambda: clock[0])
+
+    def gh(args, cwd):
+        if args[0] == "api":
+            return EMPTY_BOT_DATA
+        clock[0] += 10
+        viewed.append(prguard.pr_key(args[2]))
+        return {"url": args[2], "state": "OPEN", "title": "t", "isDraft": True, "headRefOid": HEAD}
+    monkeypatch.setattr(watchers, "_gh", gh)
+    one = {"deadline_s": 25, "pr_workers": 1}   # three reads a run
+    for _ in range(2):
+        assert watchers.run_builtin(Daemon(p.base), "prs", one).startswith("cut short (3 of 6")
+    assert sorted(viewed) == sorted(prguard.pr_key(u) for u in urls), viewed
+
+
+MIXED_PRS = {   # number: (view answer extras, BOT_QUERY pullRequest)
+    1: ({"isDraft": True, "statusCheckRollup": [{"name": "build", "conclusion": "FAILURE", "status": "COMPLETED"}]},
+        {}),
+    2: ({"isDraft": False, "statusCheckRollup": [{"name": "build", "conclusion": "SUCCESS", "status": "COMPLETED"}]},
+        {"reviewThreads": {"nodes": [{"isResolved": False, "isOutdated": False, "path": "a.py", "comments": {"nodes": [
+            {"author": {"login": "lint[bot]"}, "body": "unused import", "url": "u2", "createdAt": "2026-01-01"}]}}]}}),
+    3: ({"isDraft": False, "statusCheckRollup": [{"name": "build", "conclusion": "SUCCESS", "status": "COMPLETED"}]},
+        {}),
+    4: ({"isDraft": True, "statusCheckRollup": [{"name": "build", "conclusion": "SUCCESS", "status": "COMPLETED"}]},
+        {"comments": {"nodes": [
+            {"author": {"login": "lint[bot]"}, "body": "style nit", "url": "u4", "createdAt": "2026-01-01"},
+            {"author": {"login": "someone"}, "body": "done", "url": "u4b", "createdAt": "2026-01-02"}]}}),
+}
+
+
+def test_pr_watch_parallel_reads_find_what_one_by_one_reads_find(env, monkeypatch):
+    """A mixed set of PRs (draft or not, CI failing or green, bot comments open or answered), one named by
+    two tasks: reading them several at once records the same signatures, findings and events as reading
+    them one by one, and each PR is fetched once either way."""
+    from ttp import prguard, watchers
+    from ttp.daemon import Daemon
+    urls = {n: f"https://github.com/example-org/example-repo/pull/{n}" for n in MIXED_PRS}
+    views: list = []
+
+    def gh(args, cwd):
+        time.sleep(0.01)
+        if args[0] == "api":
+            n = int(next(a for a in args if a.startswith("number=")).split("=")[1])
+            pr = {"comments": {"nodes": []}, "reviews": {"nodes": []}, "reviewThreads": {"nodes": []}}
+            return {"data": {"repository": {"pullRequest": {**pr, **MIXED_PRS[n][1]}}}}
+        views.append(prguard.pr_key(args[2]))
+        n = int(args[2].rsplit("/", 1)[1])
+        return {"url": urls[n], "state": "OPEN", "title": "t", "headRefOid": HEAD, **MIXED_PRS[n][0]}
+    monkeypatch.setattr(watchers, "_gh", gh)
+    p = make(env)
+    _pr_tasks(p, [urls[1], urls[2], urls[2], urls[3], urls[4]])
+    top = p.db.one("SELECT MAX(id) AS n FROM tasks")["n"]
+    keys = ("pr_signatures", prguard.UNAPPROVED_KEY, prguard.FINDINGS_KEY, prguard.HEADS_KEY,
+            prguard.DRAFT_SEEN_KEY, watchers.PR_TRIED_KEY)
+    got = []
+    for workers in (1, 8):
+        # The same start for both: no state from the other run, nor the fix tasks it queued.
+        p.db.x(f"DELETE FROM kv WHERE key IN ({','.join('?' * len(keys))})", keys)
+        p.db.x("DELETE FROM events")
+        p.db.x("DELETE FROM tasks WHERE id > ?", (top,))
+        p.db.set_kv(prguard.PREDATES_KEY, [urls[2], urls[3]])   # out of draft before the guard: not an approval
+        views.clear()
+        assert watchers.run_builtin(Daemon(p.base), "prs", {"deadline_s": 60, "pr_workers": workers}) \
+            .startswith("ok (4 PRs")
+        assert sorted(views) == sorted(prguard.pr_key(u) for u in urls.values()), "each PR fetched once"
+        new = lambda m: "#new" if int(m.group(1)) > top else m.group(0)   # a fix task each run queued
+        events = sorted((e["kind"], e["task"], re.sub(r"#(\d+)", new, e["text"]))
+                        for e in p.db.q("SELECT * FROM events WHERE source='pr'"))
+        findings = {k: {**r, "owner": r["owner"] and re.sub(r"#(\d+)", new, f"#{r['owner']}")}
+                    for k, r in p.db.kv(prguard.FINDINGS_KEY).items()}
+        got.append((p.db.kv("pr_signatures"), findings, events))
+    assert got[0] == got[1]
+    sigs, findings, events = got[0]
+    assert [sigs[urls[n]]["draft"] for n in MIXED_PRS] == [True, False, False, True]
+    assert [findings[prguard.pr_key(urls[n])]["bot_open"] for n in MIXED_PRS] == [0, 1, 0, 0], "an answered one is not open"
+    assert findings[prguard.pr_key(urls[1])]["failing"] == ["build"]
+    assert sorted(t for _, t, _ in events) == [1, 2], events
+
+
+def test_pr_watch_deadline_grows_with_the_pr_count_up_to_its_cap(env, monkeypatch, tmp_path):
+    """With no deadline in its payload, a prs run gets the time its PR count needs, each PR counted once,
+    never past PR_DEADLINE_AUTO_MAX_S; the schedule's kill timeout follows it. A payload's deadline_s wins,
+    and a run whose reads all stall still ends at its deadline."""
+    from ttp import watchers
+    from ttp.daemon import Daemon, SCHEDULE_GRACE_S
+    p = make(env)
+    d = Daemon(p.base)
+    floor = d.cfg["watchers"]["deadline_s"]
+    _pr_tasks(p, ["https://github.com/example-org/example-repo/pull/1"] * 1000)
+    assert watchers.bounds(d, {"builtin": "prs"})[0] == floor, "one PR however many tasks name it"
+    _pr_tasks(p, [f"https://github.com/example-org/example-repo/pull/{n}" for n in range(2, 1001)])
+    assert watchers.bounds(d, {"builtin": "prs"})[0] == watchers.PR_DEADLINE_AUTO_MAX_S
+    assert watchers.bounds(d, {}, "prs")[0] == watchers.PR_DEADLINE_AUTO_MAX_S
+    assert watchers.bounds(d, {})[0] == floor, "other builtins keep the configured deadline"
+    assert watchers.bounds(d, {"builtin": "prs", "deadline_s": 60})[0] == 60
+    assert d._schedule_timeout({"name": "prs", "kind": "watcher"}, {}) \
+        == watchers.PR_DEADLINE_AUTO_MAX_S + SCHEDULE_GRACE_S
+    n = 200 // watchers.PR_WORKERS * watchers.PR_WORKERS
+    keep = [f"https://github.com/example-org/example-repo/pull/{k}" for k in range(1, n + 1)]
+    p.db.x(f"DELETE FROM tasks WHERE pr_url NOT IN ({','.join('?' * n)})", tuple(keep))
+    assert watchers.bounds(d, {"builtin": "prs"})[0] == max(floor, n / watchers.PR_WORKERS * watchers.PR_READ_EST_S)
+    # Every read stalls: the run still ends at its (sized, capped) deadline and leaves no gh behind.
+    p.db.x("DELETE FROM tasks")
+    q, urls, pids = _fake_gh_prs(env, monkeypatch, tmp_path, 3, "1 2 3")
+    monkeypatch.setattr(watchers, "PR_DEADLINE_AUTO_MAX_S", 1.5)
+    monkeypatch.setattr(watchers, "PR_READ_EST_S", 100.0)
+    dq = Daemon(q.base)
+    dq.cfg = {**dq.cfg, "watchers": {**dq.cfg["watchers"], "deadline_s": 0.5}}
+    assert watchers.bounds(dq, {"builtin": "prs"})[0] == 1.5
+    t0 = time.monotonic()
+    status = watchers.run_builtin(dq, "prs", {"builtin": "prs", "pr_timeout_s": 30})
+    assert time.monotonic() - t0 < 6 and status.startswith("cut short (0 of 3"), status
+    assert _all_gone(pids)
+
+
 def test_pr_watch_leaves_no_gh_process_behind_at_its_deadline(env, monkeypatch, tmp_path):
     """Every PR hangs past the run's deadline: the run ends near it, reports them not checked, and
     each gh's whole group (its children too) is killed."""
