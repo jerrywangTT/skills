@@ -58,6 +58,8 @@ _now = time.monotonic
 _BOUND: contextvars.ContextVar[tuple[float, float] | None] = contextvars.ContextVar("watcher_bound", default=None)
 # the schedule run (schedrun.Run) of the builtin run in progress: its timeout or a daemon stop kills gh's groups
 _RUN: contextvars.ContextVar = contextvars.ContextVar("watcher_run", default=None)
+# one PR's read (_read_pr): _gh appends the timeout of each of its calls that timed out
+_TIMED_OUT: contextvars.ContextVar[list | None] = contextvars.ContextVar("watcher_timed_out", default=None)
 
 
 def _seconds(*values, default: float) -> float:
@@ -129,24 +131,31 @@ def run_builtin(daemon, name: str, payload: dict) -> str:
 
 def _gh(args: list[str], cwd: str) -> dict | None:
     """gh's JSON answer, or None. Its timeout is the running builtin's per-call one, cut to the time
-    left before its deadline; past the deadline it is not called. gh runs in a process group of its
-    own, killed whole at the timeout, and known to the schedule run while it lives."""
-    left, b = _left(), _BOUND.get()
+    left before its deadline; past the deadline or once its schedule run was stopped it is not called.
+    gh runs in a process group of its own, killed whole at the timeout, and known to the schedule run
+    while it lives (schedrun.track), so a daemon stop kills it too. A call that timed out is told to
+    _read_pr (_TIMED_OUT)."""
+    left, b, run = _left(), _BOUND.get(), _RUN.get()
     timeout = GH_TIMEOUT_S if b is None else min(b[1], left)
-    if timeout <= 0:
+    if timeout <= 0 or (run is not None and run.stopping.is_set()):
         return None
     try:
         proc = subprocess.Popen(["gh", *args], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                                 cwd=cwd, stdin=subprocess.DEVNULL, start_new_session=True)
     except (OSError, subprocess.SubprocessError):
         return None
-    run = _RUN.get()
-    if run is not None:
-        run.groups[proc.pid] = None
+    from . import schedrun
+    if run is not None and not schedrun.track(run, proc.pid):   # stopped while it started: killed
+        _kill_group(proc)
+        run.groups.pop(proc.pid, None)
+        return None
     try:
         out, _ = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
         _kill_group(proc)
+        timed = _TIMED_OUT.get()
+        if timed is not None:
+            timed.append(timeout)
         return None
     except BaseException:
         _kill_group(proc)
@@ -238,18 +247,26 @@ PR_FIELDS = "state,isDraft,mergeable,reviewDecision,statusCheckRollup,comments,r
 def _read_pr(t: dict, root: str, end: float, run_end: float | None) -> dict:
     """One PR's gh reads on a pool thread: its view, then an open PR's GraphQL, all before `end` on the
     _now clock (its own timeout or the run's deadline, whichever comes first). It only calls gh.
-    `cut` says why a read was not made or did not answer in time: "deadline" or "timeout"."""
+    `cut` says why a read was not made or did not answer in time: "deadline", "timeout" (the PR's) or
+    "call" (one gh call's own timeout, `gh_timeout_s`)."""
     b = _BOUND.get()
     _BOUND.set((end, b[1] if b else GH_TIMEOUT_S))
+    timed: list = []
+    _TIMED_OUT.set(timed)
     out: dict = {"pr": None, "data": None, "calls": [], "cut": None}
 
     def gh(what: str, args: list[str]) -> dict | None:
         if not _over():
-            t0 = _now()
+            t0, n = _now(), len(timed)
             r = _gh(args, root)
-            out["calls"].append(f"{what} {_now() - t0:.1f} s" + ("" if r is not None else " (no answer)"))
-            if r is not None or not _over():
+            late = len(timed) > n
+            out["calls"].append(f"{what} {_now() - t0:.1f} s" + ("" if r is not None else
+                                                                  " (timed out)" if late else " (no answer)"))
+            if r is not None or not _over() and not late:
                 return r
+            if not _over():
+                out["cut"] = "call"
+                return None
         out["cut"] = "deadline" if run_end is not None and end >= run_end else "timeout"
         return None
 
@@ -266,15 +283,16 @@ def _read_pr(t: dict, root: str, end: float, run_end: float | None) -> dict:
 def _read_prs(order: list[dict], root: str, workers: int, pr_timeout: float) -> dict[str, dict]:
     """Read the PRs of `order` (in that order), `workers` at once, each within `pr_timeout` and the
     run's deadline; none is started past the deadline. Returns {url: _read_pr's answer} of those
-    started. It returns only once every read it started ended, so it leaves no gh process behind."""
-    b = _BOUND.get()
+    started. It returns only once every read it started ended, so it leaves no gh process behind; none
+    is started once its schedule run was stopped."""
+    b, run = _BOUND.get(), _RUN.get()
     run_end = b[0] if b else None
     results: dict[str, dict] = {}
     todo, live = list(order), {}
     pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="pr-watch")
     try:
         while todo or live:
-            while todo and len(live) < workers and not _over():
+            while todo and len(live) < workers and not _over() and not (run and run.stopping.is_set()):
                 t = todo.pop(0)
                 end = _now() + pr_timeout if run_end is None else min(run_end, _now() + pr_timeout)
                 live[pool.submit(contextvars.copy_context().run, _read_pr, t, root, end, run_end)] = t
@@ -302,6 +320,7 @@ def watch_prs(daemon, payload: dict | None = None) -> str:
                 "AND status NOT IN ('cancelled')")
     seen = db.kv("pr_signatures", {})
     workers, pr_timeout = pr_bounds(daemon, payload or {})
+    per_call = (_BOUND.get() or (0, GH_TIMEOUT_S))[1]
     # PRs already out of draft when this check first ran predate the guard and are not flagged.
     before = db.kv(prguard.PREDATES_KEY)
     if before is None:
@@ -320,6 +339,8 @@ def watch_prs(daemon, payload: dict | None = None) -> str:
     order = sorted(watch, key=lambda t: tried.get(t["pr_url"], 0))
     t0 = _now()
     results = _read_prs(order, root, workers, pr_timeout)
+    from . import schedrun
+    schedrun.check_stopped()   # a daemon stop (or the timeout's kill) killed its reads: no result to save
     read, missed, timings = 0, [], []
     for t in order:
         r = results.get(t["pr_url"])
@@ -329,7 +350,8 @@ def watch_prs(daemon, payload: dict | None = None) -> str:
             continue
         timings.append(f"{name} {', '.join(r['calls']) or 'no call'}")
         if r["cut"]:
-            why = "deadline" if r["cut"] == "deadline" else f"{pr_timeout:g} s per-PR timeout"
+            why = {"deadline": "deadline", "call": f"{per_call:g} s gh call timeout"}.get(
+                r["cut"], f"{pr_timeout:g} s per-PR timeout")
             missed.append(f"{name} ({why}" + (": findings not read)" if r["pr"] is not None else ")"))
         pr, data = r["pr"], r["data"]
         if pr is None and r["cut"] == "deadline":

@@ -1624,6 +1624,52 @@ def test_pr_watch_leaves_no_gh_process_behind_at_its_deadline(env, monkeypatch, 
     assert len(pids.read_text().split()) == 4 and _all_gone(pids)
 
 
+@pytest.mark.parametrize("where", ["payload", "config"])
+def test_pr_watch_reports_a_pr_whose_gh_call_timed_out_before_its_per_pr_timeout(env, monkeypatch, tmp_path, where):
+    """The default ratio (a gh call's timeout below the PR's): a hung call times out on its own, the
+    PR is reported not checked and goes to the back of the rotation; the others still report."""
+    from ttp import watchers
+    from ttp.daemon import Daemon
+    p, urls, pids = _fake_gh_prs(env, monkeypatch, tmp_path, 3, "2")
+    d, payload = Daemon(p.base), {"deadline_s": 30, "pr_workers": 2}
+    if where == "payload":
+        payload.update(gh_timeout_s=1, pr_timeout_s=3)
+    else:   # no overrides: the config's watchers defaults, scaled down
+        assert d.cfg["watchers"]["gh_timeout_s"] < d.cfg["watchers"]["pr_timeout_s"]
+        d.cfg = {**d.cfg, "watchers": {**d.cfg["watchers"], "gh_timeout_s": 1, "pr_timeout_s": 3}}
+    t0 = time.monotonic()
+    status = watchers.run_builtin(d, "prs", payload)
+    assert time.monotonic() - t0 < 6
+    assert status.startswith("cut short (2 of 3") and "acme/widgets#2 (1 s gh call timeout)" in status, status
+    found = {r["task"] for r in p.db.q("SELECT task FROM events WHERE kind='pr_findings'")}
+    ids = {r["pr_url"]: r["id"] for r in p.db.q("SELECT id, pr_url FROM tasks")}
+    assert found == {ids[urls[0]], ids[urls[2]]}
+    tried = p.db.kv(watchers.PR_TRIED_KEY)
+    assert tried[urls[1]] == max(tried.values()), "the timed-out PR waits behind the others"
+    assert _all_gone(pids)
+
+
+def test_a_daemon_stop_mid_pass_kills_pr_watchs_gh_and_starts_no_more(env, monkeypatch, tmp_path):
+    """gh runs in sessions of its own on the pass's pool threads: a daemon stop kills them (the hung
+    one and its child), the pass starts no further read and the run unwinds recording nothing."""
+    from ttp import daemon as dm, schedrun, schedule as sched
+    p, urls, pids = _fake_gh_prs(env, monkeypatch, tmp_path, 3, "1 2 3")
+    sched.upsert(p.db, "prs", "watcher", "5m", payload={"builtin": "prs", "deadline_s": 60, "gh_timeout_s": 50,
+                                                        "pr_timeout_s": 50, "pr_workers": 1})
+    _due(p, "prs")
+    d = dm.Daemon(p.base)
+    d.run_schedules()
+    run = d._sched_runs["prs"]
+    assert _wait_for(lambda: len(pids.read_text().split()) == 2, 10), "the first gh hung"
+    schedrun.stop(p.db, list(d._sched_runs.values()))
+    assert run.done.wait(5) and run.stopped, "the run unwound on the stop"
+    time.sleep(0.5)
+    assert len(pids.read_text().split()) == 2, "a gh started after the stop"
+    assert _all_gone(pids), "the stop killed the hung gh and its child"
+    assert p.db.one("SELECT last_run FROM schedules WHERE name='prs'")["last_run"] is None
+    assert not p.db.kv("pr_signatures"), "the killed reads saved no result"
+
+
 
 def test_the_global_cap_alert_clears_by_itself_at_the_day_reset(env, tmp_path, monkeypatch):
     p, other = _global_cap_setup(env, tmp_path)

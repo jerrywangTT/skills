@@ -104,6 +104,19 @@ def spawned(pid: int) -> None:
         run.db.set_kv(GROUPS_KEY, groups)
 
 
+def track(run: Run, pid: int) -> bool:
+    """Process group `pid` started for `run` on a thread that is not the run's (a builtin watcher's pool):
+    kept in memory only (the run's database connection belongs to its own thread), so a stop (stop) or
+    the timeout's kill (kill) kills it, a daemon killed outright does not. One started after the run was
+    stopped is killed at once: returns False then."""
+    start_token = proc_start(pid)
+    run.groups[pid] = start_token
+    if run.stopping.is_set():   # the stop's kill may have looked before it was added: it would outlive the daemon
+        _kill(pid, start_token)
+        return False
+    return True
+
+
 def ended(pid: int) -> None:
     """Process group `pid` of the schedule run on this thread is over."""
     run = current()
@@ -152,11 +165,18 @@ def check_stopped() -> None:
 
 
 def stop(db: Any, runs: Any) -> list[str]:
-    """A daemon's stop: mark its `runs` stopping, then kill every recorded group (kill_all). The runs
-    unwind on Stopped and record nothing; their schedules are due again at the next start."""
+    """A daemon's stop: mark its `runs` stopping, then kill every recorded group (kill_all) and the ones
+    only their run knows (track). The runs unwind on Stopped and record nothing; their schedules are
+    due again at the next start."""
+    runs = list(runs)
     for run in runs:
         run.stopping.set()
-    return kill_all(db)
+    recorded = {int(pid) for pid in db.kv(GROUPS_KEY, {}) or {}}
+    lines = kill_all(db)
+    for run in runs:
+        lines += [f"killed process group {pid} of schedule {run.name}" for pid, tok in list(run.groups.items())
+                  if pid not in recorded and _kill(pid, tok)]
+    return lines
 
 
 def kill_all(db: Any) -> list[str]:
