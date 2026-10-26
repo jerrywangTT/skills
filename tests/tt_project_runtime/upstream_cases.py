@@ -321,3 +321,42 @@ def test_forward_status_labels_a_retired_target_and_forward_prunes_its_row(env, 
     upstream.append("demo", 3, [{"title": "upstream: a lesson", "spec": "s"}])
     upstream.forward(now + 3 * 3600)
     assert set(json.loads(upstream.forward_path().read_text())["targets"]) == {"live-host"}
+
+
+def test_upstream_fixed_prints_the_note_and_what_it_read(env, monkeypatch, capsys):
+    """`ttp upstream --fixed <fp>` used to print nothing: its exit code was all a reader got. It now
+    prints the note (its title, or that it is not in this inbox), its state and the running version
+    the answer rests on; a malformed fingerprint fails with a usage error."""
+    from ttp import cli, upstream
+    p = make(env)
+    note = {"title": "upstream: retries lose the spec", "spec": "Keep the spec on retry."}
+    upstream.append("demo", 4, [note])
+    fp = upstream.fingerprint(note["title"], note["spec"])
+    monkeypatch.chdir(p.base)
+    _runs_version(p, "0.2.9")
+    capsys.readouterr()
+
+    def fixed(arg):
+        rc = _upstream_cli(cli, "--fixed", arg)
+        out = capsys.readouterr()
+        return rc, out.out.strip(), out.err
+
+    rc, out, _ = fixed(fp)
+    assert rc == 1 and out.startswith(f"note {fp} (upstream: retries lose the spec): "), out
+    assert "no fix recorded yet" in out and "daemon runs 0.2.9: waiting for a fix" in out, out
+    upstream.resolve(fp, "0.2.10", "", "")
+    rc, out, _ = fixed(fp)
+    assert rc == 1 and "fixed in 0.2.10" in out and "runs 0.2.9: not yet" in out, out
+    _runs_version(p, "0.2.10")
+    rc, out, _ = fixed(fp)
+    assert rc == 0 and "fixed in 0.2.10" in out and "runs 0.2.10: it has the fix" in out, out
+    other = upstream.fingerprint("upstream: elsewhere", "s")
+    upstream.wontfix(other, "works as designed")
+    rc, out, _ = fixed(other)
+    assert rc == upstream.WONTFIX_RC and out.startswith(f"note {other} (not in this machine's inbox): wontfix"), out
+    assert "works as designed" in out, out
+    p.db.set_kv("daemon", {})
+    rc, out, _ = fixed(fp)
+    assert rc == 2 and "running daemon version is unknown" in out, out
+    rc, out, err = fixed("nothex")
+    assert rc == 2 and out == "" and "not a note fingerprint" in err, (out, err)

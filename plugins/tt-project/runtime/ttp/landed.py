@@ -702,7 +702,8 @@ def _has_push_branch(p) -> bool:
 
 def can_check(p) -> bool:
     """Whether a `landed:#<id>` wait can ever pass here: a push branch, else a landed probe. Without
-    either the harness chains with depends_on and refuses a new `landed:#<id>` (NO_CHECK)."""
+    either the harness chains with depends_on, the coordinator's task_add/task_update turn `landed:#<id>`
+    into depends_on, `ttp task` refuses it (NO_CHECK), and the daemon's probes (DONE_ENV) wait on the task being done."""
     return _has_push_branch(p) or bool(landed_probe(p))
 
 

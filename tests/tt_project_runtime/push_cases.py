@@ -11944,6 +11944,76 @@ def test_stray_running_batch_file_is_closed_at_daemon_start_and_a_live_one_is_le
     assert json.loads(marker.read_text())["status"] == "running"
 
 
+def test_a_stored_landed_wait_without_a_way_to_check_it_waits_on_the_task_being_done(env, monkeypatch):
+    """No delivery.push_branch and no delivery.landed_probe: a `landed:#<id>` already stored (or a
+    `ttp landed --task <id> && ...` chain) used to exit 2 on every probe, a broken-probe coordinator
+    turn each time. The daemon's probes now wait on the task being done, as depends_on would, and no
+    landed_wait_dead event is raised for a landing nothing could check."""
+    from ttp import daemon as dmod
+    p = make(env)
+    monkeypatch.setattr(dmod, "PROBE_EVERY_S", 0)
+    tid = p.db.add_task("producer", "s", kind="code", status="running")
+    now = f"deferred_since:{time.time():.0f}"
+    plain = p.db.add_task("after it", "s", kind="work", status="queued",
+                          labels=[f"start_when:landed:#{tid}", now])
+    chain = p.db.add_task("after it too", "s", kind="work", status="queued",
+                          labels=[f"start_when:ttp landed --task {tid} && test -e ok", now])
+    (p.root / "ok").write_text("")
+    d = dmod.Daemon(p.base)
+    for t in (plain, chain):
+        _settle_deferred(d, t)
+        assert not _ready(p, t) and not _events(p, t, "deferral_probe_broken"), t
+    p.db.update_task(tid, status="done")
+    for t in (plain, chain):
+        _settle_deferred(d, t, until=lambda: _ready(p, t))
+        assert _ready(p, t) and not _events(p, t, "deferral_probe_broken"), t
+    assert not p.db.q("SELECT * FROM events WHERE kind='landed_wait_dead'")
+
+
+def test_ttp_landed_by_hand_keeps_exit_2_where_no_landing_can_be_checked(env, monkeypatch, capsys):
+    """`ttp landed` run by hand (no landed.DONE_ENV) keeps its exit 2 and NO_CHECK message even for a
+    done task: only the daemon's probes read a done task as landed."""
+    from ttp import cli, landed
+    p = make(env)
+    monkeypatch.chdir(p.base)
+    monkeypatch.delenv(landed.DONE_ENV, raising=False)
+    tid = p.db.add_task("producer", "s", kind="code", status="done")
+
+    def run(*args):
+        try:
+            cli.main(["landed", *args])
+            rc = 0
+        except SystemExit as e:
+            rc = int(e.code or 0)
+        return rc, capsys.readouterr().out.strip()
+
+    assert run(f"#{tid}") == (landed.CANNOT, landed.NO_CHECK)
+    assert run("--task", str(tid)) == (landed.CANNOT, landed.NO_CHECK)
+    monkeypatch.setenv(landed.DONE_ENV, "1")
+    assert run("--task", str(tid))[0] == 0
+    failed = p.db.add_task("failed producer", "s", kind="code", status="failed")
+    assert landed.check(p, p.root, tid=failed)[0] == landed.NOT_YET
+
+
+@pytest.mark.parametrize("probe,ids,rest", [
+    ("landed:#5", [5], ""),
+    ("ttp landed --task 5", [5], ""),
+    ("ttp landed --task 5 && test -e x", [5], "test -e x"),
+    ("test -e x && ttp landed '#5' && ttp landed --task=6", [5, 6], "test -e x"),
+    ("ttp landed --task 5 && ttp landed --task 5", [5], ""),
+    ("ttp landed --task 5 || true", [], "ttp landed --task 5 || true"),
+    ("ttp landed --task 5; true", [], "ttp landed --task 5; true"),
+    ("ttp landed --task 5 2>&1 && true", [], "ttp landed --task 5 2>&1 && true"),
+    ("ttp landed --task 5 --onto x && true", [], "ttp landed --task 5 --onto x && true"),
+    ("ttp landed --task 5 && echo 'a && b", [], "ttp landed --task 5 && echo 'a && b"),
+    ("ttp landed --task 5 &&", [], "ttp landed --task 5 &&"),
+    ("test $(ttp landed --task 5) && true", [], "test $(ttp landed --task 5) && true"),
+])
+def test_split_landed_takes_out_only_the_terms_of_a_plain_and_chain(probe, ids, rest):
+    from ttp import landed
+    assert landed.split_landed(probe) == (ids, rest)
+
+
 def test_a_landed_wait_without_a_push_branch_runs_the_landed_probe_or_names_the_fix(env, monkeypatch):
     """No delivery.push_branch: `landed:#<id>` (`ttp landed --task <id>`) used to exit 2 with 'no
     target branch' on every check, each a broken-probe coordinator turn. Unset delivery.landed_probe:

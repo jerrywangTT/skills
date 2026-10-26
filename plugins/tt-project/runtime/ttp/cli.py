@@ -7737,8 +7737,9 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--wontfix", metavar="REASON", help="with --resolve: close note FP without a release (not a "
                                                        "plugin bug); the reason is required and recorded")
     s.add_argument("--note", help="with --resolve: what changed, for the project that filed it")
-    s.add_argument("--fixed", metavar="FP", help="probe: exit 0 once this project's running daemon has note FP's "
-                                                  "fix, 1 before, 2 when unknown, 3 when closed as not a bug (wontfix)")
+    s.add_argument("--fixed", metavar="FP", help="probe: print the note, its state and the running version; exit 0 once "
+                                                  "this project's running daemon has note FP's fix, 1 before, 2 when "
+                                                  "unknown, 3 when closed as not a bug (wontfix)")
     s.add_argument("--ack", nargs=2, metavar=("FP", "EVIDENCE"), help="close note FP: the fix works here")
     s.add_argument("--regress", nargs=2, metavar=("FP", "REASON"), help="record that note FP's shipped fix did not "
                                                                         "hold: blocks its close by silence")
