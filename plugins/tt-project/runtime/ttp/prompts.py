@@ -657,6 +657,11 @@ def worker_task(p: Project, task: dict, cwd: str, branch: str | None, wake: dict
                     + (", and starts from that branch's head" if on and (branch or gets_worktree(p, kind)) else "")
                     + (", and starts from the head of what it reviewed" if old["kind"] == "review" and branch else "")
                     + (f". Its last summary: {was}" if was else "") + "\n")
+    if kind == "code" and not branch:
+        history += (f"\nNo worktree was made for this task: make your own, t{task['id']} on branch "
+                    f"ttp/t{task['id']}-<topic>, in the repo you change"
+                    + (f" (from #{old['id']}'s branch; never edit in its worktree)" if old and continues_id(task) else "")
+                    + ".\n")
     history += verified_line(p, task, cwd)
     own_off = own_push(cfg) == "off"
     if own_off and branch and (onto := carried_branch(task) or rebased_branch(task)):

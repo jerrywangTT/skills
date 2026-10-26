@@ -71,8 +71,10 @@ def asks_for(task_id: int, open_asks: list[dict]) -> list[dict]:
 def _from_reason(reason: str) -> tuple[str, str]:
     """(kind, detail) from a blocked_reason the daemon writes; a worker's own words go to the
     coordinator, which decides or asks the user."""
-    from .daemon import LOGGED_OUT_NOTE, NET_HELD_NOTE, PAUSED_NOTE, WORKSPACE_RETRY_NOTE
+    from .daemon import LOGGED_OUT_NOTE, NET_HELD_NOTE, PAUSED_NOTE, BRANCH_HELD_NOTE, WORKSPACE_RETRY_NOTE
     r = reason.strip()
+    if r.startswith(BRANCH_HELD_NOTE):
+        return "time", "#" + r[len(BRANCH_HELD_NOTE):].split("; it starts once")[0].strip() + " to end"
     if r.startswith(PAUSED_NOTE):
         what = r[len(PAUSED_NOTE):].split("; it starts once resumed")[0].strip()
         return "resource", f"paused resource {what}".strip()

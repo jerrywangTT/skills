@@ -15713,3 +15713,29 @@ def test_pinned_worker_memory_is_the_same_in_light_standard_and_deep_runs(env):
         block = _memory_block(worker_system(p, task))
         blocks[tier] = {n for n, f in pins.items() if n + " " in block}
     assert blocks["light"] == blocks["standard"] == blocks["deep"] == set(pins), blocks
+
+
+def test_task_add_chains_a_continuation_after_an_open_task_on_the_same_branch(env):
+    # Another continuation of a failed task (or a task carrying its branch) is open: the new one waits
+    # until it ends (its label), and dispatch holds it meanwhile. A task on another branch and one sharing
+    # files only are not chained this way.
+    p = make(env)
+    from ttp import coordinator as coord, worktree
+    from ttp.daemon import Daemon
+    old = p.db.add_task("failed work", "s", kind="code", tier="light", origin="user")
+    p.db.update_task(old, status="failed", branch=f"ttp/t{old}-failed-work")
+    first = p.db.add_task("redo it", "s", kind="code", tier="light", origin="user", labels=[f"continues:{old}"])
+    assert coord.apply(p, [{"type": "task_add", "kind": "code", "title": "redo it again", "spec": "s",
+                            "continues": old}]) == []
+    new = p.db.one("SELECT * FROM tasks WHERE title='redo it again'")
+    assert worktree.lineage_hold(new) == first, new["labels"]
+    d = Daemon(p.base)
+    assert d._branch_hold(new, {}) and f"#{first}" in p.db.task(new["id"])["blocked_reason"]
+    p.db.update_task(first, status="failed")
+    assert not d._branch_hold(p.db.task(new["id"]), {}), "the hold outlived the task it waits for"
+    # pr_branch: the same branch chains; another branch does not.
+    p.db.update_task(first, status="queued", labels=json.dumps(["pr_branch:feat/x"]))
+    assert coord.apply(p, [{"type": "task_add", "kind": "code", "title": "on x", "spec": "s\npr_branch: feat/x"},
+                           {"type": "task_add", "kind": "code", "title": "on y", "spec": "s\npr_branch: feat/y"}]) == []
+    assert worktree.lineage_hold(p.db.one("SELECT * FROM tasks WHERE title='on x'")) == first
+    assert worktree.lineage_hold(p.db.one("SELECT * FROM tasks WHERE title='on y'")) is None

@@ -1432,6 +1432,25 @@ def _overlap_chain(p: Project, clash: list[dict], roots: set[int] = frozenset())
         return None
 
 
+def _lineage_tie(p: Project, kind: str, labels: list[str], skip: set) -> tuple[int, str] | None:
+    """(id, what it shares) of the newest queued, running or waiting task a new task of `kind` with
+    `labels` shares a branch or worktree with (worktree.claims: the branch it carries or rebases, the task it
+    continues and that task's branch): the new task starts only once that one ends (worktree.LINEAGE_HOLD,
+    Daemon._branch_hold). Tasks in `skip` (the one it continues) never count; files alone chain only
+    through _overlap_chain."""
+    if kind in worktree.NEVER_OWN_KINDS:
+        return None
+    branches, paths = worktree.claims(p, {"id": 0, "kind": kind, "branch": None, "labels": json.dumps(labels)})
+    mine = (branches, paths - {str(p.worktrees / "t0")})
+    if not mine[0] and not mine[1]:
+        return None
+    for t in p.db.q("SELECT * FROM tasks WHERE status IN ('queued','running','waiting') "
+                    "AND kind NOT IN ('review','harness') ORDER BY id DESC"):
+        if t["id"] not in skip and (what := worktree.clash(mine, worktree.claims(p, t))):
+            return t["id"], what
+    return None
+
+
 def _and_landed(p: Project, tid: int, when: str | None) -> str:
     """`when` ANDed after a wait on task `tid` landing: `landed:#<tid>` alone, else `ttp landed --task
     <tid> && <when as the daemon runs it>` (landed.probe_command, so an ancestor probe keeps its
@@ -1741,6 +1760,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 else:
                     tie = None
                 labels += [file_overlap.label(clash, tie and tie[0])] if clash else []
+                if lineage := _lineage_tie(p, kind, labels, {old["id"]} if old else set()):
+                    labels.append(f"{worktree.LINEAGE_HOLD}{lineage[0]}")
                 labels += defer_labels(after, when, why_after)
                 with db.tx():
                     new_id = db.add_task(title, a.get("spec") or "", kind=kind, tier=tier,
@@ -1789,6 +1810,9 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                            f"{inherited}` line names it)" if foreign is not None else "")
                     notes.append(f"task_add: #{new_id} continues #{old['id']} but not its branch {inherited}"
                                  f"{why}: it delivers to the push branch with `ttp push`")
+                if lineage:
+                    notes.append(f"task_add: #{new_id} chained after #{lineage[0]}, which is using {lineage[1]}: it "
+                                 f"starts once #{lineage[0]} ends, in a worktree of its own from that branch's head")
                 if stale:
                     notes.append(f"task_add: #{new_id} added; flagged: {stale}")
                 if clash:

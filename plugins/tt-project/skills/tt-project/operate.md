@@ -249,7 +249,9 @@
   own switch is adopted): put back when safe and reported low, else one `root-head` alert that
   clears once it is back. Meanwhile new worktrees start from the base or that branch, never the
   detached HEAD; with neither known they wait with that reason.
-  Code tasks always get their own worktree; `worktree.kinds` (default `[]`) gives other kinds one
+  Code tasks always get their own worktree (a project root that is no git repo: the worker makes
+  one named after its task id; two live tasks never share a branch or worktree: dispatch holds the
+  later one until the other ends); `worktree.kinds` (default `[]`) gives other kinds one
   too (say `["work"]`; never harness). A review runs in the worktree holding the branch it reviews,
   else in a detached worktree of its own at the reviewed head (`worktrees/t<id>`), never the root. Off by default because a fresh worktree lacks the
   root's untracked build trees, outputs and submodule checkouts that work tasks often use (no check

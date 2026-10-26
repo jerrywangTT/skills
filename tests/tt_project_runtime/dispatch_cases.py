@@ -563,3 +563,113 @@ def test_the_tool_allowlist_leaves_coordinator_turns_codex_and_cursor_alone(env,
     assert dmod.web_needed("worker", None) and dmod.web_needed("worker", {"kind": "code", "spec": ""})
     assert not dmod.web_needed("reviewer", {"kind": "review", "title": "review #1", "spec": "diff"})
     assert dmod.web_needed("reviewer", {"kind": "review", "title": "see http://example.org/a", "spec": ""})
+
+
+def _stub_runner(monkeypatch):
+    """Dispatch starts runs without launching their runner."""
+    from ttp import daemon as dm
+
+    class Proc:
+        pid = 4242
+    real = subprocess.Popen
+    monkeypatch.setattr(dm.subprocess, "Popen",
+                        lambda argv, *a, **k: Proc() if "ttp.runner" in argv else real(argv, *a, **k))
+
+
+def _run_cwd(p, tid):
+    run = p.db.one("SELECT dir FROM runs WHERE task=? ORDER BY id DESC", (tid,))
+    return json.loads((pathlib.Path(run["dir"]) / "run.json").read_text())["cwd"] if run else None
+
+
+def _end(p, tid):
+    p.db.x("UPDATE runs SET status='done', ended=? WHERE task=? AND status='running'", (time.time(), tid))
+    p.db.update_task(tid, status="done")
+
+
+def test_a_second_task_on_a_live_task_s_branch_is_held_until_it_ends_then_gets_its_own_worktree(env, monkeypatch):
+    # Two code tasks carry one branch: the later one never starts beside the running one. It waits with
+    # a note naming the holder and the branch, starts once the holder ended, in a worktree of its own
+    # from that branch's current head (the holder's commit included); the holder's worktree is untouched.
+    from ttp import daemon as dm
+    p = make(env)
+    _no_events(p)
+    p.db.x("UPDATE tasks SET status='done'")
+    p.set_config("core_provider", "claude")
+    _git_out(p.root, "branch", "feat/shared")
+    first = p.db.add_task("first on it", "s", kind="code", tier="light", origin="user", labels=["pr_branch:feat/shared"])
+    second = p.db.add_task("second on it", "s", kind="code", tier="light", origin="user",
+                           labels=["pr_branch:feat/shared"])
+    _stub_runner(monkeypatch)
+    dm.Daemon(p.base).dispatch()
+    assert _run_cwd(p, first) == str(p.worktrees / f"t{first}"), p.db.task(first)["blocked_reason"]
+    held = p.db.task(second)
+    assert held["status"] == "queued" and _run_cwd(p, second) is None
+    assert held["blocked_reason"].startswith(dm.BRANCH_HELD_NOTE) and f"#{first}" in held["blocked_reason"]
+    assert "branch feat/shared" in held["blocked_reason"], held["blocked_reason"]
+    # The holder commits on the branch; the next tick still holds the second task.
+    wt = p.worktrees / f"t{first}"
+    (wt / "a.txt").write_text("work")
+    _git_out(wt, "add", "a.txt")
+    _git_out(wt, "commit", "-qm", "work of the first")
+    tip = _git_out(wt, "rev-parse", "HEAD")
+    dm.Daemon(p.base).dispatch()
+    assert _run_cwd(p, second) is None
+    _end(p, first)
+    dm.Daemon(p.base).dispatch()
+    cwd = _run_cwd(p, second)
+    assert cwd == str(p.worktrees / f"t{second}") and cwd != str(wt), cwd
+    assert _git_out(cwd, "rev-parse", "HEAD") == tip, "it did not start from the branch's current head"
+    assert p.db.task(second)["status"] == "running" and not p.db.task(second)["blocked_reason"]
+    assert (wt / "a.txt").read_text() == "work"
+
+
+def test_code_tasks_on_different_branches_still_start_side_by_side(env, monkeypatch):
+    from ttp import daemon as dm
+    p = make(env)
+    _no_events(p)
+    p.db.x("UPDATE tasks SET status='done'")
+    p.set_config("core_provider", "claude")
+    _git_out(p.root, "branch", "feat/one")
+    _git_out(p.root, "branch", "feat/two")
+    one = p.db.add_task("on one", "s", kind="code", tier="light", origin="user", labels=["pr_branch:feat/one"])
+    two = p.db.add_task("on two", "s", kind="code", tier="light", origin="user", labels=["pr_branch:feat/two"])
+    plain = p.db.add_task("plain", "s", kind="code", tier="light", origin="user")
+    _stub_runner(monkeypatch)
+    dm.Daemon(p.base).dispatch()
+    assert [p.db.task(t)["status"] for t in (one, two, plain)] == ["running"] * 3, \
+        [p.db.task(t)["blocked_reason"] for t in (one, two, plain)]
+    assert len({_run_cwd(p, t) for t in (one, two, plain)}) == 3
+
+
+def test_a_task_continuing_a_running_task_s_lineage_is_held_by_worktree_path_too(env):
+    # A project root that is no git repo records no branch: the continued task's worktree path still
+    # ties two continuations of it, and a review never holds or is held.
+    from ttp import daemon as dm
+    p = make(env)
+    old = p.db.add_task("failed work", "s", kind="code", tier="light", origin="user")
+    p.db.update_task(old, status="failed")
+    a = p.db.add_task("redo a", "s", kind="code", tier="light", origin="user", labels=[f"continues:{old}"])
+    b = p.db.add_task("redo b", "s", kind="code", tier="light", origin="user", labels=[f"continues:{old}"])
+    review = p.db.add_task("review it", "s", kind="review", tier="light", origin="user", labels=[f"continues:{old}"])
+    p.db.update_task(a, status="running")
+    d = dm.Daemon(p.base)
+    live = d._live_claims()
+    assert d._branch_hold(p.db.task(b), live)
+    assert f"worktree {p.worktrees / f't{old}'}" in p.db.task(b)["blocked_reason"]
+    assert not d._branch_hold(p.db.task(review), live)
+
+
+def test_code_prompt_tells_a_task_in_a_root_that_is_no_git_repo_to_make_its_own_worktree(env):
+    from ttp.prompts import _read, worker_task
+    p = make(env)
+    text = _read(p, "kind-code.md")
+    assert "You are in a dedicated git worktree" not in text
+    assert "When it names none (the project root is no git repo), no worktree was made for you" in text
+    assert "Never edit in a worktree another task made or uses" in text
+    old = p.db.add_task("failed work", "s", kind="code", tier="light", origin="user")
+    p.db.update_task(old, status="failed")
+    tid = p.db.add_task("redo", "s", kind="code", tier="light", origin="user", labels=[f"continues:{old}"])
+    prompt = worker_task(p, p.db.task(tid), str(p.root), None)
+    assert f"make your own, t{tid} on branch ttp/t{tid}-<topic>" in prompt
+    assert f"from #{old}'s branch; never edit in its worktree" in prompt
+    assert "No worktree was made" not in worker_task(p, p.db.task(tid), str(p.worktrees / f"t{tid}"), "ttp/x")
