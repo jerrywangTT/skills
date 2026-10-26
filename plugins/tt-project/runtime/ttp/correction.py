@@ -235,23 +235,32 @@ def audit_line(db: DB, since: float) -> str:
         return f"class fix {fix}" if fix.startswith("#") else "none (reason given)" if fix == "reason" else "none"
     return (f"corrections from the user or a chat: {len(got)}, {sum(str(r.get('fix') or '').startswith('#') for r in got)} "
             "with a class fix: " + "; ".join(f"#{r['msg']} ({r.get('why')}) {fixed(r)}" for r in got[:8])
-            + (f"; and {len(got) - 8} more" if len(got) > 8 else "") + _repeat_clause(db, got))
+            + (f"; and {len(got) - 8} more" if len(got) > 8 else "") + _repeat_clause(db, since))
 
 
-def _repeat_clause(db: DB, got: list[dict]) -> str:
-    """'; repeated instructions, 24 h: N (top: "<sentence>" xK, first #id)' for the records in `got`
-    flagged as repeats, or ''."""
+def repeat_summary(db: DB, since: float) -> dict:
+    """The repeated instructions flagged since `since`: {count, top_sentence (<=60 chars, as first
+    said), top_count, first_id}; count 0 and the rest empty or None with none."""
+    got = [r for r in _records(db) if float(r.get("ts") or 0) >= since]
     by: dict[int, int] = {}
     for r in got:
         if m := re.fullmatch(r"repeats #(\d+)", str(r.get("why") or "")):
             by[int(m.group(1))] = by.get(int(m.group(1)), 0) + 1
     if not by:
-        return ""
+        return {"count": 0, "top_sentence": "", "top_count": 0, "first_id": None}
     top, k = max(by.items(), key=lambda x: (x[1], -x[0]))
     later = [int(r["msg"]) for r in got if r.get("why") == f"repeats #{top}"][-1]
     text = {r["id"]: r["text"] for r in db.q("SELECT id, text FROM messages WHERE id IN (?,?)", (top, later))}
     pairs = [(len(set(a) & set(b)) / len(set(a) | set(b)), " ".join(a))
              for a in sentences(text.get(top, "")) for b in sentences(text.get(later, ""))]
     said = max(pairs)[1] if pairs else ""   # the sentence as first said
-    return (f"; repeated instructions, 24 h: {sum(by.values())} (top: "
-            + (f'"{said[:60]}" ' if said else "") + f"x{k}, first #{top})")
+    return {"count": sum(by.values()), "top_sentence": said[:60], "top_count": k, "first_id": top}
+
+
+def _repeat_clause(db: DB, since: float) -> str:
+    """'; repeated instructions, 24 h: N (top: "<sentence>" xK, first #id)', or ''."""
+    s = repeat_summary(db, since)
+    if not s["count"]:
+        return ""
+    return (f"; repeated instructions, 24 h: {s['count']} (top: "
+            + (f'"{s["top_sentence"]}" ' if s["top_sentence"] else "") + f"x{s['top_count']}, first #{s['first_id']})")

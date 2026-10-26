@@ -16074,3 +16074,18 @@ def test_a_landed_start_when_is_refused_where_no_landing_can_be_checked(env, cap
         assert coord.apply(p, [{"type": "task_update", "id": other, "start_when": f"landed:#{first}"}]) == []
         assert deferral(p.db.task(other))["when"] == f"landed:#{first}"
         coord.apply(p, [{"type": "task_update", "id": other, "start_when": "now"}])
+
+
+def test_the_audit_json_has_a_repeated_instructions_row_matching_the_text_clause(env):
+    from ttp import audit, correction
+    p = make(env)
+    now = time.time()
+    assert audit.report(p.db, now)["repeated_instructions"] == {"count": 0, "top_sentence": "", "top_count": 0, "first_id": None}
+    first = _said(p, "Run the full suite before pushing.", days=3)
+    a = _said(p, "run the full suite before pushing please", days=0.5)
+    b = _said(p, "Again: run the full suite before pushing.")
+    p.db.set_kv(correction.KEY, [
+        {"msg": a, "ts": now - 3600, "why": f"repeats #{first}", "fix": "", "shown": True},
+        {"msg": b, "ts": now - 60, "why": f"repeats #{first}", "fix": "", "shown": False}])
+    assert audit.report(p.db, now)["repeated_instructions"] == {
+        "count": 2, "top_sentence": "run the full suite before pushing", "top_count": 2, "first_id": first}

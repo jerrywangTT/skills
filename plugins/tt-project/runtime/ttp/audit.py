@@ -432,4 +432,5 @@ def report(db: DB, now: float | None = None, window_s: float = WINDOW_S, blocked
             "finished": done, "per_outcome": per_outcome(done),
             "stuck": stuck_long(db, now, blocked_h), "review_loops": review_loops(db, since),
             "reviews": {**reviewstats.summary(db, since), "rows": reviewstats.rows(db, since)},
-            "overrides": overrides(p, db, now, blocked_h), "promises": obligations.promise_outcomes(db, since, now)}
+            "overrides": overrides(p, db, now, blocked_h), "promises": obligations.promise_outcomes(db, since, now),
+            "repeated_instructions": correction.repeat_summary(db, since)}
