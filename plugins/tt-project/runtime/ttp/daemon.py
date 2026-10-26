@@ -256,6 +256,7 @@ PROBE_EVERY_S = 180     # how often a waiting task's `retry_when` (or a deferred
 NOT_YET_RCS = (1, 75, 255)   # probe exits meaning "not yet": 1, EX_TEMPFAIL (a busy `ttp lock`), ssh unreachable
 JOB_FAILED = "detached job failed"   # what a `ttp detach --check` exit detach.FAILED_RC found (Daemon._job_failed)
 PROBE_TIMEOUT_S = 60
+PROBE_STALL_PASS_S = 120   # probe time one probe-stall disposition pass may spend (sweep.dispose_probe_stalls)
 # The detached rerun of a shared failure's ids on the push-branch tip (Daemon._start_tip_check):
 # argv dir worktree repo timeout_s cmd...; removes the worktree, then writes rc (124 once timed out),
 # so a present rc means the rerun is wholly done.
@@ -5693,6 +5694,13 @@ class Daemon:
         self._sweep_checked = now
         db = self.p.db
         try:
+            self._probe_budget = now + PROBE_STALL_PASS_S
+            for rec in sweep.dispose_probe_stalls(db, self.cfg, now, _current_probe, self._probe_now,
+                                                  self._probe_stall_act):
+                log(self.p, f"task {rec['task']} probe stall ({rec['hours']} h not yet): {rec['disposition']}: {rec['why']}")
+        except Exception:   # a disposition that fails must not stop the sweep
+            log(self.p, "probe stall disposition failed: " + traceback.format_exc().replace("\n", " | ")[:1500])
+        try:
             why = sweep.due(db, self.cfg, now)
             if not why:
                 return
@@ -5721,6 +5729,47 @@ class Daemon:
                 log(self.p, f"blocker sweep queued ({why}; a turn: {got['why']})")
         except Exception:   # a sweep that cannot start must not stop the tick
             log(self.p, "blocker sweep failed: " + traceback.format_exc().replace("\n", " | ")[:1500])
+
+    def _probe_now(self, probe: str) -> int | str | None:
+        """Run one probe to its end (a probe stall's re-check): its exit code, "timeout" or "could not
+        start"; None once this pass's probe time (PROBE_STALL_PASS_S) is spent."""
+        left = getattr(self, "_probe_budget", 0.0) - time.time()
+        if left <= 0:
+            return None
+        try:
+            proc = subprocess.Popen(landed.probe_command(probe, self.p), shell=True, cwd=str(self.p.root),
+                                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL, start_new_session=True, env=self._probe_env())
+        except OSError:
+            return "could not start"
+        try:
+            return proc.wait(timeout=min(PROBE_TIMEOUT_S, left))
+        except subprocess.TimeoutExpired:
+            _kill_group(proc)
+            return "timeout"
+
+    def _probe_stall_act(self, task: dict, what: str, note: str) -> None:
+        """Lift a probe stall's hold model-free: 'passed' as a passed probe does; 'release' appends
+        `note` to the spec and lets the task start once at its own tier."""
+        now, tid = time.time(), task["id"]
+        waiting = not deferral(task).get("when")
+        if what == "passed":
+            if waiting:
+                self._probe_passed(task, now, why="probe passed on a probe-stall re-check")
+            else:
+                self._start_verdict(task, 0, now)
+            return
+        self.p.db.update_task(tid, spec=f"{task['spec'] or ''}\n\n{note}".lstrip())
+        task = self.p.db.task(tid)
+        progress.forget_probe(self.p.db, tid)
+        if waiting:
+            self._wake_waiting(task, "probe stale: released once by the blocker sweep", now)
+            return
+        self._probe_rc.pop(tid, None)
+        self._start_rc.pop(tid, None)
+        startgate.forget(self.p.db, tid=tid)
+        self.p.db.update_task(tid, labels=without_deferral(json.loads(task["labels"] or "[]")), not_before=None)
+        log(self.p, f"task {tid} start_when stale: released once by the blocker sweep")
 
     def maybe_coordinate(self) -> None:
         if not self.lease_held():

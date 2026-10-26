@@ -55,6 +55,12 @@ Loops: a task handed off stuck twice in a row with the same normalized reason, o
 while it stayed in the same stuck state since the last sweep, is shown as LOOP: resolve it, do not
 re-addend it. Reviews: a task in review longer than coordinator.review_backlog_h (default 6) gets a
 line on its review task: none queued, queued but held (and why), running, failed or finished.
+
+Probe stalls: before each sweep check the daemon settles every `stall:probe:#<id>` open longer than
+coordinator.probe_stall_dispose_h (default 1; 0 off) without a model call (dispose_probe_stalls): a
+probe whose named tasks are all done is re-run (a pass lifts the hold; a not yet releases the task
+once with a note to check its probe), one that greps a literal sha is flagged, one only the user can
+end is left alone. The digest lists each disposition.
 """
 from __future__ import annotations
 
@@ -90,6 +96,15 @@ UNTIL_MIN_CHARS = 12
 STUCK_EVENTS = tuple(unblock.STUCK)
 RECHECK_H = 24.0         # a watched hold carried on its unchanged fingerprint is re-judged by a turn this often
 PROBE_FRESH_S = 3600     # a probe verdict older than this says nothing about the hold now
+PROBE_STALL_KEY = "blocker_sweep_probe_stalls"  # kv: {tid: {"probe", "disposition", "why", "at", "hours", "note"}}
+PROBE_STALL_H = 1.0      # coordinator.probe_stall_dispose_h: a probe stall open this long is disposed model-free
+PROBE_STALL_RECHECK_S = 1800  # a disposition that is not final is re-judged this often
+PROBE_STALL_FINAL = ("rechecked-passed", "released-stale")   # once per task and probe text
+PROBE_STALL_DISPOSITIONS = ("rechecked-passed", "released-stale", "literal-sha-flagged", "user-gated-left", "listed")
+PROBE_SHA_NOTE = ("probe greps a literal sha; likely stale after a rebase or redeploy: "
+                  "wait with `landed:#<id>` or `ttp landed <sha>`")
+_PROBE_WORDS = re.compile(r"[\s'\"();|&<>]+")
+_SECRET_PROBE = re.compile(r"\bttp\s+secret\b|secrets\.json")
 
 
 def _cfg(cfg: dict, key: str, default: float) -> float:
@@ -954,6 +969,124 @@ def prepare(db: DB, event_id: int, cfg: dict, now: float | None = None) -> None:
                      (event["ts"], "daemon", SWEEP_KIND, "normal", text, payload, "queued"))
 
 
+def _probe_sha(probe: str) -> str:
+    return hashlib.sha1(probe.encode()).hexdigest()[:12]
+
+
+def _user_gated(db: DB, t: dict, probe: str, cfg: dict, asks: list[dict]) -> str | None:
+    """Why a probe only the user can end (a user marker, a saved secret, an open ask holding the
+    task) is left alone, or None."""
+    from . import waits
+    rx = userpause.marker(cfg)
+    if userpause.is_probe(probe, cfg) or any(rx.search(w) for w in _PROBE_WORDS.split(probe) if w):
+        return "it tests a user marker"
+    if _SECRET_PROBE.search(probe):
+        return "it tests a saved secret"
+    held = waits._held_ask(t)
+    if (held is not None and any(a["id"] == held for a in asks)) or waits.asks_for(t["id"], asks):
+        return "an open ask holds the task"
+    return None
+
+
+def dispose_probe_stalls(db: DB, cfg: dict, now: float, current_probe: Callable[[dict], str | None],
+                         run_probe: Callable[[str], Any], act: Callable[[dict, str, str], Any]) -> list[dict]:
+    """Settle every probe stall (progress.probe_stalls' `stall:probe:#<id>`) open longer than
+    coordinator.probe_stall_dispose_h (0 off) without a model call. When every task the wait names
+    (`landed:#N`, a dependency) is done, and each `landed:` one is on the push branch, the probe is
+    re-run now (run_probe returns its exit code, None when the pass has no probe time left): a pass lifts the hold (act 'passed'); a not yet
+    marks the probe stale and releases the task once with a spec note (act 'release'), at most once
+    per task and probe text. A probe that greps a literal sha is flagged; one only the user can end is
+    left. Each item records its disposition (PROBE_STALL_DISPOSITIONS) in PROBE_STALL_KEY."""
+    from . import landed, progress
+    h = _cfg(cfg, "probe_stall_dispose_h", PROBE_STALL_H)
+    if not h:
+        return []
+    raised = progress.load(db).get("raised") or {}
+    done = db.kv(PROBE_STALL_KEY, {}) or {}
+    asks = None
+    out = []
+    for key, r in sorted(raised.items()):
+        if not key.startswith("stall:probe:#") or not isinstance(r, dict):
+            continue
+        first = r.get("first") or r.get("since")
+        if not isinstance(first, (int, float)) or now - first < h * 3600:
+            continue
+        try:
+            tid = int(key.rsplit("#", 1)[1])
+        except ValueError:
+            continue
+        t = db.task(tid)
+        probe = current_probe(t) if t and t["status"] == "queued" else None
+        if not probe:
+            continue
+        sha, prev = _probe_sha(probe), done.get(str(tid)) or {}
+        if prev.get("probe") == sha and (prev.get("disposition") in PROBE_STALL_FINAL
+                                         or now - float(prev.get("at") or 0) < PROBE_STALL_RECHECK_S):
+            continue
+        if asks is None:
+            asks = [{"id": int(a["id"]), "kind": a["kind"], "text": a["text"]}
+                    for a in db.q("SELECT id, kind, text FROM messages WHERE direction='out' AND kind='ask' AND handled=0")]
+        since = r.get("since") if isinstance(r.get("since"), (int, float)) else first
+        hours = f"{max(0.0, now - since) / 3600:.1f}"
+        sha_lit = landed.literal_sha(probe)
+        rec = {"probe": sha, "at": now, "hours": hours}
+        if why := _user_gated(db, t, probe, cfg, asks):
+            rec.update(disposition="user-gated-left", why=f"{why}: left for the user, no wake")
+        else:
+            refs = [int(n) for n in landed.task_refs(probe) if int(n) != tid]
+            named = sorted(set(refs) | {n for n in dependency_ids(t) if n != tid})
+            rows = [db.task(n) for n in named]
+            finished = bool(named) and all(x and x["status"] == "done" for x in rows)
+            unrun = False
+            for n in refs if finished else ():
+                got = run_probe(f"landed:#{n}")
+                if got is None:   # no probe time left in this pass: judged on a later one
+                    unrun = True
+                    break
+                if got != 0:
+                    finished = False
+                    break
+            if unrun:
+                continue
+            if finished:
+                rc = run_probe(probe)
+                if rc is None:
+                    continue
+                names = ", ".join(f"#{n}" for n in named)
+                if rc == 0:
+                    rec.update(disposition="rechecked-passed", why=f"{names} done; the probe passes on a re-run")
+                else:
+                    rec.update(disposition="released-stale",
+                               why=f"{names} done but the probe still says not yet (exit {rc}): released once")
+                    note = (f"[probe stall] your probe has said not yet for {hours} h while the task it waits on is "
+                            f"done; check it still tests what you wait for ({names} done; probe: {_clip(probe, 160)}).")
+                    if sha_lit:
+                        note += f" {PROBE_SHA_NOTE}"
+                    rec["note"] = note
+            elif sha_lit:
+                rec.update(disposition="literal-sha-flagged", why=f"{PROBE_SHA_NOTE} ({sha_lit})")
+            else:
+                rec.update(disposition="listed",
+                           why="no finished task named and no literal sha: the stall item stands")
+        done[str(tid)] = rec
+        db.set_kv(PROBE_STALL_KEY, done)   # before acting: a failed act never releases twice
+        if rec["disposition"] == "rechecked-passed":
+            act(t, "passed", rec["why"])
+        elif rec["disposition"] == "released-stale":
+            act(t, "release", rec["note"])
+        out.append({"task": tid, **rec})
+    return out
+
+
+def probe_stall_lines(db: DB, now: float, hours: float = 24.0, n: int = 8) -> list[str]:
+    """One line per probe-stall disposition recorded in the last `hours` (newest first)."""
+    recs = sorted(((int(k), v) for k, v in (db.kv(PROBE_STALL_KEY, {}) or {}).items()
+                   if isinstance(v, dict) and now - float(v.get("at") or 0) <= hours * 3600),
+                  key=lambda kv: -float(kv[1].get("at") or 0))
+    return [f"- probe stall #{tid} ({v.get('hours', '?')} h not yet): {v.get('disposition')}: {_clip(v.get('why'), 160)}"
+            for tid, v in recs[:n]]
+
+
 def digest_lines(db: DB, event_ids: list[int], now: float | None = None, cfg: dict | None = None) -> list[str]:
     """Only this batch's sweep identities; later batches stay queued for consecutive turns. A provider
     held red by its budget gate gets a line with its unblock path (free window resets, paid credits,
@@ -977,6 +1110,7 @@ def digest_lines(db: DB, event_ids: list[int], now: float | None = None, cfg: di
             path = credits.unblock_path(db, cfg or {}, prov, now)
             out.append(f"- provider {prov} held (no sweep action; {_clip('; '.join(g.get('reasons') or []), 160)}) | "
                        f"unblock path: {path or 'none reported (no free resets or paid credits)'}")
+    out.extend(probe_stall_lines(db, now))
     if n := planned_deferrals(db, now):
         out.append(f"planned deferrals: {n}")
     return out

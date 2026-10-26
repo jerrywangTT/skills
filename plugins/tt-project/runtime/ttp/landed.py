@@ -38,6 +38,11 @@ FETCH_ANCESTOR_PROBE = re.compile(
     r"git\s+merge-base\s+--is-ancestor\s+([0-9a-f]{7,64})\s+([\w./-]+)\s*")
 # `ttp landed --task <id>` / `ttp landed #<id>` inside a longer probe: the task it waits on.
 _LANDED_TASK = re.compile(r"\bttp\s+landed\b[^|;&\n]*?(?:--task(?:=|\s+)|\s#)['\"]?([^\s'\"|;&)]+)")
+# A literal commit sha in a probe: 7 to 40 lowercase hex characters with a digit and a letter (an
+# epoch or a plain word is no sha), not part of a longer word or a dashed id (a UUID).
+_LITERAL_SHA = re.compile(r"(?<![\w-])(?=[0-9a-f]*[0-9])(?=[0-9a-f]*[a-f])[0-9a-f]{7,40}(?![\w-])")
+# Probes whose hex is a task-landing wait, a reply hash or an upstream note id, not a deployed commit.
+_SHA_WAIT_OK = re.compile(r"landed:|\bttp\s+landed\b|ack-wait|upstream\s+--fixed")
 REPLAYED = "Ttp-Replayed-From"   # batch.REPLAYED: a commit the push queue settled names the one it replays
 FETCH_S = 40                     # within the daemon's 60 s probe timeout
 NOT_YET, CANNOT = 1, 2
@@ -93,6 +98,17 @@ def task_refs(probe: str | None) -> list[str]:
     probe = probe or ""
     m = LANDED_PROBE.fullmatch(probe)
     return list(dict.fromkeys([m.group(1)] if m else _LANDED_TASK.findall(probe)))
+
+
+def literal_sha(probe: str | None) -> str | None:
+    """The first literal commit sha a probe tests (a grep of a deployed commit, say), or None. A
+    `landed:#<id>` or `ttp landed` wait and an ancestor probe the daemon runs as `ttp landed`
+    (probe_command) follow a rebase or replay; any other sha goes stale after one or a redeploy."""
+    probe = probe or ""
+    if _SHA_WAIT_OK.search(probe) or probe_command(probe) != probe:
+        return None
+    m = _LITERAL_SHA.search(probe)
+    return m.group(0) if m else None
 
 
 def missing_task_refs(db, probe: str | None) -> list[str]:

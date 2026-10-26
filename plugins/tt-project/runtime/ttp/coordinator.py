@@ -1301,7 +1301,8 @@ def marker_only_probe(probe: str | None, root: Path | str | None = None) -> str 
     """A hint when a start_when only checks that a readiness marker file exists, or waits over ssh
     only for an end marker with no dead-driver check (waitheal.end_marker_only), or greps a status
     section header that is always printed (waitheal.header_grep), or (with the project `root`) reads
-    a project-relative file that does not exist (missing_file_probe), else None."""
+    a project-relative file that does not exist (missing_file_probe), or tests a literal commit sha
+    (landed.literal_sha), else None."""
     from .waitheal import probe_flag
     end = probe_flag(probe)
     if end:
@@ -1309,6 +1310,11 @@ def marker_only_probe(probe: str | None, root: Path | str | None = None) -> str 
     missing = missing_file_probe(probe, root)
     if missing:
         return missing
+    from .landed import literal_sha
+    sha = literal_sha(probe)
+    if sha:
+        return (f"start_when {clip(probe, 120)!r} greps a literal sha ({sha}), likely stale after a rebase or "
+                f"redeploy: wait with `landed:#<id>`, or for a commit with `ttp landed <sha>`")
     if not probe or not _MARKER_ONLY.fullmatch(probe) or not re.search(r"ready", probe, re.I):
         return None
     return (f"start_when {clip(probe, 120)!r} only checks a readiness marker file, which can outlive the "
