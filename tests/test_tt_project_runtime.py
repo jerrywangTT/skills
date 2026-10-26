@@ -474,6 +474,7 @@ def env(tmp_path, monkeypatch, _git_session, _short_tmp):
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude"))   # `ttp setup` never writes the user's own skills
     monkeypatch.setenv("TTP_TEST_NO_SYNC", "1")   # setup and upgrades skip the host-wide flush (minutes on a busy host)
     monkeypatch.setenv("TTP_TEST_NO_NOTIFIER", "1")   # setup, upgrade and status never restart or test the account's own notifier
+    monkeypatch.setenv("TTP_TEST_NO_JOURNAL", "1")   # a reboot record never reads this host's own journal (initiator.py)
     # Tests may run inside a live run, detached checks, `ttp detach` (no in-run lock-wait cap) or `ttp lock`.
     # The outer checks' output directory and lifetime descriptor belong to that invocation.
     for var in ("TTP_RUN_DIR", "TTP_TASK", "TTP_RUN_ID", "TTP_PROJECT", "TTP_DETACHED", "TTP_LOCKS_HELD", "TTP_PIDNS",
@@ -22229,7 +22230,8 @@ def test_a_clean_stop_makes_the_next_boot_orderly_and_a_crash_abrupt(env, tmp_pa
     assert p.db.kv("boot_prev")["shutdown"] == how
     assert json.loads(p.db.one("SELECT note FROM runs WHERE id=?", (rids[0],))["note"])["shutdown"] == how
     ev = p.db.q("SELECT text, data FROM events WHERE source='host' AND kind='boot'")
-    assert len(ev) == 1 and ev[0]["text"] == f"the host rebooted ({how}); 1 run(s) cut short", ev
+    assert len(ev) == 1 and ev[0]["text"] == (f"the host rebooted ({how}); 1 run(s) cut short; "
+                                              f"initiator: unknown (journal not readable)"), ev
     assert json.loads(ev[0]["data"])["shutdown"] == how
     note = _reboot_notices(p)
     assert len(note) == 1 and note[0]["text"].startswith(f"The host rebooted ({how}; 1st reboot in 24 h)"), note

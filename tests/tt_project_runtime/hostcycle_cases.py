@@ -791,3 +791,134 @@ def test_a_long_reboot_downtime_with_no_run_cut_short_still_posts_the_notice(env
     d.reap_runs()
     (msg,) = _down_notices(p)
     assert "the host rebooted (orderly)" in msg["text"] and "0 run(s) were cut short" in msg["text"], msg["text"]
+
+
+# Who started the shutdown that ended the previous boot (initiator.py): fixture journal output only,
+# never the real journalctl (the env fixture sets TTP_TEST_NO_JOURNAL).
+_SUDO_REBOOT = ("Oct 25 21:59:58 testhost sudo[4242]:  someuser : TTY=pts/3 ; PWD=/home/someuser ; USER=root ; "
+                "COMMAND=/usr/sbin/reboot\n"
+                "Oct 25 21:59:59 testhost systemd-logind[812]: System is rebooting.\n")
+_PKEXEC_POWEROFF = ("Oct 25 21:59:58 testhost pkexec[51]: someuser: Executing command [USER=root] [TTY=/dev/pts/0] "
+                    "[CWD=/home/someuser] [COMMAND=/usr/bin/systemctl poweroff]\n")
+_POWER_KEY = ("Oct 25 21:59:50 testhost systemd-logind[812]: Power key pressed short.\n"
+              "Oct 25 21:59:51 testhost systemd-logind[812]: Powering off...\n")
+_HIDDEN = (0, "", "Hint: You are currently not seeing messages from other users and the system.\n")
+
+
+def _initiator_reboot(p, tmp_path, monkeypatch, journal, last_heartbeat_ago=600):
+    """A new boot after one that cut a run short, with run_journal answering `journal`; the reboot notice."""
+    from ttp import initiator
+    from ttp.daemon import Daemon
+    calls = []
+    monkeypatch.setattr(initiator, "run_journal", lambda boot: calls.append(boot) or journal)
+    _boot_as(monkeypatch, "boot-0")
+    Daemon(p.base).tick()
+    p.db.set_kv("paused", True)
+    _lost_deep_runs(p, tmp_path, "boot-0", costs=(1.0,))
+    _boot_as(monkeypatch, "boot-1", time.time() - 60)
+    d = Daemon(p.base)
+    d.tick()
+    d.tick()
+    assert calls == ["boot-0"], "the journal is read once per boot, for the boot that ended"
+    (n,) = _reboot_notices(p)
+    ev = p.db.one("SELECT text, data FROM events WHERE source='host' AND kind='boot' ORDER BY id DESC LIMIT 1")
+    return n["text"], ev["text"], json.loads(ev["data"])["initiator"]
+
+
+@pytest.mark.parametrize("journal,said", [
+    ((0, _SUDO_REBOOT, ""), "Initiator: someuser ran `reboot` via sudo (journal)."),
+    ((0, _PKEXEC_POWEROFF, ""), "Initiator: someuser ran `systemctl poweroff` via pkexec (journal)."),
+    ((0, _POWER_KEY, ""), "Initiator: the power key (journal)."),
+    ((0, "Oct 25 21:59:59 testhost systemd-logind[812]: System is powering down.\n", ""),
+     "Initiator: a request to systemd-logind that names no user (journal: System is powering down.)."),
+    ((0, "", ""), "Initiator: unknown."),
+    (_HIDDEN, "Initiator: unknown (journal not readable)."),
+    ((1, "", "No journal files were opened due to insufficient permissions.\n"),
+     "Initiator: unknown (journal not readable)."),
+    (None, "Initiator: unknown (journal not readable)."),   # journalctl missing or timed out
+])
+def test_the_reboot_notice_names_who_started_the_shutdown_from_the_journal(env, tmp_path, monkeypatch, journal, said):
+    p = make(env)
+    feed, record, got = _initiator_reboot(p, tmp_path, monkeypatch, journal)
+    assert said in feed, feed
+    assert record.endswith("; " + said[:-1].replace("Initiator", "initiator")), record
+    assert got["source"] == ("unknown" if "unknown" in said else "journal"), got
+
+
+def test_the_reboot_notice_names_a_host_cycle_record_of_another_project(env, tmp_path, monkeypatch):
+    from ttp import initiator
+    p, q = make(env), _second_project(env)
+    rec = q.state / "host-cycle" / "rec-a" / "record.json"
+    rec.parent.mkdir(parents=True)
+    rec.write_text(json.dumps({"id": "rec-a", "boot_id": "boot-0", "started": time.time() - 300,
+                               "dry_run": False, "reason": "firmware update", "by": "ttp drain"}))
+    got = initiator.find(p, "boot-0", time.time() - 60, time.time() - 600, journal=_HIDDEN)
+    assert got["source"] == "host-cycle" and got["project"] == q.name, got
+    assert got["text"] == f"`ttp drain --reboot` in project {q.name} (host-cycle record rec-a: firmware update)", got
+    # A planned cycle's notice already names its record: the clause is not repeated there.
+    feed, record, stored = _initiator_reboot(p, tmp_path, monkeypatch, _HIDDEN)
+    assert stored == {**got, "record": str(rec)} and "Initiator:" not in feed and "initiator:" not in record, feed
+    assert "It was a planned host cycle (host-cycle record rec-a" in feed, feed
+    # A host-cycle record of an earlier boot, or a dry run, names nothing.
+    assert initiator.find(p, "boot-9", time.time(), None, journal=_HIDDEN)["source"] == "unknown"
+
+
+def test_the_reboot_notice_names_a_ledger_entry_recorded_just_before_the_shutdown(env, tmp_path, monkeypatch):
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    p = make(env)
+    mm.add("testhost")
+    mm.add("otherhost")
+    now = time.time()
+    ml.add_change("testhost", "raised the fan curve", "none: kept", "other", expires="2h", now=now - 900)
+    ml.add_change("otherhost", "power cycled it via the BMC", "none: done", "other", expires="2h", now=now - 400)
+    ml.add_change("testhost", "power cycled it via the BMC", "none: done", "other", expires="2h",
+                  now=now - 4 * 3600)   # long before the shutdown
+    hit = ml.add_change("testhost", "power-cycled the host via the BMC: chips off the bus", "none: done", "other",
+                        expires="2h", now=now - 300)
+    feed, record, got = _initiator_reboot(p, tmp_path, monkeypatch, _HIDDEN)
+    assert got == {"source": "ledger", "by": "other", "entry": hit["id"],
+                   "text": f"machine-change ledger entry #{hit['id']} by project other: "
+                           f"power-cycled the host via the BMC: chips off the bus"}, got
+    assert f"Initiator: machine-change ledger entry #{hit['id']} by project other: power-cycled" in feed \
+        and "(abrupt;" in feed, feed
+
+
+def test_the_initiator_search_never_raises_and_never_waits_long(env, monkeypatch):
+    import subprocess as sp
+    from ttp import hostcycle, initiator, machines
+    p = make(env)
+    monkeypatch.delenv("TTP_TEST_NO_JOURNAL")
+    seen = []
+
+    def run(cmd, **kw):
+        seen.append((cmd, kw.get("timeout")))
+        raise sp.TimeoutExpired(cmd, kw.get("timeout"))
+    monkeypatch.setattr(initiator.subprocess, "run", run)
+    boom = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("broken"))
+    monkeypatch.setattr(hostcycle, "planned", boom)
+    monkeypatch.setattr(machines, "here", boom)
+    assert initiator.find(p, "0123456789abcdef0123456789abcdef", time.time(), None) == \
+        {"source": "unknown", "text": "unknown (journal not readable)"}
+    (cmd, timeout), = seen
+    assert cmd[:3] == ["journalctl", "-b", "0123456789abcdef0123456789abcdef"] and timeout == initiator.JOURNAL_TIMEOUT_S
+    monkeypatch.setattr(initiator.subprocess, "run", lambda *a, **k: (_ for _ in ()).throw(FileNotFoundError()))
+    assert initiator.run_journal("boot-0") is None
+    assert initiator.find(p, "b", None, None, journal=(0, None, None))["text"] == "unknown"   # garbage parses to nothing
+
+
+def test_journal_lines_that_do_not_stop_the_host_name_no_initiator():
+    from ttp import initiator
+    for line in ["sudo[1]:  someuser : 3 incorrect password attempts ; TTY=pts/1 ; USER=root ; COMMAND=/usr/sbin/reboot",
+                 "sudo[1]:  someuser : TTY=pts/1 ; USER=root ; COMMAND=/usr/bin/vim /etc/reboot.conf",
+                 "sudo[1]:  someuser : TTY=pts/1 ; USER=root ; COMMAND=/usr/bin/systemctl status reboot.target",
+                 "sudo[1]:  someuser : TTY=pts/1 ; USER=root ; COMMAND=/usr/local/bin/rebootctl",
+                 "pkexec[1]: someuser: Error executing command as another user: Not authorized [COMMAND=/usr/sbin/reboot]",
+                 "cron[1]: (root) CMD (/usr/sbin/shutdown -r now)",
+                 "systemd-logind[1]: New session 4 of user someuser."]:
+        assert initiator.parse(f"Oct 25 10:00:00 testhost {line}\n") == (None, None), line
+    # The last stop in the boot wins: a hung `shutdown` followed by the power key is the power key.
+    two = ("Oct 25 10:00:00 testhost sudo[1]:  someuser : TTY=pts/1 ; USER=root ; COMMAND=/sbin/shutdown -h now\n"
+           "Oct 25 10:09:00 testhost systemd-logind[2]: Power key pressed.\n")
+    assert initiator.parse(two)[0] == "the power key (journal)"
+    assert initiator.parse(two.splitlines()[0])[0] == "someuser ran `shutdown -h now` via sudo (journal)"

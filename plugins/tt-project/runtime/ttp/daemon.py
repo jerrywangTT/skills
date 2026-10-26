@@ -70,6 +70,7 @@ from . import holdloops
 from . import headline
 from . import pauseends
 from . import hold
+from . import initiator
 from . import identity
 from . import idlecap
 from . import integrity
@@ -934,7 +935,8 @@ class Daemon:
         held then) before this daemon's first tick overwrites it; the boot event is written from it
         once the runs the reboot cut short are reaped. The earlier boot ended orderly when the daemon
         recorded a clean stop on it (a shutdown stops the service first), abrupt otherwise (a crash,
-        a power cut, a hardware reset)."""
+        a power cut, a hardware reset). Who or what started the shutdown is read here too, before any
+        transaction (initiator.find: bounded, best effort)."""
         try:
             db = self.p.db
             if self._this_boot((db.kv("boot_prev") or {}).get("boot")):
@@ -945,9 +947,10 @@ class Daemon:
             if not prev or self._this_boot(prev):
                 return
             clean = (db.kv(CLEAN_STOP_KEY) or {}).get("boot") == prev
+            last = time.time() - hb["age"] if "age" in hb else None
             db.set_kv("boot_prev", {"boot": self.boot, "prev_boot": prev, "held": hb.get("held") or [],
-                                    "last_heartbeat": time.time() - hb["age"] if "age" in hb else None,
-                                    "shutdown": "orderly" if clean else "abrupt"})
+                                    "last_heartbeat": last, "shutdown": "orderly" if clean else "abrupt",
+                                    "initiator": initiator.find(self.p, prev, self.boot_at, last)})
         except Exception:
             log(self.p, "boot record: " + traceback.format_exc().replace("\n", " | ")[:1000])
 
@@ -2483,7 +2486,12 @@ class Daemon:
             cycle = self._planned_cycle(prev["prev_boot"]) if prev.get("prev_boot") else None
             # Decided once per reboot: a planned one is told as planned, never as abrupt or unstable.
             how = "planned" if cycle else shutdown
+            started = prev.get("initiator") if isinstance(prev.get("initiator"), dict) else None
+            # A planned cycle already names its planner: only the journal adds to it there.
+            by = f"initiator: {started.get('text') or 'unknown'}" \
+                if started and (not cycle or started.get("source") == "journal") else ""
             data = {"boot": self.boot, "boot_time": booted, "prev_boot": prev.get("prev_boot"), "shutdown": shutdown,
+                    "initiator": started,
                     "planned": {"reason": str(cycle.get("reason") or "")[:300], "record": cycle["path"],
                                 "by": cycle.get("planner") or "", "project": cycle.get("project") or ""} if cycle else None,
                     "last_heartbeat": prev.get("last_heartbeat"), "held": held, "lost_usd": round(usd, 2),
@@ -2492,7 +2500,8 @@ class Daemon:
             # A record, not news: the coordinator sees it in its digest, not as a new event.
             db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,data,status) VALUES(?,?,?,?,?,?,?,?)",
                  (min(booted or now, now), "host", "boot", f"boot:{self.boot}", "normal",
-                  f"the host rebooted ({how}); {len(lost)} run(s) cut short", json.dumps(data), "record"))
+                  f"the host rebooted ({how}); {len(lost)} run(s) cut short" + (f"; {by}" if by else ""),
+                  json.dumps(data), "record"))
             if not lost:
                 return
             boots = db.boots(now - 86400)
@@ -2506,7 +2515,8 @@ class Daemon:
                 severity = "high"
                 unstable = (f" The host looks unstable: {cut} abrupt reboots cut runs short in 24 h; check its "
                             f"power, cooling and system logs.")
-            then = f" Held at its last heartbeat: {', '.join(held)}." if held else ""
+            then = (f" {by[0].upper()}{by[1:]}." if by else "") \
+                + (f" Held at its last heartbeat: {', '.join(held)}." if held else "")
             if cycle:
                 then += (f" It was a planned host cycle ({cycle.get('planner') or 'a host-cycle record'}): "
                          f"{data['planned']['reason'] or 'no reason recorded'}.")
