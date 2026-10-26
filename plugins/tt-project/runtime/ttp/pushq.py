@@ -445,7 +445,8 @@ def _absent(p: Project, remote: str, branch: str, ask: bool | None = None) -> bo
         hit = _absent_seen.get(key)
         return bool(hit and hit[0] > now and hit[1])
     try:
-        ls = _git(p, "ls-remote", "--heads", remote, f"refs/heads/{branch}", timeout=REFUSAL_TIMEOUT_S)
+        ls = _git(p, "ls-remote", "--heads", push.push_side(p.root, remote), f"refs/heads/{branch}",
+                  timeout=REFUSAL_TIMEOUT_S)
     except (OSError, subprocess.SubprocessError):
         return False
     if ls.returncode != 0:

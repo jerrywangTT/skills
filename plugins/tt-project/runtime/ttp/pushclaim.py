@@ -304,12 +304,12 @@ def _ls(repo, remote: str, ref: str, cache: dict) -> tuple[list[str] | None, str
 
 def _fetch(repo, remote: str, ref: str, cache: dict) -> str:
     """The tip of remote's branch after a bounded fetch into its tracking ref, "" when it failed."""
-    branch = ref[len("refs/heads/"):]
+    from .push import tracking_ref
     k = ("fetch", str(repo), remote, ref)
     if k not in cache:
-        r = _net(repo, cache, "fetch", "-q", "--no-write-fetch-head", remote,
-                 f"+{ref}:refs/remotes/{remote}/{branch}", timeout=FETCH_TIMEOUT_S)
-        cache[k] = _commit(repo, f"refs/remotes/{remote}/{branch}") if r.returncode == 0 else ""
+        track = tracking_ref(remote, ref[len("refs/heads/"):])
+        r = _net(repo, cache, "fetch", "-q", "--no-write-fetch-head", remote, f"+{ref}:{track}", timeout=FETCH_TIMEOUT_S)
+        cache[k] = _commit(repo, track) if r.returncode == 0 else ""
     return cache[k]
 
 
@@ -317,7 +317,8 @@ def verify(repo, remote: str, ref: str, sha: str, cache: dict | None = None) -> 
     """(state, why) of `sha` on `remote`'s `ref`: CONFIRMED when it is the tip per ls-remote or
     reachable from it after a fetch; MISSING when the remote has no such ref or the commit is not on
     it; UNKNOWN when the remote cannot be read (the network, a timeout). A MISSING decided by an
-    answer an earlier tick read (cache[CARRIED]) is asked again first: the push may have landed since."""
+    answer an earlier tick read (cache[CARRIED]) is asked again first: the push may have landed since.
+    Asked where a push to `remote` goes (push.push_side: its push URL when that is not its fetch URL)."""
     cache = {} if cache is None else cache
     state, why, by = _verify(repo, remote, ref, sha, cache)
     carried = cache.get(CARRIED) or set()
@@ -330,7 +331,9 @@ def verify(repo, remote: str, ref: str, sha: str, cache: dict | None = None) -> 
 
 def _verify(repo, remote: str, ref: str, sha: str, cache: dict) -> tuple[str, str, tuple]:
     """verify's (state, why, the cache key of the answer that decided it)."""
+    from .push import push_side
     where, s = short_ref(remote, ref), sha[:12]
+    remote = push_side(repo, remote)
     ls, fetched = (str(repo), remote, ref), ("fetch", str(repo), remote, ref)
     tips, err = _ls(repo, remote, ref, cache)
     if tips is None:

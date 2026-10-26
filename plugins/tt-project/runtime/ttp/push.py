@@ -719,7 +719,7 @@ def fast_forward(repo: Path, remote: str, sha: str, branches: list[str], push_br
             line = f"not ff {b}: {remote}/{b} at {tip[:10]} is not an ancestor of {sha[:10]}; left as it is"
         else:
             r = _git(repo, "push", remote, f"{sha}:refs/heads/{b}") if tip != sha else None
-            ls = _git(repo, "ls-remote", "--heads", remote, f"refs/heads/{b}")
+            ls = _git(repo, "ls-remote", "--heads", push_side(repo, remote), f"refs/heads/{b}")
             now = next((ln.split()[0] for ln in ls.stdout.splitlines() if ln.endswith(f"\trefs/heads/{b}")), "")
             if now == sha:
                 line = f"ff {b} {sha}"
@@ -834,11 +834,12 @@ def _mirror_one(repo: Path, sha: str, m: dict, push_branch: str, remotes: list[s
         return f"not mirrored {name}: {why}"
     if remote not in remotes:
         return f"not mirrored {name}: there is no git remote named {remote}"
-    read, tip = _remote_head(repo, remote, branch)
+    side = push_side(repo, remote)   # where the push below goes
+    read, tip = _remote_head(repo, side, branch)
     if not read:
         return f"not mirrored {name}: {remote} cannot be read; nothing pushed"
     if tip:
-        f = _git_net(repo, "fetch", "--no-tags", remote, f"+refs/heads/{branch}:refs/remotes/{remote}/{branch}")
+        f = _git_net(repo, "fetch", "--no-tags", side, f"+refs/heads/{branch}:{tracking_ref(side, branch)}")
         if f.returncode != 0:
             return f"not mirrored {name}: cannot fetch it ({_tail_line(f.stderr)}); nothing pushed"
         if tip != sha and not descends(repo, tip, sha):
@@ -846,7 +847,7 @@ def _mirror_one(repo: Path, sha: str, m: dict, push_branch: str, remotes: list[s
     r = None
     if tip != sha:   # no leading + and no --force: git itself refuses anything but a fast-forward
         r = _git_net(repo, "push", "--porcelain", remote, f"{sha}:refs/heads/{branch}")
-    read, now = _remote_head(repo, remote, branch)
+    read, now = _remote_head(repo, side, branch)
     if now == sha:
         return f"mirror {name} {sha}"
     if r is not None and r.returncode != 0:
@@ -1368,11 +1369,13 @@ def tracking_ref(remote: str, branch: str) -> str:
 
 
 def _existing_tip(repo: Path, remote: str, branch: str) -> str:
-    """The remote branch's tip, fetched, or "" when the remote has no such branch or cannot be read."""
-    ls = _git(repo, "ls-remote", "--heads", remote, f"refs/heads/{branch}")
+    """The remote branch's tip, fetched, or "" when the remote has no such branch or cannot be read.
+    Read where a push to `remote` goes (push_side)."""
+    side = push_side(repo, remote)
+    ls = _git(repo, "ls-remote", "--heads", side, f"refs/heads/{branch}")
     if ls.returncode != 0 or not any(ln.endswith(f"\trefs/heads/{branch}") for ln in ls.stdout.splitlines()):
         return ""
-    return _fetch(repo, remote, branch)
+    return _fetch(repo, side, branch)
 
 
 def target(p: Project, repo: Path) -> tuple[str, str]:
@@ -1630,6 +1633,29 @@ def url_like(remote: str) -> bool:
     scheme://..., scp-like host:path, or a filesystem path."""
     return bool(re.match(r"[A-Za-z][A-Za-z0-9+.-]*://", remote) or re.match(r"[^/]+:", remote)
                 or remote.startswith(("/", "./", "../", "~")))
+
+
+def push_sides(repo: Path, remote: str) -> list[str]:
+    """Where `git push <remote>` goes, to ask whether a branch or a pushed commit is there: each push
+    URL of a remote whose push URL is not its fetch URL (remote.<name>.pushurl, e.g. fetching from an
+    upstream and pushing to a fork, or a pushInsteadOf rewrite), as `git remote get-url --push --all`
+    gives them; `git ls-remote <name>` and `git fetch <name>` would ask the fetch URL. Else `remote`
+    itself (one URL, a URL or path, LOCAL, or no such remote), so its tracking refs stay as they are."""
+    if not remote or remote == LOCAL or url_like(remote):
+        return [remote]
+    pushes = _git(repo, "remote", "get-url", "--push", "--all", remote)
+    fetch = _git(repo, "remote", "get-url", remote)
+    urls = pushes.stdout.split() if pushes.returncode == 0 else []
+    if not urls or fetch.returncode != 0 or urls == [fetch.stdout.strip()]:
+        return [remote]
+    return urls
+
+
+def push_side(repo: Path, remote: str) -> str:
+    """Where reads of a pushed branch on `remote` go (its tip, a pushed commit): the first of
+    push_sides. With several push URLs `git push` pushes to each and fails when one refuses, so a
+    push that went through is on the first; asking whether a branch exists checks every one."""
+    return push_sides(repo, remote)[0]
 
 
 def _repo_keys(repo: Path) -> tuple[list[Path], str]:
@@ -2055,8 +2081,11 @@ def _may_land(p: Project, task: str, owner: str, branch: str) -> bool:
 
 
 def _on_remote(repo: Path, remote: str, branch: str) -> bool:
-    ls = _git(repo, "ls-remote", "--heads", remote, f"refs/heads/{branch}")
-    return ls.returncode == 0 and any(ln.endswith(f"\trefs/heads/{branch}") for ln in ls.stdout.splitlines())
+    """Whether a push to `remote` finds `branch` there, so it creates none: on each of its push URLs."""
+    def has(side: str) -> bool:
+        ls = _git(repo, "ls-remote", "--heads", side, f"refs/heads/{branch}")
+        return ls.returncode == 0 and any(ln.endswith(f"\trefs/heads/{branch}") for ln in ls.stdout.splitlines())
+    return all(has(side) for side in push_sides(repo, remote))
 
 
 def own_landing(cfg: dict) -> str:
@@ -2318,15 +2347,17 @@ def foreign_base(p: Project, repo: Path, remote: str, push_to: str, branch: str)
 
 def behind(repo: Path, remote: str, branch: str) -> str:
     """Why pushing HEAD to remote/branch would not be a fast-forward, or "" when the branch is new
-    there or its tip is an ancestor of HEAD. Fails closed when the remote cannot be read."""
-    ls = _git(repo, "ls-remote", "--heads", remote, f"refs/heads/{branch}")
+    there or its tip is an ancestor of HEAD. Fails closed when the remote cannot be read. Read where
+    the push goes (push_side)."""
+    side = push_side(repo, remote)
+    ls = _git(repo, "ls-remote", "--heads", side, f"refs/heads/{branch}")
     if ls.returncode != 0:
         return f"cannot reach {remote}: {ls.stderr.strip()}"
     tip = next((ln.split("\t")[0] for ln in ls.stdout.splitlines()
                 if ln.endswith(f"\trefs/heads/{branch}")), "")
     if not tip:
         return ""
-    tip = _fetch(repo, remote, branch)   # the latest tip, should it have moved since
+    tip = _fetch(repo, side, branch)   # the latest tip, should it have moved since
     if not tip:
         return f"cannot fetch {remote}/{branch} to compare with HEAD"
     if _git(repo, "merge-base", "--is-ancestor", tip, "HEAD").returncode != 0:
@@ -2541,7 +2572,7 @@ def never_published(repo: Path, d: dict, branch: str, timeout: float = 30) -> bo
         remote = own_push_remote(d, repo) or remote
     except ValueError:
         return False
-    ls = git("ls-remote", "--heads", remote, f"refs/heads/{branch}")
+    ls = git("ls-remote", "--heads", push_side(repo, remote), f"refs/heads/{branch}")
     return ls is not None and ls.returncode == 0 and not any(
         ln.endswith(f"\trefs/heads/{branch}") for ln in ls.stdout.splitlines())
 
@@ -3091,7 +3122,7 @@ def published(repo: Path, remote: str, target_branch: str) -> str:
     name = _git(repo, "symbolic-ref", "--quiet", "--short", "HEAD").stdout.strip()
     if not name or name == target_branch:
         return ""
-    ls = _git(repo, "ls-remote", "--heads", remote, f"refs/heads/{name}")
+    ls = _git(repo, "ls-remote", "--heads", push_side(repo, remote), f"refs/heads/{name}")
     tip = ls.stdout.split()[0] if ls.returncode == 0 and ls.stdout.strip() else ""
     if tip and _git(repo, "merge-base", "--is-ancestor", tip, "HEAD").returncode == 0:
         return name

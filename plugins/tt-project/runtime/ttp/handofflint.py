@@ -85,7 +85,8 @@ def _ask_remote(p: Project, repo: Path, branch: str) -> bool | None:
         remote = push.own_push_remote(d, repo) or remote
     except Exception:
         return None
-    ls = push._git_net(repo, "ls-remote", "--heads", remote, f"refs/heads/{branch}", timeout_s=REMOTE_TIMEOUT_S)
+    ls = push._git_net(repo, "ls-remote", "--heads", push.push_side(repo, remote), f"refs/heads/{branch}",
+                       timeout_s=REMOTE_TIMEOUT_S)
     if ls.returncode != 0:
         return None
     return any(ln.endswith(f"\trefs/heads/{branch}") for ln in ls.stdout.splitlines())

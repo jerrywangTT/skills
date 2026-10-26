@@ -8236,6 +8236,87 @@ def test_verify_confirms_a_commit_below_the_tip_after_a_fetch_and_a_tag_elsewher
     assert state == pushclaim.MISSING and "is not on origin/proj" in why, why
 
 
+def _split_push_url(env, monkeypatch):
+    """_push_setup's repo, whose origin fetches from `origin.git` but pushes to a second bare repo
+    (remote.origin.pushurl, as a fork is set up), given as a file:// URL."""
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    fork = _bare_init(env, env["tmp"] / "fork.git")
+    _git_out(repo, "remote", "set-url", "--push", "origin", fork.as_uri())
+    return p, repo, origin, fork
+
+
+def test_own_push_existing_only_asks_the_push_url_whether_the_branch_exists(env, monkeypatch, capsys):
+    """origin's push URL can differ from its fetch URL (fetch from an upstream, push to a fork). The
+    existing_only gate of `ttp push --own` asks where `git push origin` goes: a branch only the push URL
+    has is published onto, one only the fetch URL has is refused, and with several push URLs (git
+    pushes to each) every one must have it. A remote with one URL is asked as before."""
+    from ttp import push
+    p, repo, origin, fork = _split_push_url(env, monkeypatch)
+    p.set_config("delivery.own_push", "existing_only")
+    _git_out(repo, "checkout", "-q", "-b", "feature")
+    _commit(repo, "f.txt", "f\n")
+    _git_out(repo, "push", "-q", "origin", "HEAD:refs/heads/feature")   # goes to the push URL only
+    assert _git_out(fork, "rev-parse", "feature") == _git_out(repo, "rev-parse", "HEAD")
+    assert "feature" not in _git_out(origin, "for-each-ref", "--format=%(refname:short)", "refs/heads")
+    assert push.push_sides(repo, "origin") == [fork.as_uri()]
+    push.own_gate(p, repo, "origin", "feature")   # (a) only on the push URL: accepted
+    _commit(repo, "g.txt", "g\n")
+    capsys.readouterr()
+    assert _ttp("push", "--own") == 0, capsys.readouterr().err
+    assert _git_out(fork, "rev-parse", "feature") == _git_out(repo, "rev-parse", "HEAD")
+    # (b) only on the fetch URL: refused, and nothing is created on the push URL
+    _git_out(origin, "branch", "upstream-only", "proj")
+    with pytest.raises(ValueError, match="origin has no branch upstream-only"):
+        push.own_gate(p, repo, "origin", "upstream-only")
+    assert "upstream-only" not in _git_out(fork, "for-each-ref", "--format=%(refname:short)", "refs/heads")
+    # several push URLs: git pushes to each, so each must have the branch
+    second = _bare_init(env, env["tmp"] / "second.git")
+    _git_out(repo, "remote", "set-url", "--add", "--push", "origin", second.as_uri())
+    assert push.push_sides(repo, "origin") == [fork.as_uri(), second.as_uri()]
+    with pytest.raises(ValueError, match="origin has no branch feature"):
+        push.own_gate(p, repo, "origin", "feature")
+    _git_out(repo, "push", "-q", second.as_uri(), "HEAD:refs/heads/feature")
+    push.own_gate(p, repo, "origin", "feature")
+    # (c) one URL: asked by the remote's name, as before
+    _git_out(repo, "config", "--unset-all", "remote.origin.pushurl")
+    assert push.push_sides(repo, "origin") == ["origin"]
+    push.own_gate(p, repo, "origin", "upstream-only")
+    with pytest.raises(ValueError, match="origin has no branch feature"):
+        push.own_gate(p, repo, "origin", "feature")
+
+
+def test_hand_off_push_checks_look_for_a_pushed_commit_on_the_push_url(env, monkeypatch):
+    """The checks that a hand-off's pushed commit is on the remote (pushclaim.verify) and whether a
+    proposed branch is published (the hand-off lint's lookup) ask origin's push URL, where the push
+    went, not its fetch URL; a commit only the fetch URL has is missing; a one-URL remote is
+    asked as before, its tracking ref included."""
+    from ttp import handofflint, push, pushclaim
+    p, repo, origin, fork = _split_push_url(env, monkeypatch)
+    _git_out(repo, "checkout", "-q", "-b", "feature")
+    _commit(repo, "a.txt", "a\n")
+    below = _git_out(repo, "rev-parse", "HEAD")
+    _commit(repo, "b.txt", "b\n")
+    tip = _git_out(repo, "rev-parse", "HEAD")
+    _git_out(repo, "push", "-q", "origin", "HEAD:refs/heads/feature")   # to the push URL
+    # (a) on the push URL only: confirmed, as the tip and below it after a fetch
+    assert pushclaim.verify(repo, "origin", "refs/heads/feature", tip)[0] == pushclaim.CONFIRMED
+    state, why = pushclaim.verify(repo, "origin", "refs/heads/feature", below)
+    assert state == pushclaim.CONFIRMED, why
+    assert handofflint._ask_remote(p, repo, "feature") is True
+    assert _git_out(repo, "rev-parse", push.tracking_ref(fork.as_uri(), "feature")) == tip   # fetched from there
+    # (b) on the fetch URL only: missing
+    _git_out(repo, "push", "-q", origin.as_uri(), "HEAD:refs/heads/upstream-only")
+    assert pushclaim.verify(repo, "origin", "refs/heads/upstream-only", tip)[0] == pushclaim.MISSING
+    assert handofflint._ask_remote(p, repo, "upstream-only") is False
+    # (c) one URL: the fetch URL, as before
+    _git_out(repo, "config", "--unset-all", "remote.origin.pushurl")
+    assert pushclaim.verify(repo, "origin", "refs/heads/upstream-only", below, {})[0] == pushclaim.CONFIRMED
+    assert _git_out(repo, "rev-parse", "refs/remotes/origin/upstream-only") == tip
+    assert pushclaim.verify(repo, "origin", "refs/heads/feature", tip, {})[0] == pushclaim.MISSING
+    assert handofflint._ask_remote(p, repo, "upstream-only") is True
+    assert handofflint._ask_remote(p, repo, "feature") is False
+
+
 def test_detached_push_markers_are_unknown_while_running_confirmed_by_sha_and_missing_once_failed(
         env, monkeypatch):
     from ttp import pushclaim
