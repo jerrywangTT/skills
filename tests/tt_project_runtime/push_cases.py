@@ -11986,3 +11986,59 @@ def test_a_landed_wait_without_a_push_branch_runs_the_landed_probe_or_names_the_
     p.set_config("delivery.push_branch", "no/such/branch")
     rc, words = landed.check(p, p.root, tid=tid)
     assert rc != 0 and "delivery.landed_probe" not in words, words
+
+
+def test_a_cancelled_tasks_detached_push_is_stopped_and_its_queued_push_never_starts(env, monkeypatch, capsys,
+                                                                                    reap_tmp_processes):
+    """`ttp push --detach` leads a session of its own, outside every run and every `ttp detach` job: once its
+    task is cancelled (and no open task waits on its marker) the daemon's jobstop pass ends its group and the
+    marker says why; a push still queued for the daemon is recorded as failed and never started."""
+    from ttp import jobstop, push
+    started = env["tmp"] / "started"
+    p, repo, origin, other = _push_setup(env, monkeypatch, [f"touch {started}; sleep 60"])
+    tid = p.db.add_task("soak", "s", kind="code", tier="light", origin="user")
+    monkeypatch.setenv("TTP_TASK", str(tid))
+    _git_out(repo, "checkout", "-q", "-b", f"ttp/t{tid}-soak")
+    _commit(repo, "mine.txt", "mine\n")
+
+    def own_detach():
+        rc = _ttp("push", "--own", "--detach")
+        out = capsys.readouterr()
+        lines = dict(ln.split(": ", 1) for ln in out.out.splitlines() if ln.startswith(("marker: ", "retry_when: ")))
+        assert rc == 0 and "marker" in lines, out.err
+        return pathlib.Path(lines["marker"]), lines["retry_when"]
+
+    marker, probe = own_detach()
+    pid = json.loads(marker.read_text())["pid"]
+    try:
+        assert _wait_for(started.exists)
+        assert jobstop.sweep(p) == [], "the push of an open task was stopped"
+        waiter = p.db.add_task("waiter", "s", kind="work", tier="light", origin="user")
+        p.db.update_task(waiter, status="queued", result=json.dumps({"status": "waiting", "retry_when": probe}))
+        p.db.update_task(tid, status="cancelled")
+        assert jobstop.sweep(p) == [], "a push an open task waits on was stopped"
+        p.db.update_task(waiter, status="done")
+        (r,) = jobstop.sweep(p)
+        assert r["job"] == "push" and r["pgid"] == pid and f"task #{tid} is cancelled" in r["text"]
+        assert _wait_for(lambda: not jobstop.members(pid), 10), "the push's check outlived it"
+        m = json.loads(marker.read_text())
+        assert m["status"] == "failed" and f"task #{tid} is cancelled" in m["reason"]
+        assert _probe(p, probe).returncode == 0
+        assert subprocess.run(["git", "-C", str(origin), "rev-parse", "--verify", "-q", f"ttp/t{tid}-soak"],
+                              capture_output=True).returncode != 0, "the stopped push went through"
+        assert jobstop.sweep(p) == [] and len(_stopped_events(p)) == 1
+        monkeypatch.setattr(push, "_boxed", lambda: True)
+        queued, _ = own_detach()
+        monkeypatch.setattr(push, "_boxed", lambda: False)
+        assert json.loads(queued.read_text())["status"] == "queued"
+        (r,) = jobstop.sweep(p)
+        assert "never started" in r["text"] and r["rc"] == str(queued)
+        push.tend(p)
+        q = json.loads(queued.read_text())
+        assert q["status"] == "failed" and "pid" not in q and f"task #{tid} is cancelled" in q["reason"]
+    finally:
+        try:
+            os.killpg(pid, signal.SIGKILL)
+        except OSError:
+            pass
+        reap_tmp_processes(env["tmp"])

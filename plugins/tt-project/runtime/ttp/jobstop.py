@@ -19,7 +19,11 @@ waits on it (its retry_when or on_pass names the job's .rc). end() does it in th
 5. One event names the task, job, group, broker jobs ended and locks freed.
 
 The same pass stops such a task's detached `ttp checks` (checks.pid in any of its runs, end_checks):
-SIGTERM to their group, so they end their check command and write checks.rc, then SIGKILL.
+SIGTERM to their group, so they end their check command and write checks.rc, then SIGKILL. And its
+detached `ttp push` (a marker under the project's pushes/ naming the task, end_push), which leads a
+session of its own outside every run: a queued one is recorded as failed before the daemon starts it,
+a running one gets SIGTERM to its group (it ends its check and writes a failed outcome), then SIGKILL.
+A push queue batch serves many tasks and is never stopped here.
 
 A job counts as running while its job lock is held, whatever its .rc or .lost say: a daemon that dies
 mid-stop finds it still running on its next tick and finishes the stop; a stopped one is skipped and
@@ -55,6 +59,7 @@ SWEEP_EVERY_S = 30
 SWEEP_DAYS = 14
 FREE_WAIT_S = 2.0
 CHECKS_TERM_S = 15.0   # detached checks end their check command on SIGTERM, which may take a few seconds
+PUSH_TERM_S = 15.0     # likewise a detached push: it ends its check and writes its outcome
 QUEUE = "jobstop-queue"
 EVENT = "detached_job_stopped"
 
@@ -330,6 +335,76 @@ def end_checks(p: Project, run_dir: Path, why: str, task: int | None = None) -> 
     return out
 
 
+def end_push(p: Project, marker: Path, why: str, task: int | None = None) -> dict | None:
+    """Stop the detached `ttp push` of this marker while it is queued or runs: a queued one is recorded
+    as failed under its run lock, so the daemon never starts it; a running one (its run lock held) gets
+    SIGTERM to its group, then SIGKILL after PUSH_TERM_S, and its marker then says why. A pid that no
+    longer carries the marker in its arguments is never signalled. One event per push; None when it
+    neither waits nor runs."""
+    from . import push
+    marker = Path(marker)
+    m = push._read(marker)
+    if m.get("kind") == "batch" or m.get("status") not in ("queued", "running"):
+        return None
+    run_lock = push._run_lock(marker)
+    pid = m.get("pid")
+    if m.get("status") == "queued":
+        lock = locks.try_take([run_lock], f"detached push {m.get('id')}", "jobstop")
+        if lock is None:
+            return None   # the daemon is starting it right now: stopped on the next pass
+        with lock:
+            m = push._read(marker)
+            if m.get("status") != "queued":
+                return None
+            m.update(status="failed", exit=None, ended=time.time(), reason=f"not started: {why}")
+            write_json(marker, m)
+        push._forget_lock(marker)
+        pid = 0
+    else:
+        if locks.any_free([run_lock]):
+            return None   # it ended: push._settle records the outcome
+        if not (isinstance(pid, int) and pid > 1) or str(marker) not in _argv(pid):
+            return None
+        for sig, wait in ((signal.SIGTERM, PUSH_TERM_S), (signal.SIGKILL, FREE_WAIT_S)):
+            try:
+                os.killpg(pid, sig)
+            except OSError:
+                pass
+            deadline = time.monotonic() + wait
+            while not locks.any_free([run_lock]) and time.monotonic() < deadline:
+                time.sleep(0.1)
+            if locks.any_free([run_lock]):
+                break
+        m = push._settle(marker)
+        if m.get("status") == "failed":
+            m["reason"] = f"stopped: {why}" + (f" ({m['reason']})" if m.get("reason") else "")
+            write_json(marker, m)
+    text = (f"stopped the detached push {marker.stem}" + (f" (task #{task})" if task else "")
+            + f": {why}; " + (f"group {pid}; marker {m.get('status')}" if pid else "it was queued and never started"))
+    fp = f"push_stopped:{marker}:{pid}"
+    out = {"task": task, "job": "push", "rc": str(marker), "pgid": pid, "text": text}
+    if not p.db.one("SELECT id FROM events WHERE fingerprint=?", (fp,)):
+        p.db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,data,status,task) VALUES(?,?,?,?,?,?,?,?,?)",
+               (time.time(), "daemon", EVENT, fp, "low", text, json.dumps(out), "handled", task))
+    return out
+
+
+def ended_pushes(p: Project) -> list[tuple[Path, int, str]]:
+    """(marker, task, state) of each queued or running detached push of a task in ENDED."""
+    from . import push
+    found = []
+    for marker in sorted((p.state / push.DETACHED).glob("*.json")):
+        m = push._read(marker)
+        if m.get("kind") != "batch" and m.get("status") in ("queued", "running") and str(m.get("task") or "").isdigit():
+            found.append((marker, int(m["task"])))
+    out = []
+    for marker, task in found:
+        row = p.db.one("SELECT status FROM tasks WHERE id=?", (task,))
+        if row and row["status"] in ENDED:
+            out.append((marker, task, row["status"]))
+    return out
+
+
 def waited_on(p: Project, rc: Path) -> int | None:
     """An open task whose retry_when or on_pass names this job's .rc, else None."""
     rc = Path(rc)
@@ -352,8 +427,9 @@ def task_of(p: Project, rc: Path) -> dict | None:
 
 
 def sweep(p: Project, now: float | None = None) -> list[dict]:
-    """The daemon's pass: stop each running job of a task in ENDED that no open task waits on, then carry
-    out queued `ttp detach --stop` requests. The summaries of the jobs it stopped."""
+    """The daemon's pass: stop each running job, detached checks and detached push of a task in ENDED that
+    no open task waits on, then carry out queued `ttp detach --stop` requests. The summaries of the jobs
+    it stopped."""
     now = time.time() if now is None else now
     out = []
     marks = ",".join("?" * len(ENDED))
@@ -381,6 +457,9 @@ def sweep(p: Project, now: float | None = None) -> list[dict]:
             r = end(p, rc, f"task #{row['id']} is {row['status']}", row["id"])
             if r:
                 out.append(r)
+    for marker, task, state in ended_pushes(p):
+        if waited_on(p, marker) is None and (r := end_push(p, marker, f"task #{task} is {state}", task)):
+            out.append(r)
     out += serve_requests(p)
     return out
 
