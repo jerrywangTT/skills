@@ -1221,6 +1221,8 @@ def check_start_when(probe: str, p: Project | None = None) -> None:
     if p:
         check_task_refs(p.db, probe)
     if landed.LANDED_PROBE.fullmatch(probe):
+        if p and not landed.can_check(p):   # it would only ever exit 2: refused now, not broken later
+            raise ValueError(f"start_when {clip(probe, 160)!r} refused: {landed.NO_CHECK}")
         return
     if re.match(r"\s*landed:", probe, re.I):
         raise ValueError(f"start_when {clip(probe, 160)!r}: write exactly `landed:#<id>` (one task id); to "
@@ -1750,17 +1752,21 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 roots = {int(a["continues"])} if a.get("continues") is not None else set()
                 roots |= {t["id"] for t in (old, followup, carried and carried[0]) if t}
                 tie, parallel = _overlap_chain(p, clash, roots), file_overlap.PARALLEL.search(a.get("spec") or "")
+                landing = landed.can_check(p)
                 beside = clip(parallel.group(1), START_WHY_CHARS) if tie and parallel else ""
                 if beside:
                     labels.append(file_overlap.PARALLEL_LABEL + beside)
                     tie = None
+                elif tie and tie[0] not in deps and str(tie[0]) not in landed.task_refs(when) \
+                        and not landing:   # no landing to wait for here (landed.can_check): its end instead
+                    deps = [*deps, tie[0]]
                 elif tie and tie[0] not in deps and str(tie[0]) not in landed.task_refs(when) \
                         and (both := _and_landed(p, tie[0], when)):
                     when = both
                     why_after = "; ".join(x for x in (why_after, f"#{tie[0]} lands ({tie[1]})") if x)[:START_WHY_CHARS]
                 else:
                     tie = None
-                labels += [file_overlap.label(clash, tie and tie[0])] if clash else []
+                labels += [file_overlap.label(clash, tie and tie[0], landing)] if clash else []
                 if lineage := _lineage_tie(p, kind, labels, {old["id"]} if old else set()):
                     labels.append(f"{worktree.LINEAGE_HOLD}{lineage[0]}")
                 labels += defer_labels(after, when, why_after)
@@ -1817,9 +1823,10 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 if stale:
                     notes.append(f"task_add: #{new_id} added; flagged: {stale}")
                 if clash:
-                    notes.append(f"task_add: #{new_id} added; {file_overlap.warning(clash)}")
+                    notes.append(f"task_add: #{new_id} added; {file_overlap.warning(clash, landing)}")
                 if tie:
-                    notes.append(f"task_add: #{new_id} chained after #{tie[0]} (start_when {when}): {tie[1]}; "
+                    how = f"start_when {when}" if landing else f"depends_on [{tie[0]}]: no push branch or landed probe to wait on its landing"
+                    notes.append(f"task_add: #{new_id} chained after #{tie[0]} ({how}): {tie[1]}; "
                                  f"a `parallel: <why>` spec line runs it beside instead")
                 elif beside:
                     notes.append(f"task_add: #{new_id} runs beside a hot or settled area's task, as its spec's "

@@ -6985,6 +6985,7 @@ def test_a_resource_pause_without_an_end_is_refused(env, capsys):
 
 def test_every_stored_probe_must_parse_as_posix_sh(env, capsys):
     p = make(env)
+    p.set_config("delivery.landed_probe", "test -e landed/{id}")   # no push branch: how landed:#<id> is checked
     from ttp import cli, coordinator as coord, ends
     from ttp import machine_ledger as ml
     from ttp import machines as mm
@@ -8582,6 +8583,7 @@ def test_a_new_start_when_is_never_run_at_defer_time(env, monkeypatch):
 @pytest.mark.parametrize("probe", ["landed:#12 || exit 1", "landed:12x", "landed:#", "Landed:#12"])
 def test_a_start_when_that_is_not_exactly_landed_id_is_refused(env, probe):
     p = make(env)
+    p.set_config("delivery.landed_probe", "test -e landed/{id}")   # no push branch: how landed:#<id> is checked
     from ttp import cli
     from ttp import coordinator as coord
     _tasks_up_to(p, 12)
@@ -10459,6 +10461,7 @@ def test_a_deferred_task_shows_plain_words_never_its_probe(env, why):
     from ttp.cli import status_text
     from ttp.web import state_payload
     p = make(env)
+    p.set_config("delivery.landed_probe", "test -e landed/{id}")   # no push branch: how landed:#<id> is checked
     probe = "test -f out/landed.marker"
     a = {"type": "task_add", "title": "after landing", "spec": "s", "start_when": probe}
     assert coord.apply(p, [{**a, **({"why": why} if why else {})}]) == []
@@ -15535,6 +15538,7 @@ def test_an_end_probe_that_always_exits_0_is_refused_and_a_real_test_is_kept(env
     once: each is refused on one line pointing to `|| exit 1`, and nothing is written. A real test is kept,
     and so are `landed:#<id>` and a bare `true` as a task's deliberate "now"."""
     p = make(env)
+    p.set_config("delivery.landed_probe", "test -e landed/{id}")   # no push branch: how landed:#<id> is checked
     from ttp import cli, coordinator as coord
     from ttp import screen as scr
     for bad in ALWAYS_0:
@@ -15830,3 +15834,35 @@ def test_task_add_chains_a_continuation_after_an_open_task_on_the_same_branch(en
                            {"type": "task_add", "kind": "code", "title": "on y", "spec": "s\npr_branch: feat/y"}]) == []
     assert worktree.lineage_hold(p.db.one("SELECT * FROM tasks WHERE title='on x'")) == first
     assert worktree.lineage_hold(p.db.one("SELECT * FROM tasks WHERE title='on y'")) is None
+
+
+def test_a_landed_start_when_is_refused_where_no_landing_can_be_checked(env, capsys):
+    """With neither delivery.push_branch nor delivery.landed_probe, `start_when landed:#<id>` would
+    only ever exit 2: task_add, task_update, `ttp task add --start-when` and `ttp task set-when`
+    refuse it at once, naming depends_on and delivery.landed_probe. Either key makes it pass."""
+    from ttp import cli
+    from ttp import coordinator as coord
+    from ttp.db import deferral
+    p = make(env)
+    first = p.db.add_task("first", "s", kind="work", status="running")
+    out = coord.apply(p, [{"type": "task_add", "title": "after", "spec": "s", "start_when": f"landed:#{first}"}])
+    assert len(out) == 1 and "depends_on" in out[0] and "delivery.landed_probe" in out[0], out
+    assert not p.db.one("SELECT id FROM tasks WHERE title='after'")
+    other = p.db.add_task("other", "s", kind="work", status="queued")
+    out = coord.apply(p, [{"type": "task_update", "id": other, "start_when": f" landed: {first} "}])
+    assert len(out) == 1 and "delivery.landed_probe" in out[0] and not deferral(p.db.task(other)), out
+    with pytest.raises(SystemExit):
+        cli.main(["task", "demo", "add", "cli later", "--start-when", f"landed:#{first}"])
+    seen = capsys.readouterr()
+    assert "delivery.landed_probe" in seen.out + seen.err, seen
+    assert not p.db.one("SELECT id FROM tasks WHERE title='cli later'")
+    with pytest.raises(ValueError, match="delivery.landed_probe"):
+        cli.set_when(p.db, other, f"landed:#{first}", p)
+    # A combined probe is not a landed:#<id> wait the daemon rewrites; it is left to run.
+    assert coord.apply(p, [{"type": "task_update", "id": other, "start_when": "test -e out/x"}]) == []
+    for key, value in (("delivery.landed_probe", "test -e landed/{id}"), ("delivery.push_branch", "tt/push")):
+        p.set_config("delivery.landed_probe", "")
+        p.set_config(key, value)
+        assert coord.apply(p, [{"type": "task_update", "id": other, "start_when": f"landed:#{first}"}]) == []
+        assert deferral(p.db.task(other))["when"] == f"landed:#{first}"
+        coord.apply(p, [{"type": "task_update", "id": other, "start_when": "now"}])

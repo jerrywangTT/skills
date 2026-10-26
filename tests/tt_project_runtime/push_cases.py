@@ -11942,3 +11942,47 @@ def test_stray_running_batch_file_is_closed_at_daemon_start_and_a_live_one_is_le
     s.p.db.x("UPDATE push_batches SET finalized=NULL WHERE id=?", (bid,))
     assert pushq.close_strays(s.p) == []
     assert json.loads(marker.read_text())["status"] == "running"
+
+
+def test_a_landed_wait_without_a_push_branch_runs_the_landed_probe_or_names_the_fix(env, monkeypatch):
+    """No delivery.push_branch: `landed:#<id>` (`ttp landed --task <id>`) used to exit 2 with 'no
+    target branch' on every check, each a broken-probe coordinator turn. Unset delivery.landed_probe:
+    one clear error naming depends_on and the key. Set: its exit 0 and 1 are the answer, any other
+    exit (or a timeout) is CANNOT; `{id}` is the task id; a local-only check does not run it; a
+    deferred task starts once it passes. A push branch still wins over the key."""
+    from ttp import daemon as dmod
+    from ttp import landed
+    p = make(env)
+    monkeypatch.setattr(dmod, "PROBE_EVERY_S", 0)
+    tid = p.db.add_task("producer", "s", kind="code", status="done")
+    rc, words = landed.check(p, p.root, tid=tid)
+    assert rc == landed.CANNOT and "no target branch" not in words, words
+    assert "depends_on" in words and "delivery.landed_probe" in words and "delivery.push_branch" in words
+    assert landed.check(p, p.root, tid=tid + 99) == (landed.CANNOT, f"no task #{tid + 99} in this project")
+    p.set_config("delivery.landed_probe", "test -e landed/{id} || { echo waiting; exit 1; }")
+    assert landed.check(p, p.root, tid=tid) == (landed.NOT_YET, f"#{tid} has not landed yet (delivery.landed_probe): waiting")
+    assert landed.check(p, p.root, tid=tid, fetch=False)[0] == landed.NOT_YET
+    after = p.db.add_task("after it", "s", kind="work", status="queued",
+                          labels=[f"start_when:landed:#{tid}", f"deferred_since:{time.time():.0f}"])
+    d = dmod.Daemon(p.base)
+    _settle_deferred(d, after)
+    assert not _ready(p, after) and not _events(p, after, "deferral_probe_broken")
+    (p.root / "landed").mkdir()
+    (p.root / "landed" / str(tid)).write_text("")
+    assert landed.check(p, p.root, tid=tid)[0] == 0
+    assert landed.check(p, p.root, tid=tid, fetch=False)[0] == landed.NOT_YET   # never run on a local check
+    _settle_deferred(d, after, until=lambda: _ready(p, after))
+    assert _ready(p, after)
+    p.set_config("delivery.landed_probe", "exit 3")
+    rc, words = landed.check(p, p.root, tid=tid)
+    assert rc == landed.CANNOT and "delivery.landed_probe" in words and "exited 3" in words
+    monkeypatch.setattr(landed, "FETCH_S", 1)
+    p.set_config("delivery.landed_probe", "sleep 30")
+    t0 = time.time()
+    rc, words = landed.check(p, p.root, tid=tid)
+    assert rc == landed.CANNOT and "ran over" in words and time.time() - t0 < 10
+    # A push branch: the key is ignored and the landing is looked for on that branch.
+    p.set_config("delivery.landed_probe", "true")
+    p.set_config("delivery.push_branch", "no/such/branch")
+    rc, words = landed.check(p, p.root, tid=tid)
+    assert rc != 0 and "delivery.landed_probe" not in words, words

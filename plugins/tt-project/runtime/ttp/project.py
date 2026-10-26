@@ -441,7 +441,9 @@ EXTRA_KEYS = {
     # push_solo_paths: pathspecs a batch takes at most one change touching (pushq.SOLO_PATHS); push_cap_tests:
     # the name regex of prompt size cap tests, whose lone failure sends a trim-to-fit fix (conflictfix.CAP_TESTS).
     # push_rerun_s: the time limit of one rerun of a failed push check's failing tests (batch.RERUN_S).
-    "delivery": {"base_ref", "push_branch", "push_checks", "push_checks_by_repo", "push_exclude_paths", "push_rounds", "push_wait_s",
+    # landed_probe: with no push_branch, the read-only command (`{id}`: the task id) that answers
+    # `landed:#<id>` (landed.landed_probe); unset there, the harness chains with depends_on instead.
+    "delivery": {"base_ref", "push_branch", "landed_probe", "push_checks", "push_checks_by_repo", "push_exclude_paths", "push_rounds", "push_wait_s",
                  "version_bump", "push_queue", "push_batch_s", "push_batch_max", "push_min_gap_s", "push_landing_alert_h", "after_push",
                  "push_solo_paths", "push_cap_tests", "push_rerun_s",
                  "after_push_timeout_s", "backup_remote", "fast_forward_also", "mirror_remotes",

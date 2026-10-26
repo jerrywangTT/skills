@@ -689,6 +689,54 @@ def abandon(p, tid: int, why: str) -> str:
     return f"task #{tid}: abandoned ({why}); its branch {task.get('branch') or '(none)'} is kept"
 
 
+def landed_probe(p) -> str:
+    """`delivery.landed_probe`: a read-only shell command template, `{id}` the task id (exit 0 landed,
+    1 not yet, any other exit broken), that answers `landed:#<id>` in a project with no
+    `delivery.push_branch`; "" when unset. Ignored while a push branch is set."""
+    return str((p.config().get("delivery") or {}).get("landed_probe") or "").strip()
+
+
+def _has_push_branch(p) -> bool:
+    return bool(str((p.config().get("delivery") or {}).get("push_branch") or "").strip())
+
+
+def can_check(p) -> bool:
+    """Whether a `landed:#<id>` wait can ever pass here: a push branch, else a landed probe. Without
+    either the harness chains with depends_on and refuses a new `landed:#<id>` (NO_CHECK)."""
+    return _has_push_branch(p) or bool(landed_probe(p))
+
+
+NO_CHECK = ("`landed:#<id>` cannot be checked in this project: it sets neither delivery.push_branch nor "
+            "delivery.landed_probe. Wait on the task with depends_on instead, or set delivery.landed_probe "
+            "(a read-only command with {id} for the task id: exit 0 landed, 1 not yet)")
+
+
+def _run_landed_probe(p, cmd: str, tid: int) -> tuple[int, str]:
+    """delivery.landed_probe for task `tid`, run in the project root within FETCH_S: its exit 0 and 1
+    as they are, anything else (a timeout, a missing command) CANNOT naming the key."""
+    try:
+        proc = subprocess.Popen(cmd.replace("{id}", str(int(tid))), shell=True, cwd=str(p.root),
+                                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                text=True, start_new_session=True)
+    except OSError as e:
+        return CANNOT, f"delivery.landed_probe could not start: {e}"
+    try:
+        out, _ = proc.communicate(timeout=FETCH_S)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, 9)
+        except OSError:
+            pass
+        proc.communicate()
+        return CANNOT, f"delivery.landed_probe for #{tid} ran over {FETCH_S} s"
+    tail = " ".join((out or "").strip().splitlines()[-1:])[:200]
+    if proc.returncode == 0:
+        return 0, f"#{tid} landed (delivery.landed_probe)" + (f": {tail}" if tail else "")
+    if proc.returncode == NOT_YET:
+        return NOT_YET, f"#{tid} has not landed yet (delivery.landed_probe)" + (f": {tail}" if tail else "")
+    return CANNOT, f"delivery.landed_probe for #{tid} exited {proc.returncode}" + (f": {tail}" if tail else "")
+
+
 def _start(repo: Path, branch: str) -> str:
     """The commit `branch` was created at (its oldest reflog entry), "" when git kept no reflog."""
     log = _git(repo, "reflog", "show", "--format=%H", f"refs/heads/{branch}").stdout.split()
@@ -699,7 +747,16 @@ def check(p, repo: Path, sha: str | None = None, tid: int | None = None, onto: s
           fetch: bool = True) -> tuple[int, str]:
     """(exit code, words) for `ttp landed`: a sha, or task `tid`'s landing, on `onto` (default the
     push branch). Reads the local ref first and fetches only when that says not yet (never with
-    `fetch` False: local refs only)."""
+    `fetch` False: local refs only). With no push branch, a task's landing is delivery.landed_probe's
+    answer (with `fetch` False it is not run: NOT_YET), and without that key CANNOT naming the fix."""
+    if tid is not None and onto is None and not _has_push_branch(p):
+        if not p.db.task(tid):
+            return CANNOT, f"no task #{tid} in this project"
+        if not (cmd := landed_probe(p)):
+            return CANNOT, NO_CHECK
+        if not fetch:   # local checks only: a project's own command may reach the network
+            return NOT_YET, f"#{tid}: delivery.landed_probe not run (local check only)"
+        return _run_landed_probe(p, cmd, tid)
     try:
         onto = onto or _push_ref(p, repo)
     except ValueError as e:

@@ -291,18 +291,19 @@ def find(p, spec: str, skip=()) -> list[dict]:
     return [{**h, "paths": list(h["paths"].items())} for _, h in sorted(hits.items(), reverse=True)]
 
 
-def advice(hits: list[dict]) -> tuple[list[int], str]:
+def advice(hits: list[dict], landing: bool = True) -> tuple[list[int], str]:
     """(the ids it names, the fix) for the tasks a warning lists: `depends_on` the open ones, and
-    `start_when landed:#<id>` the most recent done one with a head (its landed probe can pass)."""
+    `start_when landed:#<id>` the most recent done one with a head (its landed probe can pass), only
+    with `landing` (landed.can_check: a project with no way to check a landing gets no such wait)."""
     shown = hits[:MAX_TASKS]
     deps = [h["id"] for h in shown if h.get("open")]
-    land = next((h["id"] for h in shown if not h.get("open") and h.get("head")), None)
+    land = next((h["id"] for h in shown if not h.get("open") and h.get("head")), None) if landing else None
     fix = ([f"depends_on [{', '.join(map(str, deps))}]"] if deps else []) + \
         ([f"start_when landed:#{land}"] if land is not None else [])
     return deps + ([land] if land is not None else []), " and ".join(fix)
 
 
-def warning(hits: list[dict]) -> str:
+def warning(hits: list[dict], landing: bool = True) -> str:
     """One line naming the most recent few other tasks, the shared paths (new files flagged) and the fix."""
     if not hits:
         return ""
@@ -313,16 +314,16 @@ def warning(hits: list[dict]) -> str:
         parts.append(f"#{h['id']} ({', '.join(names)}{f', +{more} more' if more > 0 else ''})")
     more = len(hits) - MAX_TASKS
     it = "it" if len(hits) == 1 else "them"
-    fix = advice(hits)[1]
+    fix = advice(hits, landing)[1]
     return (f"overlaps {'; '.join(parts)}{f'; +{more} more tasks' if more > 0 else ''}: build on {it}, not "
             f"beside {it}{f': {fix}' if fix else ''}")
 
 
-def label(hits: list[dict], chained: int | None = None) -> str:
+def label(hits: list[dict], chained: int | None = None, landing: bool = True) -> str:
     """overlap:<ids the fix names>:<warning>: the digest drops it once the task waits on them all
-    (only on `chained` once task_add chained it after that task)."""
-    ids = [chained] if chained is not None else advice(hits)[0]
-    return f"{LABEL}{','.join(map(str, ids))}:{warning(hits)}" if hits else ""
+    (only on `chained` once task_add chained it after that task). `landing` as for advice."""
+    ids = [chained] if chained is not None else advice(hits, landing)[0]
+    return f"{LABEL}{','.join(map(str, ids))}:{warning(hits, landing)}" if hits else ""
 
 
 def digest_note(task: dict) -> str:

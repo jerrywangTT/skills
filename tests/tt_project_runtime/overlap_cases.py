@@ -57,6 +57,7 @@ def test_task_add_flags_a_file_an_unlanded_finished_branch_adds_as_a_new_file(en
     is warned without the flag. Once the records show the task landed, nothing is flagged."""
     from ttp import coordinator as coord, overlap
     p = make(env)
+    p.set_config("delivery.landed_probe", "test -e landed/{id}")   # no push branch: how landed:#<id> is checked
     (p.root / "runtime" / "ttp").mkdir(parents=True, exist_ok=True)
     (p.root / "runtime/ttp/relay.py").write_text("x = 1\n")
     subprocess.run(["git", "-C", str(p.root), "add", "runtime/ttp/relay.py"], check=True)
@@ -257,6 +258,7 @@ def test_task_add_chains_a_new_task_on_a_hot_or_settled_file_after_the_newest_op
     from ttp import coordinator as coord, overlap, reviewcap, settled
     from ttp.db import deferral
     p = make(env)
+    p.set_config("delivery.landed_probe", "test -e landed/{id}")   # no push branch: how landed:#<id> is checked
     hot, cold, calm = "runtime/ttp/progress.py", "runtime/ttp/relay.py", "runtime/ttp/sweep.py"
     mains = {}
     monkeypatch.setattr(reviewcap, "main_file", lambda p, r: mains.get(r["id"]))
@@ -326,6 +328,7 @@ def test_overlap_chain_never_waits_on_a_task_that_waits_on_the_new_tasks_own_lin
     from ttp import coordinator as coord, reviewcap
     from ttp.db import deferral
     p = make(env)
+    p.set_config("delivery.landed_probe", "test -e landed/{id}")   # no push branch: how landed:#<id> is checked
     hot = "runtime/ttp/progress.py"
     monkeypatch.setattr(reviewcap, "main_file", lambda p, r: hot)
 
@@ -351,3 +354,45 @@ def test_overlap_chain_never_waits_on_a_task_that_waits_on_the_new_tasks_own_lin
     # A task outside A's lineage still chains after the newest (C waits on A, not on it).
     p.db.x("UPDATE tasks SET status='cancelled' WHERE id IN (?, ?)", (d, fix["id"]))
     assert deferral(add("other", f"Extend {hot}."))["when"] == f"landed:#{c}"
+
+
+def test_an_automatic_chain_uses_depends_on_where_no_landing_can_be_checked(env, monkeypatch):
+    """A project with no delivery.push_branch lands its work some other way, so `landed:#<id>` would
+    exit 2 on every check. With no delivery.landed_probe either, task_add's automatic chains (a
+    settled area's file, a file a review failed on within 48 h) wait on the open task with depends_on,
+    and the overlap warning suggests no landed wait. With delivery.landed_probe set they keep
+    `landed:#<id>`, as does a project with a push branch."""
+    from ttp import coordinator as coord, overlap, reviewcap, settled
+    from ttp.db import deferral, dependency_ids
+    p = make(env)
+    hot, calm = "runtime/ttp/progress.py", "runtime/ttp/sweep.py"
+    mains = {}
+    monkeypatch.setattr(reviewcap, "main_file", lambda p, r: mains.get(r["id"]))
+
+    def add(title, spec, **kw):
+        assert coord.apply(p, [{"type": "task_add", "title": title, "kind": "code", "spec": spec, **kw}]) == []
+        return p.db.one("SELECT * FROM tasks WHERE title=?", (title,))
+
+    older = p.db.add_task("older", f"Change {hot}.", kind="code", status="done")
+    mains[_failed_review(p, older)] = hot
+    open_ = p.db.add_task("open", f"Change {hot}.", kind="code", status="running")
+    t = add("failed review file", f"Extend {hot}.")
+    assert not deferral(t) and dependency_ids(t) == [open_], (deferral(t), t["depends_on"])
+    assert any(n.startswith(f"task_add: #{t['id']} chained after #{open_} (depends_on [{open_}]") and
+               "landed:#" not in n for n in p.db.kv(coord.NOTES_KEY)), p.db.kv(coord.NOTES_KEY)
+    assert overlap.digest_note(t) == ""   # it waits on the task its label names
+    settled.add(p, [calm], "one rule", commit=False)
+    other = p.db.add_task("settled work", f"Change {calm}.", kind="code", status="queued")
+    t = add("settled area", f"Extend {calm}.")
+    assert not deferral(t) and dependency_ids(t) == [other]
+    # A done task with a head off the branch: no `start_when landed:#<id>` advice here.
+    hits = [{"id": 7, "open": False, "head": "abc1234", "paths": [(hot, False)]}]
+    assert "landed:#" not in overlap.warning(hits, landing=False) and "landed:#7" in overlap.warning(hits)
+    # With a landed probe, or a push branch, the chain is a landed wait as before.
+    p.set_config("delivery.landed_probe", "test -e landed/{id}")
+    t = add("with a landed probe", f"Extend {calm}.")
+    assert deferral(t)["when"] == f"landed:#{t['id'] - 1}" and dependency_ids(t) == []
+    p.set_config("delivery.landed_probe", "")
+    p.set_config("delivery.push_branch", "tt/push")
+    t = add("with a push branch", f"Extend {calm}.")
+    assert deferral(t)["when"] == f"landed:#{t['id'] - 1}" and dependency_ids(t) == []

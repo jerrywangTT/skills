@@ -26418,6 +26418,7 @@ def test_ttp_task_add_start_when_is_set_at_creation_and_holds_dispatch(env, monk
 
 def test_ttp_task_add_start_after_and_landed_probe(env, capsys):
     p = make(env)
+    p.set_config("delivery.landed_probe", "test -e landed/{id}")   # no push branch: how landed:#<id> is checked
     from ttp import cli
     _tasks_up_to(p, 4)
     cli.main(["task", "demo", "add", "later", "--start-after", "2h", "--start-when", "landed:#4"])
