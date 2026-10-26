@@ -15953,6 +15953,22 @@ def test_a_task_blocked_on_its_workspace_retries_by_itself_until_the_retries_run
     assert d._workspace_tries(tid) == 0, "a cancelled task's workspace tries were kept"
 
 
+def test_a_workspace_block_reason_cut_for_length_keeps_its_tail(env):
+    # A long error (deep paths) is cut to fit the 400-char reason; what happens next is kept whole.
+    p = make(env)
+    from ttp import worktree
+    from ttp.daemon import Daemon
+    p.set_config("worktree.create_retries", 0)
+    d = Daemon(p.base)
+    for e, tail in ((worktree.WorkspaceStuck("gone from /" + "deep/" * 120), "(not retried: it cannot recover by itself)"),
+                    (TimeoutError("timed out in /" + "deep/" * 120), "(after 1 tries)")):
+        tid = p.db.add_task("stuck", "s", kind="code", tier="light", origin="user")
+        d._workspace_failed(p.db.task(tid), e)
+        t = p.db.task(tid)
+        assert t["status"] == "blocked" and t["blocked_reason"].startswith("workspace: ")
+        assert t["blocked_reason"].endswith(tail) and len(t["blocked_reason"]) == 400
+
+
 def _dangling_setup(env, monkeypatch):
     """A code task whose worktree was made, holding an uncommitted file, and a daemon whose starts
     are recorded. Returns (p, task, path, daemon, starts)."""

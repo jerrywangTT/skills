@@ -10819,9 +10819,10 @@ class Daemon:
                 db.update_task(task["id"], status="queued", not_before=time.time() + delay,
                                blocked_reason=f"{WORKSPACE_RETRY_NOTE} ({n}/{limit}): {e}"[:400])
             else:
-                db.update_task(task["id"], status="blocked", blocked_reason=(
-                    f"workspace: {e} (not retried: it cannot recover by itself)" if getattr(e, "final", False)
-                    else f"workspace: {e} (after {n} tries)")[:400])
+                # The cut falls in the error (long paths), never in the tail saying what happens next.
+                tail = (" (not retried: it cannot recover by itself)" if getattr(e, "final", False)
+                        else f" (after {n} tries)")
+                db.update_task(task["id"], status="blocked", blocked_reason=f"workspace: {e}"[:400 - len(tail)] + tail)
         log(self.p, f"task {task['id']} workspace failed ({n}/{limit + 1}): {e}")
 
     def retry_workspaces(self) -> None:
