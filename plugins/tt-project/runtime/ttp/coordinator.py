@@ -3576,7 +3576,7 @@ def memory_pinned_line(p: Project) -> str:
         return ""
     return (f"## Pinned memory over half your budget: restrictions, preferences, resources and (standing) "
             f"entries take {coord['pinned_chars']} of {coord['limit']} chars, leaving "
-            f"{max(0, coord['limit'] - coord['pinned_chars'])} for decisions and facts. Merge overlapping ones "
+            f"{coord['recent_room']} for decisions and facts. Merge overlapping ones "
             f"(`memory_add` with `supersedes`, same kind, standing kept standing, the user's quoted words "
             f"kept verbatim); never retire them for space")
 

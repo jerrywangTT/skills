@@ -17089,6 +17089,12 @@ def test_pinned_memory_over_half_the_coordinator_budget_is_flagged_once(env):
     assert len(events()) == 1 and events()[0]["severity"] == "normal"
     assert "takes over half the coordinator's 12000-char" in events()[0]["text"]
     assert "## Pinned memory over half your budget" in coord.digest(p, {}, [], [])
+    # Over the budget, the line names the room memory_select reserves, as the budget line does.
+    p.add_memory("PREF-Y " + "q" * 6000, kind="preference")
+    _, use = p.memory_select(coord.COORDINATOR_MEMORY_CHARS)
+    assert use["pinned_over"] and use["recent_room"] == use["reserve"] > 0
+    assert f"leaving {use['recent_room']} for decisions and facts" in coord.memory_pinned_line(p)
+    p.forget_memories([f.stem for f in p.memory_dir.glob("preference-PREF-Y*.md")] or [])
     # It re-arms once pinned memory fits again.
     p.forget_memories([f.stem for f in p.memory_dir.glob("preference-*.md")][:3])
     coord.memory_budget_check(p)
