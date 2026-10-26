@@ -17110,7 +17110,9 @@ def test_pinned_memory_over_half_the_coordinator_budget_is_flagged_once(env):
     _, use = p.memory_select(coord.COORDINATOR_MEMORY_CHARS)
     assert use["pinned_over"] and use["recent_room"] == use["reserve"] > 0
     assert f"leaving {use['recent_room']} for decisions and facts" in coord.memory_pinned_line(p)
-    p.forget_memories([f.stem for f in p.memory_dir.glob("preference-PREF-Y*.md")] or [])
+    # Memory file names are lowercase slugs: PREF-Y is preference-pref-y.md.
+    gone, errors = p.forget_memories([f.stem for f in p.memory_dir.glob("preference-pref-y*.md")])
+    assert len(gone) == 1 and not errors, "the over-budget entry was not retired"
     # It re-arms once pinned memory fits again.
     p.forget_memories([f.stem for f in p.memory_dir.glob("preference-*.md")][:3])
     coord.memory_budget_check(p)
