@@ -16098,5 +16098,5 @@ def test_promise_filler_accepts_hash_and_parenthesised_numbers():
                  "I'll post the (812) table here.", "I'll post the (812) results here."):
         assert ob.commitments(text) == [text], text
     for text in ("I posted the #812 table here.", "If you want, I'll post the (812) table here.",
-                 "I'll post it later. The #812 table is here."):
+                 "I'll check it. The #812 table is here."):
         assert ob.commitments(text) == [], text
