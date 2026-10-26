@@ -1660,19 +1660,39 @@ class Project:
                             "archived": archived, "text": body.strip(), "created": c.group(1) if c else ""})
         return sorted(out, key=lambda e: (e["created"], e["name"]))
 
+    def superseded_end(self, names: list[str]) -> dict:
+        """The end (see ends.from_action) an entry replacing the live entries `names` carries over, so a
+        temporary entry never turns permanent by a merge: the earliest `expires` with that entry's
+        until and probe, else the first until or probe; {} when none has an end. Unknown, ambiguous
+        and archived names are skipped (the retirement reports them)."""
+        from .ends import read_front_matter
+        found = []
+        for raw in names:
+            try:
+                name, archived = self._resolve_memory_name(Path(str(raw).strip().strip("[]")).stem)
+            except ValueError:
+                continue
+            if not archived:
+                found.append(read_front_matter(_memory_parts((self.memory_dir / f"{name}.md").read_text())[0]))
+        found = [e for e in found if e]
+        return dict(min(found, key=lambda e: e.get("expires", math.inf))) if found else {}
+
     def supersede_memory(self, text: str, names: list[str], kind: str = "fact", standing: bool = False,
-                         title: str | None = None, audience: str | None = None,
-                         dry_run: bool = False) -> tuple[Path, list[Path]]:
+                         title: str | None = None, audience: str | None = None, end: dict | None = None,
+                         permanent: bool = False, dry_run: bool = False) -> tuple[Path, list[Path]]:
         """Add a merged entry and retire the live entries it replaces, with one harness commit:
         (new entry, archived paths). Refused whole, nothing written, when a name is unknown, ambiguous
         or already archived, or the merge would lose a user rule: a standing entry is replaced only
         by a standing one, a restriction only by a restriction, a preference only by a preference or
         restriction, a resource only by a resource, and the quoted words of a restriction, preference
         or standing entry (the user's verbatim words) stay word for word in the new text. `title` and
-        `audience` as add_memory's; with no `audience` the new entry keeps the one its entries share.
-        `dry_run` checks the same and returns the same paths, writing and committing nothing."""
+        `audience` as add_memory's; with no `audience` the new entry keeps the one its entries share,
+        "default" stores none. With no `end` it keeps the replaced entries' earliest (superseded_end),
+        unless `permanent`. `dry_run` checks the same and returns the same paths, writing and committing nothing."""
         from .forbidden import check
         check(self, "memory", text, title or "")
+        if end and permanent:
+            raise ValueError("nothing changed: an end and permanent contradict each other; give one")
         if standing and kind not in PINNED_MEMORY_KINDS:
             kind = "preference"
         new = " ".join(text.split())
@@ -1708,7 +1728,9 @@ class Project:
             raise ValueError("nothing changed: " + "\n".join(errors))
         # Merged entries that all share one audience keep it.
         added = self.add_memory(text, kind=kind, title=title, standing=standing, commit=False, dry_run=dry_run,
-                                audience=audience or (next(iter(auds)) if len(auds) == 1 else None))
+                                end=end or ({} if permanent else self.superseded_end(olds)),
+                                audience=None if audience == "default"
+                                else audience or (next(iter(auds)) if len(auds) == 1 else None))
         if dry_run:
             return added, [self.memory_dir / "archive" / f"{n}.md" for n in olds]
         done, errors = self.forget_memories(olds, keep=added.stem, why=f"merged into [{added.stem}]", commit=False)

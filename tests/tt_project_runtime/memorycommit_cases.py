@@ -217,3 +217,104 @@ def test_memory_cli_dry_run_writes_retires_and_commits_nothing(env):
                                      "over budget: "), err.getvalue()
     assert snapshot() == before and p.memory_index.read_text() == index and head() == h0
     assert _harness_dirty(p) == ""
+
+
+def _memory_end(path):
+    from ttp.ends import read_front_matter
+    return read_front_matter(path.read_text().split("\n---\n", 1)[0])
+
+
+def _live_memory(p):
+    return sorted(f.stem for f in p.memory_dir.glob("*.md"))
+
+
+def test_memory_supersedes_keeps_the_earliest_end_unless_a_new_end_or_permanent(env):
+    """A merge never turns a temporary entry permanent: with no end of its own the new entry keeps the
+    earliest expires of the entries it replaces with that entry's until and probe (else the first
+    until), a new end wins, and --permanent drops it."""
+    from ttp import cli
+    p = make(env)
+    now = time.time()
+    soon = {"expires": now + 86400, "probe": "test -e /nonexistent/done"}
+
+    def three():
+        return [p.add_memory("A later fact.", kind="fact", end={"expires": now + 3 * 86400, "until": "it ships"}),
+                p.add_memory("A sooner fact.", kind="fact", end=soon),
+                p.add_memory("A permanent fact.", kind="fact")]
+    olds = three()
+    with contextlib.redirect_stdout(io.StringIO()) as out:
+        cli.main(["memory", "demo", "The merged fact.", "--supersedes", *(o.stem for o in olds)])
+    added = pathlib.Path(out.getvalue().splitlines()[0])
+    end = _memory_end(added)
+    assert end["probe"] == soon["probe"] and "until" not in end and abs(end["expires"] - soon["expires"]) < 61, end
+    assert not any(o.exists() for o in olds)
+    # Only an until among them: kept.
+    olds = [p.add_memory("Until-only fact.", kind="fact", end={"until": "the box is back"}),
+            p.add_memory("No-end fact.", kind="fact")]
+    added, _ = p.supersede_memory("Merged until fact.", [o.stem for o in olds])
+    assert _memory_end(added) == {"until": "the box is back"}
+    # A new end wins whole.
+    olds = three()
+    added, _ = p.supersede_memory("Merged with its own end.", [o.stem for o in olds], end={"until": "a new end"})
+    assert _memory_end(added) == {"until": "a new end"}
+    # --permanent drops it.
+    olds = three()
+    with contextlib.redirect_stdout(io.StringIO()) as out:
+        cli.main(["memory", "demo", "Merged for good.", "--supersedes", *(o.stem for o in olds), "--permanent"])
+    assert _memory_end(pathlib.Path(out.getvalue().splitlines()[0])) == {}
+    with pytest.raises(ValueError, match="contradict"):
+        p.supersede_memory("Both.", [p.add_memory("X fact.", kind="fact").stem], end={"until": "x"}, permanent=True)
+    with pytest.raises(SystemExit, match="--permanent goes with --supersedes"):
+        cli.main(["memory", "demo", "A fact.", "--permanent"])
+    _committed_clean(p)
+
+
+def test_memory_supersedes_audience_default_clears_a_workers_audience_in_one_write(env):
+    """--audience default stores no audience (default ranked selection) in the same commit as the
+    merge, leaving one live entry; without it the shared audience is kept."""
+    from ttp import cli
+    p = make(env)
+    old = p.add_memory("A fact for workers.", kind="fact", audience="workers")
+    count = lambda: len(_memory_commit_log(p))
+    before = count()
+    with contextlib.redirect_stdout(io.StringIO()) as out:
+        cli.main(["memory", "demo", "The fact, unpinned.", "--supersedes", old.stem, "--audience", "default"])
+    added = pathlib.Path(out.getvalue().splitlines()[0])
+    assert "audience:" not in added.read_text()
+    assert count() == before + 1 and _live_memory(p) == [added.stem]
+    _committed_clean(p)
+    # No --audience: the shared one stays.
+    old = p.add_memory("Another fact for workers.", kind="fact", audience="workers")
+    added, _ = p.supersede_memory("Still for workers.", [old.stem])
+    assert "audience: workers\n" in added.read_text()
+
+
+def test_coordinator_memory_add_supersedes_carries_the_earliest_end_and_takes_the_default_audience(env):
+    """The coordinator's memory_add with `supersedes` goes its own way (add, then retire) and behaves
+    as `ttp memory --supersedes`: the earliest end carried over, its own end or `permanent` wins, and
+    audience `default` stores none."""
+    p = make(env)
+    from ttp import coordinator as coord
+    now = time.time()
+    for turn, extra, want in ((1, {}, "carried"), (2, {"until": "a new end"}, {"until": "a new end"}),
+                              (3, {"permanent": True}, {}), (4, {"audience": "default"}, "carried")):
+        old = p.add_memory(f"Temporary fact {turn}.", kind="fact", audience="workers",
+                           end={"expires": now + 86400, "until": "it ships"})
+        later = p.add_memory(f"Later fact {turn}.", kind="fact", end={"expires": now + 5 * 86400})
+        with p.db.tx():
+            assert coord.apply(p, [{"type": "memory_add", "text": f"Merged fact {turn}.", "memory_kind": "fact",
+                                    "supersedes": [old.stem, later.stem], **extra}], turn=turn) == []
+        added = p.memory_dir / f"fact-merged-fact-{turn}.md"
+        end = _memory_end(added)
+        if want == "carried":
+            assert end["until"] == "it ships" and abs(end["expires"] - now - 86400) < 61, end
+        else:
+            assert end == want, (extra, end)
+        assert not old.exists() and not later.exists()
+        assert "audience:" not in added.read_text()
+    with p.db.tx():
+        probs = coord.apply(p, [{"type": "memory_add", "text": "Contradiction.", "memory_kind": "fact",
+                                 "supersedes": [added.stem], "until": "x", "permanent": True}], turn=9)
+    assert probs and "contradict" in str(probs), probs
+    assert added.exists()
+    _committed_clean(p)

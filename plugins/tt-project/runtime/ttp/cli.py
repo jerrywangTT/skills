@@ -5242,6 +5242,8 @@ def cmd_memory(a) -> None:
         sys.exit("give the memory's text, or --forget <entry>, or --search <words>")
     if (a.title or a.audience) and not a.text:
         sys.exit("--title and --audience go with the memory's text")
+    if a.permanent and not a.supersedes:
+        sys.exit("--permanent goes with --supersedes")
     dry = "dry run, nothing written or committed: " if a.dry_run else ""
     if a.supersedes:
         if not a.text or a.forget:
@@ -5249,7 +5251,8 @@ def cmd_memory(a) -> None:
                      f"ttp memory {p.name} \"<text>\" --kind K --supersedes <entry> ...")
         try:
             added, done = p.supersede_memory(a.text, a.supersedes, kind=a.kind, standing=a.standing,
-                                             title=a.title, audience=a.audience, dry_run=a.dry_run)
+                                             title=a.title, audience=a.audience, permanent=a.permanent,
+                                             dry_run=a.dry_run)
         except ValueError as e:
             sys.exit(str(e))
         print(f"{dry}would add {added}" if dry else added)
@@ -8133,10 +8136,10 @@ def main(argv: list[str] | None = None) -> None:
                         "one finished instance never retires it")
     s.add_argument("--title", help="with the text: the entry's title (its MEMORY.md line and file name; "
                                    "default its first line, cut to 80 chars)")
-    s.add_argument("--audience", choices=MEMORY_AUDIENCES,
+    s.add_argument("--audience", choices=(*MEMORY_AUDIENCES, "default"),
                    help="with the text: who gets it. workers: pinned in worker prompts; coordinator: kept "
                         "out of them (a restriction still reaches them). Default: by kind and wording. With --supersedes the default is the "
-                        "audience the replaced entries share")
+                        "audience the replaced entries share; 'default' clears it in the same write")
     s.add_argument("--why", help="with --forget: why it ends; required for a standing entry (its end condition "
                                   "or the user's words ending it)")
     s.add_argument("--search", nargs="+", metavar="WORD",
@@ -8146,7 +8149,10 @@ def main(argv: list[str] | None = None) -> None:
                         "harness commit. Refused whole if a name is unknown or archived, a standing entry would "
                         "be replaced by one not --standing, a restriction, preference or resource by another "
                         "kind, or the quoted (user's verbatim) words of a restriction, preference or standing "
-                        "entry are missing from the text")
+                        "entry are missing from the text. The new entry keeps the earliest end (expires, until, "
+                        "until_probe) of the entries it replaces")
+    s.add_argument("--permanent", action="store_true",
+                   help="with --supersedes: the new entry drops the replaced entries' end and never expires")
     s.add_argument("--settle", nargs="*", metavar="ENTRY",
                    help="move decision entries into the settled-areas register (harness/settled_areas.json) and "
                         "archive them from memory, in one harness commit; with no names, every decision that "

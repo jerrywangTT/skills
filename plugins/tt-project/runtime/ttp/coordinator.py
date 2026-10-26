@@ -95,7 +95,7 @@ ACTIONS_SCHEMA: dict[str, Any] = {
             "needs_device": {"type": "boolean"}, "user_deep": {"type": "boolean"}, "standing": {"type": "boolean"},
             "continues": {"type": "integer"}, "resource": {"type": "string"}, "machine": {"type": "string"}, "paused": {"type": "boolean"},
             "user_asked": {"type": "boolean"}, "outage": {"type": "boolean"},
-            "reason": {"type": "string"}, "supersedes": {"type": "array", "items": {"type": "string"}},
+            "reason": {"type": "string"}, "supersedes": {"type": "array", "items": {"type": "string"}}, "permanent": {"type": "boolean"},
             "replaces": {"type": "string"}, "over": {"type": "string"}, "both_hold": {"type": "boolean"},
             "expires": {"type": "string"}, "until": {"type": "string"}, "until_probe": {"type": "string"},
             "end_when": {"type": "string"}, "report_from": {"type": "string"},
@@ -2111,13 +2111,19 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 if relayed:
                     text = f"{text.rstrip()} {RELAYED_MARK}: {relayed}]"
                     notes.append(f"memory_add: marked in the entry as relayer context ({relayed})")
+                old = a.get("supersedes") or []
+                old = [old] if isinstance(old, str) else old
+                end = ends.from_action(a, where=p)
+                if end and a.get("permanent") is True:
+                    raise ValueError("memory_add rejected: an end (`expires`, `until`, `until_probe`) and "
+                                     "`permanent` contradict each other; give one")
+                if old and not end and a.get("permanent") is not True:
+                    end = p.superseded_end([str(n) for n in old])   # a temporary entry never turns permanent
                 added = p.add_memory(text, kind=a.get("memory_kind") or "fact", title=a.get("title"), key=key,
-                                     end=ends.from_action(a, where=p), standing=a.get("standing") is True,
-                                     audience=a.get("audience"))
+                                     end=end, standing=a.get("standing") is True, audience=a.get("audience"))
                 if (a.get("memory_kind") or "") == "restriction":
                     _tell_running_workers(db, f"New binding restriction: {a['text'].strip()}", key)
-                old = a.get("supersedes") or []
-                for name in [old] if isinstance(old, str) else old:
+                for name in old:
                     try:
                         # A standing entry superseded by a standing one is shortened, not retired.
                         p.forget_memory(str(name), keep=added.stem, why=a.get("why") or (
