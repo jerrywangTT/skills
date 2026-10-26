@@ -300,3 +300,24 @@ def test_note_status_of_a_local_or_queued_note(env, monkeypatch, capsys):
     upstream.append("demo", 3, [{"title": "upstream: a lesson", "spec": "s"}])
     assert _note(cli, "--status", upstream.fingerprint("upstream: a lesson", "s")) == 2
     assert "ttp upstream --mine" in capsys.readouterr().out
+
+
+def test_forward_status_labels_a_retired_target_and_forward_prunes_its_row(env, monkeypatch):
+    """A row outside the current target set reads 'no longer a target' (never failing, never counted),
+    a failing current target still reads failing, and the next forward save drops the retired row."""
+    from ttp import upstream
+    fake = _fake_forward_ssh(env, monkeypatch)
+    now = time.time()
+    bad = {"fails": 5, "fail_since": now - 5 * 3600, "error_at": now - 3600, "next": now + 600,
+           "tried": now - 3600, "last_error": "exit 255: down"}
+    upstream.project.write_json(upstream.forward_path(), {"targets": {"gone-host": dict(bad), "live-host": dict(bad)}})
+    upstream.set_forward_to(["live-host"])
+    lines = upstream.forward_status(now)
+    gone = [ln for ln in lines if ln.startswith("gone-host")]
+    assert len(gone) == 1 and "no longer a target" in gone[0] and "failing" not in gone[0]
+    assert any(ln.startswith("live-host") and "failing (5x" in ln for ln in lines)
+    assert list(upstream.failing(now)) == ["live-host"]
+    assert "gone-host" not in upstream.forward_line(now)
+    upstream.append("demo", 3, [{"title": "upstream: a lesson", "spec": "s"}])
+    upstream.forward(now + 3 * 3600)
+    assert set(json.loads(upstream.forward_path().read_text())["targets"]) == {"live-host"}

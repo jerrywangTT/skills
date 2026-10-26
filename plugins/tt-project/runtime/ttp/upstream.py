@@ -1738,6 +1738,7 @@ def _forward(now: float, budget_s: float, context: str = "daemon") -> int:
     configured = forward_to()
     projects = _remote_projects()
     targets = configured if configured is not None else sorted(set(projects.values()))
+    current = set(targets)
     daemon = context == "daemon"
     if not daemon:
         targets = [t for t in targets if _failing_since(targets_st.get(t), now) >= FALLBACK_AFTER_S]
@@ -1746,6 +1747,9 @@ def _forward(now: float, budget_s: float, context: str = "daemon") -> int:
     open_fps: set[str] | None = None
 
     def save():
+        # Rows of retired targets go at the next save: nothing tries them any more.
+        for t in [t for t in targets_st if t not in current]:
+            del targets_st[t]
         project.write_json(forward_path(), {"targets": targets_st}, mode=0o600)
 
     def fits() -> bool:
@@ -1857,7 +1861,7 @@ def forward_status(now: float | None = None) -> list[str]:
     now = now or time.time()
     targets_st = _json(forward_path()).get("targets") or {}
     configured = forward_to()
-    names = configured if configured is not None else sorted(set(_remote_projects().values()) | set(targets_st))
+    names = configured if configured is not None else sorted(set(_remote_projects().values()))
     if configured == []:
         return ["upstream.forward_to is none: this machine sends no notes on"]
     if not names:
@@ -1883,6 +1887,8 @@ def forward_status(now: float | None = None) -> list[str]:
         if st.get("run_ok"):
             line += f"; last sent from a run or the CLI {ago(st['run_ok'])}"
         out.append(line)
+    for t in sorted(set(targets_st) - set(names)):
+        out.append(f"{t}: no longer a target (last tried {ago((targets_st[t] or {}).get('tried'))})")
     return out
 
 
