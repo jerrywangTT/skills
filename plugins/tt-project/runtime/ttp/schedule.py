@@ -25,7 +25,7 @@ retries every half hour instead of a full period on.
 
 An llm schedule may name a `precheck`: a shell command, run off the tick from the project root after
 the budget, open-run, debounce and idle gates (`precheck_timeout_s`, 120, capped like a command
-watcher's). Exit 0 skips the trigger as "skipped: precheck: <its first output line>"; any other exit,
+watcher's `timeout_s`; see over_caps). Exit 0 skips the trigger as "skipped: precheck: <its first output line>"; any other exit,
 a timeout or an error lets the run go ahead and is logged. It judges outside state no model needs to.
 
 A project may keep its schedules in `harness/schedules.json` (the format of the template's
@@ -33,6 +33,11 @@ recurring.json), so every change to them is a commit in the harness. Once that f
 the source of truth: the daemon applies it at start and whenever it changes (a schedule missing
 from it is removed), and schedule_set and the web app write their changes back to it. Without the
 file the database alone holds them; `ttp schedules NAME --export` creates it once from there.
+
+Timeouts have caps (over_caps): a command's `timeout_s` and a precheck's at the daemon's watcher cap
+(240 s), a heal block's `timeout_s` there too and its `fix_timeout_s` at 4 h. schedule_set refuses a
+value above its cap; one already stored (the file, an older row) runs at the cap, the daemon logs
+that once per schedule, and a run cut at the cap says so ("timed out after 240 s (cap; asked 400)").
 """
 from __future__ import annotations
 
@@ -368,6 +373,39 @@ def entry(row: dict) -> dict:
     payload = row["payload"]
     out["payload"] = json.loads(payload or "{}") if isinstance(payload, str) else (payload or {})
     return out
+
+
+def over_caps(payload: dict) -> list[tuple[str, float, float]]:
+    """(field, asked, cap) for each timeout in a schedule payload above the cap the daemon runs it at:
+    `timeout_s`, `precheck_timeout_s`, `heal.timeout_s` and `heal.fix_timeout_s`. A number written as
+    text counts (the daemon reads it); other values are left to the payload's own checks."""
+    from .heal import FIX_MAX_TIMEOUT_S, MAX_TIMEOUT_S   # MAX_TIMEOUT_S is daemon.WATCHER_MAX_S
+    block = payload.get("heal") if isinstance(payload.get("heal"), dict) else {}
+    out = []
+    for field, v, cap in (("timeout_s", payload.get("timeout_s"), MAX_TIMEOUT_S),
+                          ("precheck_timeout_s", payload.get("precheck_timeout_s"), MAX_TIMEOUT_S),
+                          ("heal.timeout_s", block.get("timeout_s"), MAX_TIMEOUT_S),
+                          ("heal.fix_timeout_s", block.get("fix_timeout_s"), FIX_MAX_TIMEOUT_S)):
+        try:
+            asked = float(v) if not isinstance(v, bool) and v is not None else 0.0
+        except (TypeError, ValueError):
+            continue
+        if asked > cap:
+            out.append((field, asked, cap))
+    return out
+
+
+def over_cap_text(over: list[tuple[str, float, float]]) -> str:
+    """over_caps' findings in words: "`timeout_s` 400 is above its cap of 240 s"."""
+    return "; ".join(f"`{field}` {asked:g} is above its cap of {cap:g} s" for field, asked, cap in over)
+
+
+def capped_note(asked: Any, cap: float) -> str:
+    """" (cap; asked 400)" after a "timed out after 240 s" when the cap cut the asked timeout, else ""."""
+    try:
+        return f" (cap; asked {float(asked):g})" if float(asked) > cap else ""
+    except (TypeError, ValueError):
+        return ""
 
 
 def parse_file(text: str | bytes, known: Any = ()) -> list[dict]:

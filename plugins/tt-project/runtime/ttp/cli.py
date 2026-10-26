@@ -5415,6 +5415,7 @@ def cmd_schedules(a) -> None:
         e = sched.entry(r)
         t = e["payload"].get("timeout_s") if isinstance(e["payload"], dict) else None
         pre = str(e["payload"].get("precheck") or "").strip() if isinstance(e["payload"], dict) else ""
+        over = sched.over_caps(e["payload"]) if r["kind"] != "watcher" and isinstance(e["payload"], dict) else []
         at = sched.at_text(r, home)
         spec = heal.of(e["payload"]) if r["kind"] == "command" and isinstance(e["payload"], dict) else None
         slow = heal.interval(p.db, r, spec) if spec else 0
@@ -5425,7 +5426,9 @@ def cmd_schedules(a) -> None:
         if cap and (hint := sched.cap_text(sched.suggest_cap(p.db, r))):
             cap += f" ({hint})"
         print(f"  {e['name']:24} {e['kind']:8} every {e['every']}{' ' + at if at else ''}{cap}"
-              f"{f' timeout {t}s' if t else ''}{f' precheck: {pre[:60]}' if pre else ''}"
+              f"{f' timeout {t}s' if t else ''}"
+              f"{f' (runs at the cap: {sched.over_cap_text(over)})' if over else ''}"
+              f"{f' precheck: {pre[:60]}' if pre else ''}"
               f"{'' if e['enabled'] else ' (off)'}  {r['last_status'] or ''}"
               f"{f' ({n} skip(s) in 24 h)' if (n := len(sched.skips(p.db, r['name'], sched.SKIP_KEEP, time.time() - 86400))) else ''}")
 

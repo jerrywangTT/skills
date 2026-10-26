@@ -277,7 +277,9 @@ def validate(block: Any, where: str = "heal", every_s: int | None = None) -> dic
             raise ValueError(f"{where}: `{k}` is a number, 0 or more")
     if out["timeout_s"] <= 0 or out["window_h"] <= 0:
         raise ValueError(f"{where}: `timeout_s` and `window_h` must be positive")
-    out["timeout_s"] = min(out["timeout_s"], MAX_TIMEOUT_S)   # longer would hold the daemon's tick past its watchdog
+    if out["timeout_s"] > MAX_TIMEOUT_S:   # longer would hold the daemon's tick past its watchdog
+        # schedule_set refuses it (schedule.over_caps); a stored one runs at the cap, its timeout text says so
+        out["timeout_asked_s"], out["timeout_s"] = out["timeout_s"], MAX_TIMEOUT_S
     for k in ("check", "fix", "suppress", "resource", "machine", "self_fix_note"):
         if out.get(k) is not None and not isinstance(out[k], str):
             raise ValueError(f"{where}: `{k}` is text")
@@ -295,7 +297,8 @@ def validate(block: Any, where: str = "heal", every_s: int | None = None) -> dic
         v = out.setdefault("fix_timeout_s", FIX_TIMEOUT_S)
         if isinstance(v, bool) or not isinstance(v, (int, float)) or v <= 0:
             raise ValueError(f"{where}: `fix_timeout_s` is a number of seconds, above 0")
-        out["fix_timeout_s"] = min(v, FIX_MAX_TIMEOUT_S)
+        if v > FIX_MAX_TIMEOUT_S:   # as timeout_s above
+            out["fix_timeout_asked_s"], out["fix_timeout_s"] = v, FIX_MAX_TIMEOUT_S
     elif "fix_timeout_s" in out:
         raise ValueError(f"{where}: `fix_timeout_s` is for a detached fix: set `fix_detached` true too")
     if out.get("healthy_every") is not None:
@@ -580,9 +583,9 @@ def check(spec: dict, state: dict, cwd: str, env: dict | None = None) -> tuple[i
         return fn(spec, state, cwd)
     end = time.monotonic() + spec["timeout_s"]
     said: list[str] = []
-    rc, out = scriptwatch.rerun(lambda: _shell(spec["check"], cwd, max(end - time.monotonic(), 1), env),
-                                lambda r: r[0] != 0, spec["check"], cwd, env or _env(), said.append,
-                                again=lambda: end - time.monotonic() >= 1)
+    rc, out = _capped(spec, scriptwatch.rerun(lambda: _shell(spec["check"], cwd, max(end - time.monotonic(), 1), env),
+                                              lambda r: r[0] != 0, spec["check"], cwd, env or _env(), said.append,
+                                              again=lambda: end - time.monotonic() >= 1))
     return rc, "\n".join([out, *said]) if said else out
 
 
@@ -681,8 +684,18 @@ def run_fix(spec: dict, cwd: str, env: dict) -> tuple[int, str]:
     names one. 75 only from the lock (busy or paused): `ttp lock` passes its command's exit code on,
     so a fix's own 75 comes back as FIX_OWN_75."""
     if not spec.get("resource"):
-        return _shell(spec["fix"], cwd, spec["timeout_s"], env)
-    return _exec(_fix_argv(spec), cwd, spec["timeout_s"] + LOCK_WAIT_S + 10, env)
+        return _capped(spec, _shell(spec["fix"], cwd, spec["timeout_s"], env))
+    return _capped(spec, _exec(_fix_argv(spec), cwd, spec["timeout_s"] + LOCK_WAIT_S + 10, env))
+
+
+def _capped(spec: dict, result: tuple[int, str]) -> tuple[int, str]:
+    """`result` with " (cap; asked N)" after its "timed out after ... s" when `timeout_s` was capped."""
+    rc, out = result
+    if rc != 124 or "timeout_asked_s" not in spec or not out.startswith("timed out after "):
+        return result
+    from .schedule import capped_note
+    first, nl, rest = out.partition("\n")
+    return rc, first + capped_note(spec["timeout_asked_s"], MAX_TIMEOUT_S) + nl + rest
 
 
 def _fix_argv(spec: dict) -> list[str]:
@@ -1154,7 +1167,9 @@ def _fix_job(host: Any, name: str, spec: dict, st: dict, now: float) -> tuple[st
         pid = int(job.get("pid") or 0)
         if pid > 1:
             detach.stop(rc, pid, f"ran past fix_timeout_s ({limit:.0f} s): killed by the daemon")
-        frc, fout = 124, f"the detached fix ran past fix_timeout_s ({limit:.0f} s): killed"
+        from .schedule import capped_note
+        frc, fout = 124, (f"the detached fix ran past fix_timeout_s ({limit:.0f} s)"
+                          f"{capped_note(spec.get('fix_timeout_asked_s'), limit)}: killed")
     elif where == "ended":
         try:
             frc = int(val)

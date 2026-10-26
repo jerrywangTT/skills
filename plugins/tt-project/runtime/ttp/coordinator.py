@@ -2342,6 +2342,12 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     sched.check_name(a.get("name"), (old["name"],) if old else ())
                 except ValueError as e:
                     raise ValueError(f"schedule_set rejected: {e}") from None
+                # A timeout above its cap would run cut to the cap, unseen: refused, so the coordinator
+                # resends a value that holds. Only the action's own values: a stored one never blocks a change.
+                if over := sched.over_caps({k: a[k] for k in ("timeout_s", "precheck_timeout_s", "heal") if a.get(k)}):
+                    raise ValueError(f"schedule_set {a.get('name')!r} rejected: {sched.over_cap_text(over)} (the daemon "
+                                     f"would stop it there); set it at or under the cap, or have the command start "
+                                     f"the long work detached and report its result on a later run")
                 kind = a.get("kind") or (old["kind"] if old else "llm")
                 kept = json.loads(old["payload"] or "{}") if old and old["kind"] == kind else {}
                 # Fields the action leaves out keep their current values; only a new schedule gets defaults.

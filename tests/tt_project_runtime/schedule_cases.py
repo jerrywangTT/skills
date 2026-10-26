@@ -767,3 +767,117 @@ def test_schedule_skip_records_leave_the_quiet_gate_settling_all_held_idle_wakes
     fp2 = quietgate.fingerprint(p.db, cfg, "wake")
     assert fp2 == fp and quietgate.all_held(p.db, cfg, now)
     assert quietgate.quiet(p.db, cfg, [], [], lambda: [], "idle", fp2, now)
+
+
+def test_schedule_set_refuses_a_timeout_above_its_cap_and_names_the_cap_and_the_value(env):
+    """The case behind it: a command schedule set with timeout_s 400 was cut at the daemon's 240 s watcher cap
+    with no word of it, so its author believed it had 400 s."""
+    from ttp import coordinator as coord
+    from ttp import daemon as dm
+    from ttp import heal
+    from ttp import schedule as sched
+    p = make(env)
+    row = lambda name: p.db.one("SELECT payload FROM schedules WHERE name=?", (name,))
+    base = {"type": "schedule_set", "name": "slow", "kind": "command", "every": "30m", "command": "true"}
+    for extra, said in [({"timeout_s": 400}, f"`timeout_s` 400 is above its cap of {dm.WATCHER_MAX_S} s"),
+                        ({"timeout_s": "400"}, "`timeout_s` 400 is above its cap"),   # the daemon reads text too
+                        ({"timeout_s": 240.5}, "`timeout_s` 240.5 is above its cap"),
+                        ({"heal": {"check": "true", "timeout_s": 400}}, "`heal.timeout_s` 400 is above its cap of 240 s"),
+                        ({"heal": {"check": "true", "fix": "true", "fix_detached": True, "fix_timeout_s": 20000}},
+                         f"`heal.fix_timeout_s` 20000 is above its cap of {heal.FIX_MAX_TIMEOUT_S} s"),
+                        ({"kind": "llm", "spec": "sum up", "precheck": "true", "precheck_timeout_s": 600},
+                         "`precheck_timeout_s` 600 is above its cap of 240 s")]:
+        out = coord.apply(p, [{**base, **extra}])
+        assert len(out) == 1 and "schedule_set 'slow' rejected" in out[0] and said in out[0], out
+        assert row("slow") is None
+    # At the cap it is set as before, and a later change that leaves timeout_s out keeps it.
+    assert coord.apply(p, [{**base, "timeout_s": dm.WATCHER_MAX_S}]) == []
+    assert json.loads(row("slow")["payload"])["timeout_s"] == dm.WATCHER_MAX_S
+    # A stored over-cap value never blocks another change (switching it off, a new command).
+    sched.upsert(p.db, "old", "command", "30m", payload={"command": "true", "timeout_s": 400})
+    assert coord.apply(p, [{"type": "schedule_set", "name": "old", "enabled": False}]) == []
+    assert coord.apply(p, [{"type": "schedule_set", "name": "old", "command": "date"}]) == []
+    assert json.loads(row("old")["payload"]) == {"command": "date", "timeout_s": 400}
+
+
+def _timed_out_runs(p, monkeypatch, name, payload, runs=2):
+    """Store command schedule `name` with `payload`, run it `runs` times through the daemon with every
+    command timing out; returns (the timeouts it ran with, its last status, daemon.log)."""
+    from ttp import daemon as dm
+    from ttp import schedule as sched
+    seen = []
+
+    def run_group(cmd, **kw):
+        seen.append(kw["timeout"])
+        raise subprocess.TimeoutExpired(cmd, kw["timeout"])
+
+    monkeypatch.setattr(dm.schedrun, "run_group", run_group)
+    sched.upsert(p.db, name, "command", "30m", payload=payload)
+    d = dm.Daemon(p.base)
+    d.gates = {}
+    for _ in range(runs):
+        p.db.x("UPDATE schedules SET next_run=? WHERE name=?", (time.time() - 1, name))
+        _run_precheck_schedule(d)
+    status = p.db.one("SELECT last_status FROM schedules WHERE name=?", (name,))["last_status"]
+    log = (p.logs / "daemon.log").read_text() if (p.logs / "daemon.log").exists() else ""
+    return seen, status, log
+
+
+def test_a_stored_over_cap_schedule_runs_at_the_cap_warns_once_and_its_timeout_names_both(env, monkeypatch, capsys):
+    from ttp import cli
+    from ttp import daemon as dm
+    p = make(env)
+    seen, status, log = _timed_out_runs(p, monkeypatch, "slow", {"command": "sleep 999", "timeout_s": 400})
+    assert seen == [dm.WATCHER_MAX_S] * 2
+    assert status == f"error: timed out after {dm.WATCHER_MAX_S} s (cap; asked 400)", status
+    warn = f"schedule slow: `timeout_s` 400 is above its cap of {dm.WATCHER_MAX_S} s; it runs at the cap"
+    assert log.count(warn) == 1, log   # once per schedule, not per run
+    err = p.db.q("SELECT text FROM events WHERE source='watcher-error:slow'")
+    assert any(f"timed out after {dm.WATCHER_MAX_S} s (cap; asked 400): sleep 999" in e["text"] for e in err), err
+    capsys.readouterr()
+    cli.main(["schedules", p.name])
+    assert "timeout 400s (runs at the cap: `timeout_s` 400 is above its cap of 240 s)" in capsys.readouterr().out
+    # Back at the cap the warning's record goes, so a later over-cap value warns again.
+    d = dm.Daemon(p.base)
+    d._warn_over_cap({"name": "slow", "kind": "command"}, {"command": "x", "timeout_s": 200})
+    assert "slow" not in (p.db.kv(d.CAP_WARNED_KEY) or {})
+    d._warn_over_cap({"name": "slow", "kind": "command"}, {"command": "x", "timeout_s": 500})
+    assert "`timeout_s` 500 is above" in (p.logs / "daemon.log").read_text()
+
+
+def test_a_schedule_at_or_under_the_cap_times_out_as_before_with_no_warning(env, monkeypatch):
+    from ttp import daemon as dm
+    p = make(env)
+    seen, status, log = _timed_out_runs(p, monkeypatch, "quick", {"command": "sleep 999", "timeout_s": dm.WATCHER_MAX_S})
+    assert seen == [dm.WATCHER_MAX_S] * 2 and status == f"error: timed out after {dm.WATCHER_MAX_S} s", status
+    assert "cap" not in log and not p.db.kv(dm.Daemon.CAP_WARNED_KEY)
+    err = p.db.q("SELECT text FROM events WHERE source='watcher-error:quick'")
+    assert err and all(e["text"] == "watcher command timed out: sleep 999" for e in err), err
+
+
+def test_an_over_cap_precheck_and_heal_timeout_name_the_cap_and_the_value_asked(env, monkeypatch):
+    from ttp import daemon as dm
+    from ttp import heal
+    p = make(env)
+
+    def run_group(cmd, **kw):
+        raise subprocess.TimeoutExpired(cmd, kw["timeout"])
+
+    monkeypatch.setattr(dm.schedrun, "run_group", run_group)
+    _prechecked(p, "sleep 999", precheck_timeout_s=400)
+    d = dm.Daemon(p.base)
+    d.gates = {}
+    _run_precheck_schedule(d)
+    log = _summary(p)[2]
+    assert "schedule summary: precheck timed out after 240 s (cap; asked 400); the run goes ahead" in log, log
+    assert log.count("schedule summary: `precheck_timeout_s` 400 is above its cap of 240 s") == 1
+    # A heal block: loaded at the cap, and its timed-out check or fix says so; at the cap, as before.
+    spec = heal.validate({"check": "sleep 999", "fix": "true", "timeout_s": 400})
+    assert spec["timeout_s"] == heal.MAX_TIMEOUT_S
+    monkeypatch.setattr(heal, "_shell", lambda cmd, cwd, t, env=None: (124, f"timed out after {t:.0f} s"))
+    assert heal.run_fix(spec, str(p.root), {}) == (124, "timed out after 240 s (cap; asked 400)")
+    assert heal.check(spec, {}, str(p.root))[1].startswith("timed out after 240 s (cap; asked 400)")
+    under = heal.validate({"check": "sleep 999", "fix": "true", "timeout_s": 240})
+    assert "timeout_asked_s" not in under and heal.run_fix(under, str(p.root), {}) == (124, "timed out after 240 s")
+    fix = heal.validate({"check": "true", "fix": "true", "fix_detached": True, "fix_timeout_s": 20000})
+    assert fix["fix_timeout_s"] == heal.FIX_MAX_TIMEOUT_S and fix["fix_timeout_asked_s"] == 20000

@@ -4675,6 +4675,7 @@ class Daemon:
     def _start_schedule(self, s: dict, payload: dict) -> schedrun.Run:
         """Start one command, heal, builtin watcher or prechecked llm run in its own thread. It works on a
         copy of the daemon with its own database connection; its watchdog pings are the tick's own business."""
+        self._warn_over_cap(s, payload)
         host = copy.copy(self)
         host.p = copy.copy(self.p)
         host.p._db = None
@@ -4692,6 +4693,23 @@ class Daemon:
             return run_builtin(host, s["name"], payload), None
         return schedrun.start(schedrun.Run(s, payload, self._schedule_timeout(s, payload)), body,
                               lambda: host.p.db)
+
+    CAP_WARNED_KEY = "schedule_cap_warned"   # kv: schedule -> the over-cap timeouts its daemon log line named
+
+    def _warn_over_cap(self, s: dict, payload: dict) -> None:
+        """A stored schedule whose timeouts are above their caps (schedule_set refuses those; the file or
+        an older row may hold one) runs at the caps: log that once per schedule and values, not per run."""
+        over = sched.over_caps(payload) if s["kind"] != "watcher" else []
+        warned = dict(self.p.db.kv(self.CAP_WARNED_KEY) or {})
+        text = sched.over_cap_text(over)
+        if warned.get(s["name"], "") == text:
+            return
+        if text:
+            log(self.p, f"schedule {s['name']}: {text}; it runs at the cap")
+            warned[s["name"]] = text
+        else:
+            warned.pop(s["name"], None)
+        self.p.db.set_kv(self.CAP_WARNED_KEY, warned)
 
     def _schedule_timeout(self, s: dict, payload: dict) -> float:
         """How long one run may go on: its own bounds plus SCHEDULE_GRACE_S, so they normally end it."""
@@ -4842,9 +4860,10 @@ class Daemon:
             out = schedrun.run_group(cmd, cwd=str(self.p.root), timeout=timeout, env=command_env(self.p),
                                      ok=(0, 1))
         except subprocess.TimeoutExpired:   # its whole process group is killed: a failed run
-            self.observe(errors, f"watcher command timed out: {cmd}", "normal", rewake_after_s=rewake,
-                         lifecycle=scr.ERROR)
-            return f"error: timed out after {timeout} s"
+            note = sched.capped_note(payload.get("timeout_s"), WATCHER_MAX_S)
+            self.observe(errors, f"watcher command timed out{f' after {timeout} s' + note if note else ''}: {cmd}",
+                         "normal", rewake_after_s=rewake, lifecycle=scr.ERROR)
+            return f"error: timed out after {timeout} s{note}"
         text = (out.stdout or "").strip()
         ok = out.returncode in (0, 1)
         failed = not ok and not text   # the daemon reports the failure itself
@@ -5132,7 +5151,8 @@ class Daemon:
             out = schedrun.run_group(cmd, cwd=str(self.p.root), timeout=timeout, env=command_env(self.p),
                                      ok=(0, 1))
         except subprocess.TimeoutExpired:
-            log(self.p, f"schedule {s['name']}: precheck timed out after {timeout} s; the run goes ahead")
+            log(self.p, f"schedule {s['name']}: precheck timed out after {timeout} s"
+                        f"{sched.capped_note(payload.get('precheck_timeout_s'), WATCHER_MAX_S)}; the run goes ahead")
             return ""
         except Exception as e:
             log(self.p, f"schedule {s['name']}: precheck failed ({type(e).__name__}: {e}); the run goes ahead")
@@ -11378,7 +11398,9 @@ def _cut_off_cost(run_dir: Path, exit_info: dict, usage=None, prov=None) -> floa
 
 def _watcher_timeout(payload: dict) -> int:
     """A command watcher's timeout: its timeout_s (default 120), capped at WATCHER_MAX_S so one slow
-    watcher cannot hold a tick past the watchdog and restart the daemon over and over."""
+    watcher cannot hold a tick past the watchdog and restart the daemon over and over. schedule_set
+    refuses more; a stored value above it is logged once (Daemon._warn_over_cap) and named in the
+    timeout text (schedule.capped_note)."""
     try:
         want = int(payload.get("timeout_s") or 120)
     except (TypeError, ValueError):
