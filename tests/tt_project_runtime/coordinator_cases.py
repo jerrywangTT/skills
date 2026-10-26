@@ -11956,6 +11956,7 @@ def test_a_task_reference_to_a_missing_task_is_rejected_and_reaches_the_coordina
     from ttp import coordinator as coord
     from ttp.daemon import Daemon
     p = make(env)
+    p.set_config("delivery.push_branch", "work")   # landed:#<id> is checkable here
     ok = p.db.add_task("the change", "s", origin="user")
     p.db.x("UPDATE messages SET handled=1 WHERE direction='in'")
     before = p.db.one("SELECT COUNT(*) n FROM tasks")["n"]
