@@ -875,14 +875,26 @@ def fixed(p: project.Project, fp: str) -> int:
     """`ttp upstream --fixed`: 0 once p's running daemon is at or above the note's fixed_in, 1 before
     that (or while the note has no resolution), 2 when p's running version is unknown, 3 when the note
     was closed as not a plugin bug (wontfix): no fix ships, the wait is over and the task wakes to replan."""
+    return fixed_status(p, fp)[0]
+
+
+def fixed_status(p: project.Project, fp: str) -> tuple[int, str]:
+    """fixed's exit code and the one line `ttp upstream --fixed` prints: the note, its state and what
+    the probe read (the fix's release, the running version). Read-only: it records nothing."""
     fp = _check_fp(fp)
-    if wontfixed(fp):
-        return WONTFIX_RC
+    n = _find(fp)[0]
+    what = f"note {fp}" + (f" ({' '.join(str(n.get('title') or '').split())[:120]})" if n else " (not in this machine's inbox)")
+    if wf := wontfixed(fp):
+        return WONTFIX_RC, f"{what}: wontfix, closed as not a plugin bug ({' '.join(str(wf.get('note') or '').split())[:200]}): " \
+                           f"no fix ships"
     res = resolution(fp)
     v = running_version(p)
+    fix = f"fixed in {res['fixed_in']}" if res else f"{state(fp)}, no fix recorded yet"
     if v is None:
-        return 2
-    return 0 if res and at_least(v, res["fixed_in"]) else 1
+        return 2, f"{what}: {fix}; {p.name}'s running daemon version is unknown"
+    if res and at_least(v, res["fixed_in"]):
+        return 0, f"{what}: {fix}; {p.name}'s daemon runs {v}: it has the fix"
+    return 1, f"{what}: {fix}; {p.name}'s daemon runs {v}: " + ("not yet" if res else "waiting for a fix")
 
 
 def filed(name: str) -> dict[str, dict]:

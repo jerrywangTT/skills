@@ -711,6 +711,46 @@ NO_CHECK = ("`landed:#<id>` cannot be checked in this project: it sets neither d
             "(a read-only command with {id} for the task id: exit 0 landed, 1 not yet)")
 
 
+# Set in the probes the daemon runs (Daemon._probe_env): there a `landed:#<id>` this project cannot
+# check (can_check) waits on task <id> being done, as depends_on would, never exit 2 into a broken
+# probe, however the probe was written or stored. `ttp landed` run by hand keeps CANNOT and NO_CHECK.
+DONE_ENV = "TTP_LANDED_OR_DONE"
+# One `&&` term that waits on a task's landing on the push branch (no --onto): `ttp landed --task <id>`
+# or `ttp landed #<id>`, quoted or not.
+_TASK_TERM = re.compile(r"\s*ttp\s+landed\s+(?:--task(?:=|\s+)(['\"]?)#?(?P<a>\d+)\1|(['\"]?)#(?P<b>\d+)\3)\s*")
+
+
+def split_landed(probe: str | None) -> tuple[list[int], str]:
+    """(the task ids, the rest) of a probe whose landing waits can be taken out as depends_on: all of
+    `landed:#<id>`, or each `ttp landed --task <id>` / `ttp landed #<id>` term of a plain `&&` chain,
+    the other terms kept in order. A probe with `||`, `;`, a pipe, a newline or a background `&`
+    (also a redirect such as `2>&1`), a command substitution or a quote spanning an `&&` keeps its
+    terms (([], probe)): only a plain `&&` chain means each term must pass."""
+    probe = probe or ""
+    if m := LANDED_PROBE.fullmatch(probe):
+        return [int(m.group(1))], ""
+    if re.search(r"[|;\n`]|\$\(|(?<!&)&(?!&)", probe):
+        return [], probe
+    ids, rest = [], []
+    for part in probe.split("&&"):
+        if m := _TASK_TERM.fullmatch(part):
+            ids.append(int(m["a"] or m["b"]))
+        else:
+            rest.append(part.strip())
+    if not ids or not all(rest) or any(len(re.findall(r"(?<!\\)['\"]", x)) % 2 for x in rest):
+        return [], probe   # an empty term, or a quote that spans an `&&`: not a plain chain
+    return list(dict.fromkeys(ids)), " && ".join(rest)
+
+
+def _done_wait(p, tid: int) -> tuple[int, str]:
+    """DONE_ENV's answer for task `tid` here: 0 once it is done, else NOT_YET with its status."""
+    status = (p.db.task(tid) or {}).get("status")
+    why = "no push branch or landed probe here, so its end stands for its landing, as with depends_on"
+    if status == "done":
+        return 0, f"#{tid} is done ({why})"
+    return NOT_YET, f"#{tid} is {status}, not done yet ({why})"
+
+
 def _run_landed_probe(p, cmd: str, tid: int) -> tuple[int, str]:
     """delivery.landed_probe for task `tid`, run in the project root within FETCH_S: its exit 0 and 1
     as they are, anything else (a timeout, a missing command) CANNOT naming the key."""
@@ -753,7 +793,7 @@ def check(p, repo: Path, sha: str | None = None, tid: int | None = None, onto: s
         if not p.db.task(tid):
             return CANNOT, f"no task #{tid} in this project"
         if not (cmd := landed_probe(p)):
-            return CANNOT, NO_CHECK
+            return _done_wait(p, tid) if os.environ.get(DONE_ENV) else (CANNOT, NO_CHECK)
         if not fetch:   # local checks only: a project's own command may reach the network
             return NOT_YET, f"#{tid}: delivery.landed_probe not run (local check only)"
         return _run_landed_probe(p, cmd, tid)

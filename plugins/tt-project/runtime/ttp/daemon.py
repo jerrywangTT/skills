@@ -7579,7 +7579,9 @@ class Daemon:
         per producer nothing can land. Saved task rows only, never the in-memory probe verdicts
         (_start_rc), which are empty after a restart: a wait in a longer probe is not judged."""
         held: dict[int, list[dict]] = {}
-        for t in deferred:
+        # Where no landing can be checked the wait is on the producer being done (landed.DONE_ENV):
+        # nothing is held on a landing, and an earlier event clears.
+        for t in deferred if landed.can_check(self.p) else []:
             m = landed.LANDED_PROBE.fullmatch(deferral(t).get("when") or "")
             if m:
                 held.setdefault(int(m.group(1)), []).append(t)
@@ -9050,8 +9052,9 @@ class Daemon:
 
     def _probe_env(self) -> dict:
         """Probes and on_pass commands run `ttp` (e.g. `ttp lock --probe device-a`) as a worker would,
-        devices masked as in its run."""
-        return machines.mask_devices(command_env(self.p))
+        devices masked as in its run. A `ttp landed` in them waits on a task being done where this
+        project cannot check a landing (landed.DONE_ENV)."""
+        return {**machines.mask_devices(command_env(self.p)), landed.DONE_ENV: "1"}
 
     def _start_failed(self, task: dict, e: Exception) -> None:
         """Nothing was launched, so no attempt is spent. The task waits a minute before the next try,

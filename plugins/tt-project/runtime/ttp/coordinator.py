@@ -1473,6 +1473,30 @@ def _and_landed(p: Project, tid: int, when: str | None) -> str:
     return both
 
 
+def _landed_as_deps(p: Project, a: dict, deps: list | None = None) -> tuple[dict, str]:
+    """In a project that cannot check a landing (landed.can_check), a task_add or task_update's
+    start_when that waits on task landings (landed.split_landed) waits on those tasks through
+    depends_on instead, ANDed with its other terms: (the action rewritten, the words saying so; ''
+    when unchanged). `deps`: the task's current depends_on, kept when the action sends none."""
+    when = a.get("start_when")
+    if not isinstance(when, str) or landed.can_check(p):
+        return a, ""
+    ids, rest = landed.split_landed(when.strip())
+    if not ids:
+        return a, ""
+    had = a["depends_on"] if a.get("depends_on") is not None else list(deps or [])
+    if not isinstance(had, list):
+        return a, ""   # _new_dependencies refuses it with its own words
+    seen = {str(d).strip().lstrip("#") for d in had}
+    a = {**a, "start_when": rest, "depends_on": [*had, *(i for i in ids if str(i) not in seen)]}
+    if not rest:
+        a.pop("why", None)   # it explained the probe, now gone
+    keep = f"; start_when {rest}" if rest else ""
+    return a, (f"start_when {clip(when.strip(), 160)} became depends_on [{', '.join(map(str, ids))}]{keep}: this "
+               f"project sets neither delivery.push_branch nor delivery.landed_probe, so a landing cannot be "
+               f"checked here and it starts once {', '.join(f'#{i}' for i in ids)} is done")
+
+
 def defer_labels(after: float | None, when: str | None, why: str | None = None) -> list[str]:
     """The labels a deferred task carries (see db.deferral); none when it may start now."""
     if after is None and not when:
@@ -1644,6 +1668,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     labels.append("needs_device")
                 if tier == "deep" and a.get("user_deep"):
                     labels.append(effort.USER_DEEP)   # a device task keeps deep on its first start
+                a, as_deps = _landed_as_deps(p, a)
                 try:
                     deps = _new_dependencies(db, None, a.get("depends_on") or [])
                 except MissingTaskRef as e:
@@ -1824,6 +1849,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 if lineage:
                     notes.append(f"task_add: #{new_id} chained after #{lineage[0]}, which is using {lineage[1]}: it "
                                  f"starts once #{lineage[0]} ends, in a worktree of its own from that branch's head")
+                if as_deps:
+                    notes.append(f"task_add: #{new_id} added; {as_deps}")
                 if stale:
                     notes.append(f"task_add: #{new_id} added; flagged: {stale}")
                 if clash:
@@ -1846,6 +1873,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 if not task:
                     raise ValueError(f"no task #{a.get('id')}")
                 batch_tasks[task["id"]] = task["reply_chat"]
+                a, as_deps = _landed_as_deps(p, a, dependency_ids(task))
                 upd: dict[str, Any] = {}
                 if a.get("status") in ("queued", "blocked", "cancelled", "done", "waiting"):
                     if task["status"] == "running" and a["status"] != "cancelled":
@@ -2012,6 +2040,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     if waits or anchors.without(labels) != labels:
                         upd["labels"] = anchors.without(labels) + ([waits] if waits else [])
                 db.update_task(task["id"], **upd)
+                if as_deps:
+                    notes.append(f"task_update: #{task['id']} {as_deps}")
                 if waits == anchors.label("ask", anchors.NEW_ASK):
                     new_ask_holds.append((k, task, upd))
                 held_on = anchors.label("when", "")

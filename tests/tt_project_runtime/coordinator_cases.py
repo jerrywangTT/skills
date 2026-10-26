@@ -16159,21 +16159,43 @@ def test_task_add_chains_a_continuation_after_an_open_task_on_the_same_branch(en
     assert worktree.lineage_hold(p.db.one("SELECT * FROM tasks WHERE title='on y'")) is None
 
 
-def test_a_landed_start_when_is_refused_where_no_landing_can_be_checked(env, capsys):
+def test_a_landed_start_when_becomes_depends_on_where_no_landing_can_be_checked(env, capsys):
     """With neither delivery.push_branch nor delivery.landed_probe, `start_when landed:#<id>` would
-    only ever exit 2: task_add, task_update, `ttp task add --start-when` and `ttp task set-when`
-    refuse it at once, naming depends_on and delivery.landed_probe. Either key makes it pass."""
+    only ever exit 2. task_add and task_update turn each landing wait of the probe (`landed:#<id>`, or
+    a `ttp landed --task <id>` / `#<id>` term of an `&&` chain) into depends_on <id>, keep the other
+    terms as the start_when and say so in their note; a probe with `||` is left as written.
+    `ttp task add --start-when` and `ttp task set-when` still refuse it, naming depends_on. Either
+    key keeps the landed wait as written."""
     from ttp import cli
     from ttp import coordinator as coord
-    from ttp.db import deferral
+    from ttp.db import deferral, dependency_ids
     p = make(env)
     first = p.db.add_task("first", "s", kind="work", status="running")
-    out = coord.apply(p, [{"type": "task_add", "title": "after", "spec": "s", "start_when": f"landed:#{first}"}])
-    assert len(out) == 1 and "depends_on" in out[0] and "delivery.landed_probe" in out[0], out
-    assert not p.db.one("SELECT id FROM tasks WHERE title='after'")
-    other = p.db.add_task("other", "s", kind="work", status="queued")
+    second = p.db.add_task("second", "s", kind="work", status="running")
+    out = coord.apply(p, [{"type": "task_add", "title": "after", "spec": "s", "start_when": f"landed:#{first}",
+                           "why": "first's change is in"}])
+    after = p.db.one("SELECT * FROM tasks WHERE title='after'")
+    notes = p.db.kv(coord.NOTES_KEY)
+    assert out == [] and after and dependency_ids(after) == [first] and not deferral(after), (out, after)
+    assert [n for n in notes if f"task_add: #{after['id']} added; start_when landed:#{first} became depends_on "
+            f"[{first}]: " in n and "delivery.landed_probe" in n and f"once #{first} is done" in n], notes
+    other = p.db.add_task("other", "s", kind="work", status="queued", depends_on=[second])
     out = coord.apply(p, [{"type": "task_update", "id": other, "start_when": f" landed: {first} "}])
-    assert len(out) == 1 and "delivery.landed_probe" in out[0] and not deferral(p.db.task(other)), out
+    notes = p.db.kv(coord.NOTES_KEY)
+    assert out == [] and dependency_ids(p.db.task(other)) == [second, first] and not deferral(p.db.task(other)), out
+    assert [n for n in notes if n.startswith(f"task_update: #{other} start_when landed: {first} became "
+                                             f"depends_on [{first}]: ")], notes
+    # ANDed with the other terms: those stay the start_when; a depends_on sent along is the base.
+    out = coord.apply(p, [{"type": "task_update", "id": other, "depends_on": [second],
+                           "start_when": f"test -e out/x && ttp landed --task {first} && ttp landed '#{second}'"}])
+    assert out == [] and dependency_ids(p.db.task(other)) == [second, first], out
+    assert deferral(p.db.task(other))["when"] == "test -e out/x", out
+    assert [n for n in p.db.kv(coord.NOTES_KEY) if f"depends_on [{first}, {second}]; start_when test -e out/x: "
+            in n], p.db.kv(coord.NOTES_KEY)
+    out = coord.apply(p, [{"type": "task_add", "title": "either", "spec": "s",
+                           "start_when": f"ttp landed --task {first} || test -e out/y"}])
+    either = p.db.one("SELECT * FROM tasks WHERE title='either'")
+    assert out == [] and dependency_ids(either) == [] and deferral(either)["when"].startswith("ttp landed"), out
     with pytest.raises(SystemExit):
         cli.main(["task", "demo", "add", "cli later", "--start-when", f"landed:#{first}"])
     seen = capsys.readouterr()
@@ -16181,13 +16203,12 @@ def test_a_landed_start_when_is_refused_where_no_landing_can_be_checked(env, cap
     assert not p.db.one("SELECT id FROM tasks WHERE title='cli later'")
     with pytest.raises(ValueError, match="delivery.landed_probe"):
         cli.set_when(p.db, other, f"landed:#{first}", p)
-    # A combined probe is not a landed:#<id> wait the daemon rewrites; it is left to run.
-    assert coord.apply(p, [{"type": "task_update", "id": other, "start_when": "test -e out/x"}]) == []
     for key, value in (("delivery.landed_probe", "test -e landed/{id}"), ("delivery.push_branch", "tt/push")):
         p.set_config("delivery.landed_probe", "")
         p.set_config(key, value)
-        assert coord.apply(p, [{"type": "task_update", "id": other, "start_when": f"landed:#{first}"}]) == []
-        assert deferral(p.db.task(other))["when"] == f"landed:#{first}"
+        assert coord.apply(p, [{"type": "task_update", "id": other, "depends_on": [],
+                                "start_when": f"landed:#{first}"}]) == []
+        assert deferral(p.db.task(other))["when"] == f"landed:#{first}" and dependency_ids(p.db.task(other)) == []
         coord.apply(p, [{"type": "task_update", "id": other, "start_when": "now"}])
 
 

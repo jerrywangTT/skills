@@ -1988,7 +1988,9 @@ def cmd_upstream(a) -> None:
             if not p:
                 die("no tt-project project here", 2)
             if a.fixed:
-                raise SystemExit(upstream.fixed(p, a.fixed))
+                rc, words = upstream.fixed_status(p, a.fixed)
+                print(words)
+                raise SystemExit(rc)
             if a.regress:
                 fp, reason = a.regress
                 # The filer's regression blocks its close by silence; a maintainer's ingesting project may also
