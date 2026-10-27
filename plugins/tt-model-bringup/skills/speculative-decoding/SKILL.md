@@ -76,7 +76,7 @@ short sliding windows, a small dedicated kernel (`tt/dflash/row_attention.py`) a
 ## SD-05: Give the drafter enough context
 
 **Do:** the drafter's window is how many recent positions of the target's context it attends to. Sweep it at the prompt
-lengths served, using one window size for all lengths within a sweep ($perf-measurement PM-02), over several dates.
+lengths served, using one window size for all lengths within a sweep (no switch by length), over several dates.
 
 **Evidence:** window 512 → 1,024 tokens: same round time; mean 658 → 668 tok/s/user over 5 dates × 10 prompt lengths.
 

@@ -101,7 +101,7 @@ assigned by load (busiest chip had up to 1.5x the average tokens) 332 → 314 ms
 
 **Do:** time each op alone on the model's expert shape, activation and biases over the full range of tokens per expert
 (on average prompt length × k ÷ E) before trusting `hybrid_routed_expert_moe`, which picks per expert at run time from a
-threshold ($perf-measurement PM-02).
+threshold, so a sweep through it does not show which op ran.
 
 **Evidence:** for the gpt-oss expert shape (2880 × 2880, SwiGLU-OAI with biases),
 `models/demos/deepseek_v3_d_p/reference/gpt_oss_20b_config.py` records `moe_fused_swiglu` faster up to 384 tokens per

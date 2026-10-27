@@ -1,7 +1,0 @@
-interface:
-  display_name: "Performance Measurement"
-  short_description: "Measure speedups so they are real and attributable"
-  default_prompt: "Use $perf-measurement to check that this performance change is measured back to back on one build, per chip on a mesh, on real data with pinned prompts and configs, with outputs checked, and with a real-time-profiler test for any op change."
-
-policy:
-  allow_implicit_invocation: true

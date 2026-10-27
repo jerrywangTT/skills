@@ -32,7 +32,7 @@ IDs, waiting only on the oldest). Put the bias, activation (SwiGLU) and, for the
 over experts in the same kernel so the output is written once.
 
 **Check:** the row's effective bandwidth (weight bytes ÷ device time); tokens identical to the stock path on a fixed
-prompt set ($perf-measurement PM-06).
+prompt set.
 
 **Evidence:** expert gate/up 54 → 23 µs per layer (one tile per read reached about 220 GB/s); LM head 1,218 → 307 µs per
 token (158 → 508 GB/s).
@@ -78,7 +78,7 @@ the whole row. That chip is slower and every collective after the matmul waits f
 largest logical column any chip uses as its worker (east of the bank on every chip), add extra readers only east of it
 for east-side banks, and keep west-side banks' readers west of every chip's east-side workers.
 
-**Check:** time the same op on every chip ($perf-measurement PM-03); the slowest within 10% of the fastest.
+**Check:** time the same op on every chip (the `DEVICE ID` column of the device-profiler ops report); the slowest within 10% of the fastest.
 
 **Evidence:** per-chip placement 2.335 ms per token, first-chip placement 2.799 ms (two chips' streaming matmuls
 1.13–1.34x slower). DRAM-sharded matmul with two readers per bank on those two chips: 216 µs with first-chip placement,
