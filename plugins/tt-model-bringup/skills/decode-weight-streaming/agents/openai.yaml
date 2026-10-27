@@ -1,0 +1,7 @@
+interface:
+  display_name: "Decode Weight Streaming"
+  short_description: "Stream decode matmul weights near DRAM bandwidth"
+  default_prompt: "Use $decode-weight-streaming to bring this model's decode matmuls near their DRAM-bandwidth floor, verifying each change with per-row device time, per-chip balance on a mesh, and unchanged outputs."
+
+policy:
+  allow_implicit_invocation: true

@@ -1,0 +1,7 @@
+interface:
+  display_name: "MoE Optimization"
+  short_description: "Make mixture-of-experts decode and prefill compute only routed work"
+  default_prompt: "Use $moe-optimization to make this model's mixture-of-experts layers read and compute only the routed experts' work in decode and prefill, measuring each change against the previous path with unchanged outputs."
+
+policy:
+  allow_implicit_invocation: true

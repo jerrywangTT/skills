@@ -31,8 +31,8 @@ the tokens per round.
 
 ## Gates before optimizing
 
-- Optimize plain decode first (see the [matmul](../optimize/cards/matmul.md), [fusion](../optimize/cards/fusion.md) and
-  [sparse matmul](../optimize/cards/sparse_matmul.md) cards). The verify pass runs the same weights through the same
+- Optimize plain decode first ($decode-weight-streaming, $kernel-fusion and $moe-optimization). The verify pass runs
+  the same weights through the same
   kernels; every plain-decode win carries over.
 - Check correctness by teacher forcing: feed the speculative output into plain greedy decode and compare its argmax
   with the next speculative token at every position. Expect high but not perfect agreement, because verify computes
@@ -45,7 +45,7 @@ the tokens per round.
 
 Checking the n guesses with n + 1 ordinary decode steps reads every weight n + 1 times per round. One verify pass with
 n + 1 rows reads each weight once and multiplies it by all rows; its MoE reads the union of the rows' experts
-([SM-02](../optimize/cards/sparse_matmul.md#sm-02-several-rows-at-once-compute-the-union-of-their-experts-once-each)).
+([SM-02](../moe-optimization/SKILL.md#sm-02-several-rows-at-once-compute-the-union-of-their-experts-once-each)).
 
 Evidence: first version (eager, one decode step per guess) 180.7 ms per round; one traced 8-row verify pass
 16.2 ms per round (draft 97.0 → 5.8 ms, verify 77.2 → 8.5 ms).
@@ -56,7 +56,7 @@ Let each pass write the next pass's inputs on the device: drafts into the verify
 position and last token into the next draft and verify inputs, and the context rows into the drafter. Compute the
 acceptance in the verify pass. Read one small result per round with a non-blocking read, queue the next round
 before reading this one, and record the round as one trace
-([FU-07](../optimize/cards/fusion.md#fu-07-keep-the-host-off-the-devices-critical-path)).
+([FU-07](../kernel-fusion/SKILL.md#fu-07-keep-the-host-off-the-devices-critical-path)).
 
 Evidence: hand-over on the device, host reads one 16-integer result: 16.2 → 10.2 ms per round; acceptance on the
 device: 8.18 → 7.95 ms; next round queued first: 4.957 → 4.884 ms; one trace instead of three: 4.873 → 4.842 ms.
@@ -98,7 +98,7 @@ rows per pass per user count:
 - take the largest b (up to the drafter's n + 1) that keeps every user in one pass;
 - allow larger passes (512 rows) once users × b would otherwise force small blocks or several passes;
 - compute only the routed (row, expert) pairs in the verify MoE
-  ([SM-04](../optimize/cards/sparse_matmul.md#sm-04-many-rows-batch-32256-or-prefill-compute-only-the-routed-row-expert-pairs)).
+  ([SM-04](../moe-optimization/SKILL.md#sm-04-many-rows-batch-32256-or-prefill-compute-only-the-routed-row-expert-pairs)).
 
 Measure against plain decode at the same user count and prompt length: at enough users the per-row costs make a
 speculative round slower than the plain steps it replaces.
@@ -112,7 +112,7 @@ passes (168).
 
 A traced speculative runner keeps buffers resident in L1 between rounds. Prefill ops that size their circular buffers
 for all of L1 then fail with "static circular buffers clash with L1 buffers". Size them below the lowest resident L1
-address ([FU-05](../optimize/cards/fusion.md#fu-05-keep-intermediates-and-resident-data-in-l1)).
+address ([FU-05](../kernel-fusion/SKILL.md#fu-05-keep-intermediates-and-resident-data-in-l1)).
 
 ## Evidence to leave
 

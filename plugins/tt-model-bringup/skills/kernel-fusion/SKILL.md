@@ -1,6 +1,16 @@
-# Fusion card: fewer programs, fewer host waits, fewer DRAM round trips
+---
+name: kernel-fusion
+description: "Cut fixed per-program costs, host waits and DRAM round trips in traced TTNN decode or speculative-decoding steps: one-program layer boundaries inside the next matmul, packed all-reduce payloads, selection inside the producing kernel, one-program blocks with semaphore hand-off, L1 residency, launch rectangles and host-free rounds. Use when a step is a long chain of small programs or device time well exceeds the sum of its material op rows."
+---
 
-Read this card when a traced decode step (or a speculative-decoding round) is a long chain of small programs, when
+# Kernel fusion: fewer programs, fewer host waits, fewer DRAM round trips
+
+Before using this workflow, follow the dependency and environment setup in
+[the model-bringup entrypoint](../model-bringup/SKILL.md#startup).
+Resolve its package root from this installed skill's location; do not assume
+this plugin is copied into the target tt-metal checkout.
+
+Use this skill when a traced decode step (or a speculative-decoding round) is a long chain of small programs, when
 device time per step is well above the sum of the material op rows, or when the host appears between device passes.
 The evidence is from gpt-oss-20b on a QuietBox 2 (4 Blackhole chips, TP=4): batch-1 decode in tenstorrent/tt-metal
 #60161 and speculative decoding (DFlash) in #61050.

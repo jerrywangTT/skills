@@ -1,9 +1,19 @@
-# Matmul card: decode weight streaming and DRAM reader placement
+---
+name: decode-weight-streaming
+description: "Make decode matmuls that are bound by reading weights from DRAM run near DRAM bandwidth on Tenstorrent hardware: stream weights in large reads from contiguous per-bank columns, place readers on their bank's row, balance banks, place readers per chip on harvested multi-chip meshes, and find LM-head top tokens inside the LM-head program. Use when a decode QKV, attention-output, router, expert or LM-head matmul is far above its weight-bytes-over-bandwidth floor."
+---
 
-Read this card when a decode matmul (QKV, attention output, router, expert gate/up or down, LM head) is a
+# Decode weight streaming
+
+Before using this workflow, follow the dependency and environment setup in
+[the model-bringup entrypoint](../model-bringup/SKILL.md#startup).
+Resolve its package root from this installed skill's location; do not assume
+this plugin is copied into the target tt-metal checkout.
+
+Use this skill when a decode matmul (QKV, attention output, router, expert gate/up or down, LM head) is a
 material row in `tt-perf-report` and decode is bound by reading its weights from DRAM. It extends
-[OPT-004](../SKILL.md#opt-004-sweep-dram-sharded-decode-matmul-geometry-not-only-dtype) and
-[OPT-015](../SKILL.md#opt-015-sweep-blackhole-dram-readers-per-bank) with what moved gpt-oss-20b batch-1 decode on a
+[OPT-004](../optimize/SKILL.md#opt-004-sweep-dram-sharded-decode-matmul-geometry-not-only-dtype) and
+[OPT-015](../optimize/SKILL.md#opt-015-sweep-blackhole-dram-readers-per-bank) with what moved gpt-oss-20b batch-1 decode on a
 QuietBox 2 (4 Blackhole chips, TP=4) from 18.35 to 2.38 ms per token (tenstorrent/tt-metal #60161) and batch-32
 decode from 15.44 to 12.72 ms per step (#61548, #62566). The numbers are evidence for when a rule pays, not targets
 for another model.
@@ -114,7 +124,7 @@ same tokens; two values per word in the scan: 217 → 178 µs per head (#61050).
 ## MM-06: Read more of a bank with more readers when one cannot keep it busy
 
 **Applies when** a streaming kernel's reader rate per bank is below the bank's bandwidth and spare cores exist on the
-bank's row (see [OPT-015](../SKILL.md#opt-015-sweep-blackhole-dram-readers-per-bank) for the stock matmul's
+bank's row (see [OPT-015](../optimize/SKILL.md#opt-015-sweep-blackhole-dram-readers-per-bank) for the stock matmul's
 `num_workers_per_dram_bank`).
 
 **Do:** sweep 1–4 readers per bank per projection, each reading a disjoint slice of the bank's columns, under the same

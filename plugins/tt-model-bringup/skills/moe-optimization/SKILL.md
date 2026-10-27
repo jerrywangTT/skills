@@ -1,7 +1,17 @@
-# Sparse matmul card: mixture-of-experts decode and prefill
+---
+name: moe-optimization
+description: "Optimize mixture-of-experts (MoE) layers in TTNN decode and prefill: compute only routed experts, take the union of several rows' experts once, prefetch likely experts, compute only routed (row, expert) pairs for many rows, avoid per-expert token copies and gathers in prefill, keep routing small, and choose the expert kernel by tokens per expert. Use when an MoE layer is a material share of decode or prefill time."
+---
 
-Read this card when a mixture-of-experts (MoE) layer is a material share of decode or prefill time. It complements
-[Sparse Matmul `nnz`](../SKILL.md#sparse-matmul-nnz). Evidence is from gpt-oss-20b (24 layers, 32 experts, top-4,
+# Mixture-of-experts optimization: decode and prefill
+
+Before using this workflow, follow the dependency and environment setup in
+[the model-bringup entrypoint](../model-bringup/SKILL.md#startup).
+Resolve its package root from this installed skill's location; do not assume
+this plugin is copied into the target tt-metal checkout.
+
+Use this skill when a mixture-of-experts (MoE) layer is a material share of decode or prefill time. It complements
+[Sparse Matmul `nnz`](../optimize/SKILL.md#sparse-matmul-nnz). Evidence is from gpt-oss-20b (24 layers, 32 experts, top-4,
 hidden 2,880) on a QuietBox 2 (4 Blackhole chips, TP=4 for decode, experts split over chips for prefill):
 tenstorrent/tt-metal #60161 (batch-1 decode), #61050 (speculative decoding) and #61548 (prefill and batched
 speculative decoding).
@@ -15,7 +25,7 @@ an expert the token did not pick, and every copy that only rearranges rows for t
 
 **Do:** pass the router's expert ids to the expert kernels and read only those experts' weights from DRAM. With one
 token, k experts mean k weight reads per layer, not E. Put the bias, activation and the weighted sum of the k experts
-in the same streaming kernels (see [MM-01](matmul.md#mm-01-stream-decode-matmul-weights-from-contiguous-per-bank-columns-in-large-reads)).
+in the same streaming kernels (see [MM-01](../decode-weight-streaming/SKILL.md#mm-01-stream-decode-matmul-weights-from-contiguous-per-bank-columns-in-large-reads)).
 
 **Evidence:** expert matmuls stepped through all 32 experts and wrote 28 rows of zeros; taking the 4 ids and writing
 4 rows: experts 275 → 81 µs per layer, 13.77 → 9.34 ms per token, the second-largest decode win (#60161).

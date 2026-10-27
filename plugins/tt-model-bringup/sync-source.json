@@ -197,7 +197,7 @@
       "destination": "skills/optimize/SKILL.md",
       "blob": "280abb027d839f1f076ab8a524fc6f61ed6df587",
       "source_sha256": "c4b4015ed198c305ed19f73c2ef6a539923212457588319767d08489a5331c8b",
-      "packaged_sha256": "41af3b2e35c4f7bb02d65e4232dfc8f6362816e86ba82dd8c92c2f9399a3a667"
+      "packaged_sha256": "d90567bf04db5b1d69a28c35be8bcb29e1e2f459889b6088cd532c2f707f8ce6"
     },
     {
       "source": ".agents/skills/optimize/agents/openai.yaml",

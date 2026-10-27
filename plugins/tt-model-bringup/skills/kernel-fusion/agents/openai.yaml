@@ -1,0 +1,7 @@
+interface:
+  display_name: "Kernel Fusion"
+  short_description: "Merge small programs and keep the host off the device's path"
+  default_prompt: "Use $kernel-fusion to reduce the number of programs, host waits and DRAM round trips in this traced TTNN step, naming for each change whether it saves overlap, fixed per-program cost or a DRAM round trip, and measuring it in the same traced harness."
+
+policy:
+  allow_implicit_invocation: true
