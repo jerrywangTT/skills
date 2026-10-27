@@ -1,0 +1,7 @@
+interface:
+  display_name: "Prefill Optimization"
+  short_description: "Cut time to first token in single and batched prefill"
+  default_prompt: "Use $prefill-optimization to reduce this model's prefill time to first token at batch 1 and in batched prefill, measuring each change against the previous one at short and long prompts with the accuracy gate passing."
+
+policy:
+  allow_implicit_invocation: true
